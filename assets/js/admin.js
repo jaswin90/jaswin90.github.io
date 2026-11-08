@@ -23,8 +23,29 @@ function toast(msg) {
 }
 
 /* ------------------------------------------------------------------ invites */
+// The site sends no email itself (the free Firebase plan has no mail service). After inviting,
+// the admin gets a ready-made message to send from their own email.
+const SITE = location.origin;
+function inviteMessage(email) {
+  const subject = 'You are invited to Jaswin\'s library';
+  const body = 'Hi,\n\nI have added ' + email + ' to my library and apps.\n\n' +
+    '1. Open ' + SITE + '/library/\n' +
+    '2. Click "Sign in" at the top right and choose your Google account (' + email + ').\n\n' +
+    'Books: ' + SITE + '/library/\nApps (My Planner): ' + SITE + '/apps/planner/\n\n' +
+    'If Google shows "Google hasn\'t verified this app", click Advanced, then Go to the site.\n\nJaswin';
+  return { subject, body };
+}
+function sendLinks(email) {
+  const m = inviteMessage(email);
+  const gmail = 'https://mail.google.com/mail/?view=cm&fs=1&to=' + encodeURIComponent(email) + '&su=' + encodeURIComponent(m.subject) + '&body=' + encodeURIComponent(m.body);
+  const mailto = 'mailto:' + encodeURIComponent(email) + '?subject=' + encodeURIComponent(m.subject) + '&body=' + encodeURIComponent(m.body);
+  return '<a class="btn small" target="_blank" rel="noopener" href="' + esc(gmail) + '">Email via Gmail</a> ' +
+    '<a class="btn small" href="' + esc(mailto) + '">Other mail app</a> ' +
+    '<button class="btn small" type="button" data-copy="' + esc(email) + '">Copy message</button>';
+}
+
 function invitesSection(box) {
-  box.innerHTML = '<h2>Invites</h2><p class="small muted">People on this list can sign in to the library and the apps with their Google account. You are always allowed.</p>' +
+  box.innerHTML = '<h2>Invites</h2><p class="small muted">People on this list can sign in to the library and the apps with their Google account. You are always allowed. Adding someone does not email them: use <b>Email via Gmail</b> (or Copy message) to let them know.</p>' +
     '<div class="inv-list"><p class="small muted">Loading…</p></div>' +
     '<form class="auth-form inv-form" novalidate><label>Email<input name="email" type="email" required placeholder="name@gmail.com"></label>' +
     '<label>Note (optional)<input name="note" type="text"></label><p class="auth-err" role="alert" hidden></p>' +
@@ -34,7 +55,12 @@ function invitesSection(box) {
     try {
       const items = await listInvites();
       list.innerHTML = items.length ? '<ul class="inv-ul">' + items.map((i) => '<li><span>' + esc(i.email) + (i.note ? ' <span class="muted small">' + esc(i.note) + '</span>' : '') +
-        '</span><button class="btn small" data-rm="' + esc(i.email) + '">Remove</button></li>').join('') + '</ul>' : '<p class="small muted">No invites yet.</p>';
+        '</span><span class="inv-actions">' + sendLinks(i.email) + ' <button class="btn small" data-rm="' + esc(i.email) + '">Remove</button></span></li>').join('') + '</ul>' : '<p class="small muted">No invites yet.</p>';
+      list.querySelectorAll('[data-copy]').forEach((x) => x.addEventListener('click', async () => {
+        const m = inviteMessage(x.dataset.copy);
+        try { await navigator.clipboard.writeText(m.subject + '\n\n' + m.body); toast('Message copied. Paste it into WhatsApp, email or anywhere.'); }
+        catch (e) { prompt('Copy this message:', m.body); }
+      }));
       list.querySelectorAll('[data-rm]').forEach((x) => x.addEventListener('click', async () => {
         if (!confirm('Remove ' + x.dataset.rm + ' from the invite list?')) return;
         try { await removeInvite(x.dataset.rm); toast('Removed ' + x.dataset.rm); draw(); } catch (e) { toast(e.message); }
@@ -46,7 +72,7 @@ function invitesSection(box) {
   };
   form.addEventListener('submit', async (ev) => {
     ev.preventDefault(); err.hidden = true;
-    try { const em = await addInvite(form.email.value, form.note.value); form.reset(); toast('Invited ' + em); draw(); }
+    try { const em = await addInvite(form.email.value, form.note.value); form.reset(); toast('Added ' + em + '. Now send them the invite with "Email via Gmail".'); draw(); }
     catch (x) { err.textContent = x.message; err.hidden = false; }
   });
   draw();

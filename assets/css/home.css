@@ -65,3 +65,6 @@ section.plain { border: 0; }
 .dash-table th, .dash-table td { text-align: left; padding: .3rem .2rem; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
 .dash-table td:last-child, .dash-table th:last-child { text-align: right; white-space: nowrap; }
 .notice-box { border: 1px solid var(--border); border-left: 3px solid var(--warn); border-radius: 8px; padding: .4rem 1rem; background: var(--surface); }
+.inv-actions { display: inline-flex; flex-wrap: wrap; gap: .35rem; justify-content: flex-end; }
+@media (max-width: 600px) { .inv-ul li { flex-direction: column; align-items: flex-start; } .inv-actions { justify-content: flex-start; } }
+.inv-actions a.btn { text-decoration: none; color: var(--fg); }

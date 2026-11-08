@@ -14,6 +14,7 @@ const PROJECT = (firebaseConfig && firebaseConfig.projectId) || '';
 const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
 const fmt = (n) => Number(n || 0).toLocaleString('en-GB');
 let token = null;   // { value, expiresAt } — in memory only
+let fb = null;      // Firebase, loaded once on page load so the popup can open straight from the click
 
 function toast(msg) {
   let t = document.querySelector('.toast');
@@ -38,7 +39,10 @@ function invitesSection(box) {
         if (!confirm('Remove ' + x.dataset.rm + ' from the invite list?')) return;
         try { await removeInvite(x.dataset.rm); toast('Removed ' + x.dataset.rm); draw(); } catch (e) { toast(e.message); }
       }));
-    } catch (e) { list.innerHTML = '<p class="auth-err">Could not read invites (' + esc(e.code || e.message) + '). Have the Firestore rules been published?</p>'; }
+    } catch (e) {
+      list.innerHTML = '<p class="auth-err">Could not read invites (' + esc(e.code || e.message) + ').' + (/permission/i.test(e.code || e.message)
+        ? ' The database refuses: the access rules are not published yet. Firebase console → Firestore Database → Rules: paste the rules from <code>firestore.rules</code> and click Publish.' : '') + '</p>';
+    }
   };
   form.addEventListener('submit', async (ev) => {
     ev.preventDefault(); err.hidden = true;
@@ -49,9 +53,10 @@ function invitesSection(box) {
 }
 
 /* ------------------------------------------------------------------ analytics */
+/** Must be called directly from a click, with nothing awaited before it, or browsers block the popup. */
 async function getToken() {
   if (token && token.expiresAt - Date.now() > 60000) return token.value;
-  const { A, auth } = await firebase();
+  const { A, auth } = fb;
   const provider = new A.GoogleAuthProvider();
   provider.addScope(SCOPE);
   provider.setCustomParameters({ login_hint: ADMIN_EMAIL });
@@ -132,6 +137,17 @@ function dashboardSection(box) {
   const out = box.querySelector('#dash-out');
   box.querySelector('#dash-load').addEventListener('click', async () => {
     const days = Number(box.querySelector('#dash-range').value);
+    try {
+      await getToken();   // first, while the click still counts as a user gesture
+    } catch (e) {
+      const code = (e && e.code) || '';
+      out.innerHTML = '<p class="auth-err">' + (code === 'auth/popup-blocked'
+        ? 'Your browser blocked the Google window. Allow pop-ups for jaswin90.github.io (icon at the right of the address bar), then click Load dashboard again.'
+        : code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request'
+          ? 'The Google window was closed before finishing. Click Load dashboard and complete it.'
+          : 'Google sign-in for Analytics failed: ' + esc(code || e.message)) + '</p>';
+      return;
+    }
     out.innerHTML = '<p class="small muted">Loading…</p>';
     try {
       const prop = await findProperty(mid);
@@ -157,7 +173,6 @@ function dashboardSection(box) {
       const scope = e.status === 403 && /scope|insufficient/i.test(e.reason || e.message);
       out.innerHTML = '<p class="auth-err">Could not load the dashboard: ' + esc(e.message) + '</p>' +
         (disabled || scope ? setupHelp(disabled ? 'One of the Analytics APIs is not enabled yet.' : 'The analytics.readonly scope is not granted yet.') : '');
-      if (/popup/i.test(e.code || '')) out.innerHTML = '<p class="auth-err">Allow pop-ups for this site, then click Load dashboard again.</p>';
     }
   });
 }
@@ -165,6 +180,7 @@ function dashboardSection(box) {
 /* ------------------------------------------------------------------ page */
 async function main() {
   if (!configured()) { root.innerHTML = '<p class="small muted">Accounts are not enabled on this build.</p>'; return; }
+  fb = await firebase();
   await onSession(({ user, admin }) => {
     if (!user || !admin || norm(user.email) !== ADMIN_EMAIL) {
       root.innerHTML = '<p>This page is for the site\'s administrator. ' + (user ? '' : 'Sign in with the admin account (top right).') + '</p>';

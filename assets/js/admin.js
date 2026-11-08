@@ -96,7 +96,7 @@ async function findProperty(measurementId) {
       }
     }
   }
-  throw new Error('No Google Analytics property with measurement ID ' + measurementId + ' is visible to this Google account.');
+  throw new Error('No Google Analytics property for this site is visible to this Google account.');
 }
 
 const report = (prop, body) => api(DATA_API + '/' + prop + ':runReport', body);
@@ -124,13 +124,13 @@ function setupHelp(extra) {
   return '<div class="notice-box"><p><b>To turn the dashboard on (one time):</b></p><ol>' +
     '<li>Firebase console → Project settings → Integrations → <b>Google Analytics</b> → Enable (creates the GA4 property and a <code>measurementId</code>).</li>' +
     '<li>Copy the web app config again (Project settings → Your apps; it now includes <code>measurementId</code>) into the <code>FIREBASE_CONFIG</code> secret, and re-run the deploy.</li>' +
-    '<li>Google Cloud console (project ' + esc(PROJECT) + '): enable <b>Google Analytics Data API</b> and <b>Google Analytics Admin API</b>; in Google Auth Platform → Data access, add the scope <code>analytics.readonly</code>.</li>' +
+    '<li>Google Cloud console (this Firebase project): enable <b>Google Analytics Data API</b> and <b>Google Analytics Admin API</b>; in Google Auth Platform → Data access, add the scope <code>analytics.readonly</code>.</li>' +
     '</ol>' + (extra ? '<p class="small muted">' + extra + '</p>' : '') + '</div>';
 }
 
 function dashboardSection(box) {
   const mid = firebaseConfig && firebaseConfig.measurementId;
-  box.innerHTML = '<h2>Visitors</h2>' + (mid ? '<p class="small muted">Google Analytics 4 · ' + esc(mid) + '. Daily figures lag by up to a day; "Active now" is live.</p>' +
+  box.innerHTML = '<h2>Visitors</h2>' + (mid ? '<p class="small muted">Daily figures lag by up to a day; "Active now" is live.</p>' +
     '<div class="row-tools"><label class="small">Period <select id="dash-range"><option value="7">Last 7 days</option><option value="30" selected>Last 30 days</option><option value="90">Last 90 days</option></select></label>' +
     ' <button class="btn primary" id="dash-load">Load dashboard</button></div><div id="dash-out"></div>' : setupHelp('The site build has no measurement ID yet, so visits are not being counted.'));
   if (!mid) return;

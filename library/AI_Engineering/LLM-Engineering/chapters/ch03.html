@@ -1,0 +1,803 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 3 · Running the Model: Prefill, Decode and the KV Cache — Introduction to LLM Engineering</title>
+<meta name="description" content="Chapter 3 of Introduction to LLM Engineering: generation as a loop, the KV cache and its exactness, prefill versus decode, compute/memory/overhead, arithmetic intensity and the roofline, latency models for TTFT and TPOT, and a fully costed request.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script defer src="/library/assets/book-shim.js" data-library="/library/" data-field="/library/AI_Engineering/" data-field-title="AI Engineering"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-chapter="ch03" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Part I · Foundations — Chapter 3</div>
+<h1 id="top">Running the Model: Prefill, Decode and the KV Cache</h1>
+<p class="lede">Generating text calls the model once per token. This chapter works out what must be remembered between calls, where the time goes, and how to predict the latency and cost of a real request from first principles.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Chapter 2 gave us an exact inventory of a Transformer. Llama 3 8B has 8.03 billion parameters, occupies 16 GB in BF16, and costs about 15 GFLOPs per token plus an attention term that grows with context. An H100 performs 989 TFLOP/s. Divide one by the other and you might conclude that it should generate about 65,000 tokens per second. In reality, a single user sees something like 150. Where do the missing two and a half orders of magnitude go?</p>
+<p>The answer is the subject of this chapter, and it is the conceptual core of the whole book. First, generation is a <em>loop</em>, and a naive loop wastes almost all its work recomputing things it already knew. Removing that waste requires a cache, the KV cache, whose size we can calculate exactly and which becomes the dominant consumer of GPU memory. Second, once the waste is removed, each step of the loop is limited not by arithmetic but by how fast data can be read from memory. To make that precise we introduce the most useful tool in performance engineering, <strong>arithmetic intensity</strong> and the <strong>roofline</strong>. With these we can predict, to within a factor that real systems spend the rest of this book closing, the time to first token, the time per output token, the throughput and the cost of serving a request.</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Explain why naive generation costs \(O(NT^2)\), and prove that caching keys and values is exact.</li>
+<li>Define prefill and decode precisely, and say which metric (TTFT or TPOT) each controls.</li>
+<li>Compute KV-cache size for any model, and the maximum number of concurrent sequences on a GPU.</li>
+<li>Classify where a GPU spends time (compute, memory or overhead), and compute arithmetic intensities for linear layers and attention.</li>
+<li>Place operations on a roofline, and explain why decode attention cannot be fixed by batching.</li>
+<li>Predict TTFT, TPOT, throughput and cost per million tokens for a given model, GPU and workload.</li>
+<li>Read a 70-line KV-cached implementation and say what production engines change.</li>
+</ol>
+<p class="small muted">Uses: Chapter 1 (§1.9 the memory wall, §1.10 the bandwidth bound, §1.13 metrics) and Chapter 2 (§2.4 attention and GQA, §2.9–2.11 counting). Symbols: <a href="../notation.html">notation page</a>.</p>
+</div>
+
+<h2 id="s3-1">3.1 Generation is a loop</h2>
+<p>A language model computes \(p(x_{t+1}\mid x_{\le t})\). To generate text from a prompt \(x_{1:n_{\text{in}}}\), we evaluate the model, sample a token from its output distribution, append the token to the sequence and repeat until an end-of-sequence token appears or a length limit is reached. Written as code, the most direct implementation is:</p>
+<pre><code><span class="c-kw">def</span> generate_naive(model, tokens, n_out):
+    <span class="c-kw">for</span> _ <span class="c-kw">in</span> range(n_out):
+        logits = model(tokens)              <span class="c-com"># full forward pass over ALL tokens so far</span>
+        tokens.append(sample(logits[-1]))   <span class="c-com"># only the last position's logits are used</span>
+    <span class="c-kw">return</span> tokens</code></pre>
+<p>This works, and it is exactly how the earliest Transformer demos generated text, but look at what each iteration does. At step \(t\) it runs the whole network on all \(t\) tokens, at a cost of roughly \(2N t\) FLOPs from Chapter 2, and then throws away everything except the last position's logits. Generating \(T\) tokens costs \(\sum_{t=1}^{T}2Nt\approx NT^2\) FLOPs, quadratic in the length, when the useful output is only \(T\) tokens. For a 1,000-token answer that is about 500 times more work than necessary.</p>
+<p>The waste is obvious once stated. At step \(t\) we recompute the hidden states of positions \(1,\dots,t-1\), which we already computed at step \(t-1\). Can we keep them instead? Not all of them are needed, and keeping them all would cost a great deal of memory. The question is <em>which</em> intermediate results the next step actually needs, and whether reusing them gives exactly the same answer.</p>
+<figure class="diagram" id="fig-3-1">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="Naive generation recomputes the whole prefix at every step; cached generation processes one new token per step">
+<text x="20" y="24" class="t-b">Without a cache: recompute everything</text>
+<text x="380" y="24" class="t-b">With a KV cache: one new token per step</text>
+<line x1="360" y1="10" x2="360" y2="240" class="grid"/>
+<g>
+<text x="20" y="56" class="t-xs">step 1</text><rect x="70" y="44" width="40" height="18" rx="3" class="bx2"/>
+<text x="20" y="84" class="t-xs">step 2</text><rect x="70" y="72" width="40" height="18" rx="3" class="fill-muted"/><rect x="112" y="72" width="40" height="18" rx="3" class="bx2"/>
+<text x="20" y="112" class="t-xs">step 3</text><rect x="70" y="100" width="40" height="18" rx="3" class="fill-muted"/><rect x="112" y="100" width="40" height="18" rx="3" class="fill-muted"/><rect x="154" y="100" width="40" height="18" rx="3" class="bx2"/>
+<text x="20" y="140" class="t-xs">step 4</text><rect x="70" y="128" width="40" height="18" rx="3" class="fill-muted"/><rect x="112" y="128" width="40" height="18" rx="3" class="fill-muted"/><rect x="154" y="128" width="40" height="18" rx="3" class="fill-muted"/><rect x="196" y="128" width="40" height="18" rx="3" class="bx2"/>
+<text x="20" y="168" class="t-xs">step 5</text><rect x="70" y="156" width="40" height="18" rx="3" class="fill-muted"/><rect x="112" y="156" width="40" height="18" rx="3" class="fill-muted"/><rect x="154" y="156" width="40" height="18" rx="3" class="fill-muted"/><rect x="196" y="156" width="40" height="18" rx="3" class="fill-muted"/><rect x="238" y="156" width="40" height="18" rx="3" class="bx2"/>
+<text x="175" y="200" text-anchor="middle" class="t-sm">grey = recomputed work already done before</text>
+<text x="175" y="220" text-anchor="middle" class="t-sm t-s2 t-b">total work ∝ 1+2+…+T ≈ T²/2</text>
+</g>
+<g>
+<text x="380" y="56" class="t-xs">step 1</text><rect x="430" y="44" width="40" height="18" rx="3" class="bx2"/>
+<text x="380" y="84" class="t-xs">step 2</text><rect x="430" y="72" width="40" height="18" rx="3" class="bx5" stroke-dasharray="3 3"/><rect x="472" y="72" width="40" height="18" rx="3" class="bx2"/>
+<text x="380" y="112" class="t-xs">step 3</text><rect x="430" y="100" width="82" height="18" rx="3" class="bx5" stroke-dasharray="3 3"/><rect x="514" y="100" width="40" height="18" rx="3" class="bx2"/>
+<text x="380" y="140" class="t-xs">step 4</text><rect x="430" y="128" width="124" height="18" rx="3" class="bx5" stroke-dasharray="3 3"/><rect x="556" y="128" width="40" height="18" rx="3" class="bx2"/>
+<text x="380" y="168" class="t-xs">step 5</text><rect x="430" y="156" width="166" height="18" rx="3" class="bx5" stroke-dasharray="3 3"/><rect x="598" y="156" width="40" height="18" rx="3" class="bx2"/>
+<text x="540" y="200" text-anchor="middle" class="t-sm">dashed = cached K,V that is <tspan class="t-b">read</tspan>, not recomputed</text>
+<text x="540" y="220" text-anchor="middle" class="t-sm t-acc t-b">compute ∝ T, but each step reads a growing cache</text>
+</g>
+</svg>
+<figcaption><b>Figure 3.1 — Why we cache.</b> Left: the naive loop re-runs the network on every earlier token at every step. Right: with a KV cache, each step runs the network on one new token (orange) and reads the stored keys and values of earlier tokens (dashed).</figcaption></figure>
+
+<p>Figure 3.1 contrasts the two strategies. On the left, the naive loop's work at step \(t\) is a row of \(t\) blocks, all but the last of them recomputation (grey), so the total work forms a triangle of area about \(T^2/2\). On the right, each step computes only one new block (orange), but it must <em>read</em> a growing row of stored results (dashed). The arithmetic becomes linear in \(T\). The price is memory to hold the stored results and bandwidth to read them, the two costs that occupy the rest of this chapter.</p>
+
+
+<h2 id="s3-2">3.2 The KV cache</h2>
+<p>Look at one layer from the point of view of the newest position \(t\). Everything a Transformer block does is position-wise (the norms, the projections, the FFN) except for attention, where position \(t\)'s query is compared with the keys of positions \(1,\dots,t\) and averages their values. So the only information about earlier positions that the new position needs, in each layer, is their <strong>keys and values</strong>. If we store, for every layer, the keys and values of all previous positions, then processing a new token requires running the network on that token alone, plus reading the stored keys and values. That store is the <strong>KV cache</strong>.</p>
+<p>Is it exact? Could the keys of earlier positions change when a new token arrives? For a causal model they cannot, and the proof is a short induction.</p>
+
+<div class="box thm">
+<div class="box-title">Proposition — KV caching is exact</div>
+<p>Let \(h^{(\ell)}_j\) be the residual-stream vector of position \(j\) after layer \(\ell\). <em>Claim:</em> \(h^{(\ell)}_j\) depends only on the tokens \(x_{1:j}\). <em>Proof</em> by induction on \(\ell\). For \(\ell=0\), \(h^{(0)}_j = (W_E)_{x_j}\), the embedding of token \(x_j\). Suppose the claim holds for \(\ell-1\). In layer \(\ell\), the norms, projections and FFN act on each position separately. Attention at position \(j\) combines its query with keys and values of positions \(i\le j\) only, because of the causal mask. Each of these is a function of \(h^{(\ell-1)}_i\), which by hypothesis depends only on \(x_{1:i}\subseteq x_{1:j}\). Hence \(h^{(\ell)}_j\) depends only on \(x_{1:j}\). ∎</p>
+<p>Consequently the keys and values of positions \(1,\dots,t\) are identical whether they are computed in one pass over \(x_{1:t}\) or incrementally, and appending tokens never changes them. Caching them is pure memoisation. (In floating point, results can differ in the last bits, because the two computations add numbers in different orders. Chapter 4 returns to this.)</p>
+</div>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — what a cache is</div>
+<p>In computing, a <em>cache</em> stores the results of a computation so they can be reused instead of recomputed. Mathematically it is memoisation: if \(f\) will be evaluated again at the same arguments, store \(f\)'s values. The KV cache memoises the maps \(j\mapsto (k^{(\ell)}_j, v^{(\ell)}_j)\) for all layers \(\ell\). It is valid because, as the proposition shows, these values never depend on arguments that change later.</p>
+</div>
+
+<h3 id="prefill-decode">Prefill and decode, precisely</h3>
+<p>With a cache, generation splits into two phases that behave very differently. Chapter 1 introduced them informally; now we can define them.</p>
+<p><strong>Prefill</strong> processes the prompt. All \(n_{\text{in}}\) prompt tokens are known, so the model runs on all of them in a single forward pass, exactly like a training forward pass without the backward pass. Every weight matrix multiplies a matrix with \(B\cdot n_{\text{in}}\) rows. The pass writes the keys and values of every prompt token, in every layer, into the cache, and produces the logits of the last position, from which the first output token is sampled. Prefill therefore determines the <strong>time to first token (TTFT)</strong>, apart from queueing.</p>
+<p><strong>Decode</strong> produces the rest of the output, one token per step. Each step feeds only the newest token of each sequence through the network. Every weight matrix multiplies a matrix with just \(B\) rows, one per sequence in the batch. Each layer computes the new token's query, key and value, appends the key and value to the cache, and attends over the whole cache. Each step yields one token per sequence, so decode determines the <strong>time per output token (TPOT)</strong>.</p>
+
+<figure class="diagram" id="fig-3-2">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-label="Prefill processes all prompt tokens at once; decode processes one token per step">
+<defs><marker id="a26" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<text x="150" y="20" text-anchor="middle" class="t-b">Prefill: one pass, n_in tokens</text>
+<text x="500" y="20" text-anchor="middle" class="t-b">Decode: one pass per output token</text>
+<g>
+<rect x="30" y="40" width="240" height="70" rx="10" class="bx2"/>
+<text x="150" y="68" text-anchor="middle" class="t-sm">model on (B, n_in) tokens</text>
+<text x="150" y="88" text-anchor="middle" class="t-xs">GEMMs with M = B·n_in rows</text>
+<g class="t-xs">
+<rect x="40" y="140" width="22" height="22" class="bx2"/><rect x="64" y="140" width="22" height="22" class="bx2"/><rect x="88" y="140" width="22" height="22" class="bx2"/><rect x="112" y="140" width="22" height="22" class="bx2"/><rect x="136" y="140" width="22" height="22" class="bx2"/><rect x="160" y="140" width="22" height="22" class="bx2"/><rect x="184" y="140" width="22" height="22" class="bx2"/><rect x="208" y="140" width="22" height="22" class="bx2"/>
+</g>
+<line x1="150" y1="138" x2="150" y2="112" class="ln" marker-end="url(#a26)"/>
+<text x="150" y="182" text-anchor="middle" class="t-xs">prompt tokens (all at once)</text>
+<text x="150" y="206" text-anchor="middle" class="t-sm t-s2">compute-bound · sets TTFT</text>
+</g>
+<line x1="290" y1="30" x2="290" y2="220" class="grid"/>
+<g>
+<rect x="320" y="40" width="70" height="70" rx="8" class="bx5"/><text x="355" y="70" text-anchor="middle" class="t-xs">step 1</text><text x="355" y="86" text-anchor="middle" class="t-xs">(B, 1)</text>
+<rect x="400" y="40" width="70" height="70" rx="8" class="bx5"/><text x="435" y="70" text-anchor="middle" class="t-xs">step 2</text><text x="435" y="86" text-anchor="middle" class="t-xs">(B, 1)</text>
+<rect x="480" y="40" width="70" height="70" rx="8" class="bx5"/><text x="515" y="70" text-anchor="middle" class="t-xs">step 3</text><text x="515" y="86" text-anchor="middle" class="t-xs">(B, 1)</text>
+<text x="580" y="80" text-anchor="middle">· · ·</text>
+<rect x="610" y="40" width="80" height="70" rx="8" class="bx5"/><text x="650" y="70" text-anchor="middle" class="t-xs">step n_out</text><text x="650" y="86" text-anchor="middle" class="t-xs">(B, 1)</text>
+<line x1="390" y1="75" x2="398" y2="75" class="ln" marker-end="url(#a26)"/><line x1="470" y1="75" x2="478" y2="75" class="ln" marker-end="url(#a26)"/>
+<rect x="320" y="136" width="370" height="26" rx="5" class="fill-muted"/>
+<rect x="320" y="136" width="210" height="26" rx="5" class="bx2" opacity=".6"/>
+<text x="425" y="153" text-anchor="middle" class="t-xs">prompt K,V (from prefill)</text>
+<rect x="530" y="136" width="20" height="26" class="bx5"/><rect x="550" y="136" width="20" height="26" class="bx5"/><rect x="570" y="136" width="20" height="26" class="bx5"/>
+<text x="640" y="153" text-anchor="middle" class="t-xs">grows by 1/step</text>
+<text x="505" y="182" text-anchor="middle" class="t-xs">KV cache read in full every step, in every layer</text>
+<text x="505" y="206" text-anchor="middle" class="t-sm t-acc">memory-bound · sets TPOT</text>
+</g>
+</svg>
+<figcaption><b>Figure 3.2 — Two phases of generation.</b> Prefill processes all prompt tokens at once and builds the cache. Each decode step processes one new token per sequence and must re-read the whole cache.</figcaption></figure>
+
+<p>Figure 3.2 contrasts the two phases. On the left, prefill is one large computation over all prompt tokens, and its matrix products have \(B\cdot n_{\text{in}}\) rows, often thousands. On the right, decode is a long sequence of small computations whose matrix products have only \(B\) rows. Beneath them the cache grows by one entry per step, and every step reads it in full. Sections 3.4–3.6 explain why "large matrix products" means limited by arithmetic and "small matrix products plus a full cache read" means limited by memory bandwidth. First we measure the cache.</p>
+
+<h2 id="s3-3">3.3 How big is the KV cache?</h2>
+<p>For each token, each layer stores one key vector and one value vector for each of its \(n_{kv}\) key/value heads, each of dimension \(d_h\). At \(b_{kv}\) bytes per element:</p>
+<div class="box formula">
+\[ s_{kv} = 2\cdot L\cdot n_{kv}\cdot d_h\cdot b_{kv} \ \ \text{bytes per token},\qquad \text{KV}_{\text{total}} = s_{kv}\cdot\sum_{\text{sequences}} t_{\text{seq}} , \]
+<p class="small">where \(t_{\text{seq}}\) is the current length (prompt plus generated tokens) of each live sequence.</p>
+</div>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>Model</th><th>Attention</th><th class="num">\(L\)</th><th class="num">\(n_{kv}\times d_h\)</th><th class="num">\(s_{kv}\) (BF16)</th><th class="num">One 32k-token sequence</th></tr></thead>
+<tbody>
+<tr><td>Llama 2 7B</td><td>MHA</td><td class="num">32</td><td class="num">32 × 128</td><td class="num">512 KiB</td><td class="num">16 GiB</td></tr>
+<tr><td><strong>Llama 3 8B</strong></td><td>GQA (\(g=4\))</td><td class="num">32</td><td class="num">8 × 128</td><td class="num">128 KiB</td><td class="num">4 GiB</td></tr>
+<tr><td><strong>Llama 3 70B</strong></td><td>GQA (\(g=8\))</td><td class="num">80</td><td class="num">8 × 128</td><td class="num">320 KiB</td><td class="num">10 GiB</td></tr>
+<tr><td>Llama 3.1 405B</td><td>GQA (\(g=16\))</td><td class="num">126</td><td class="num">8 × 128</td><td class="num">504 KiB</td><td class="num">15.75 GiB</td></tr>
+<tr><td><strong>DeepSeek-V3</strong></td><td>MLA</td><td class="num">61</td><td class="num">latent 512 + RoPE 64</td><td class="num">≈ 68.6 KiB</td><td class="num">≈ 2.1 GiB</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The table repays careful reading. Llama 2 7B and Llama 3 8B are almost the same size, but the older model, with full multi-head attention, needs four times as much cache per token. A single 32k-token conversation with Llama 2 7B needs 16 GiB of cache, as much as the model's own weights. The 405B model, despite being 50 times larger than Llama 3 8B, needs only four times its cache per token, because it shares each KV head among 16 query heads. DeepSeek-V3, a 671-billion-parameter model, needs about half of Llama 3 8B's cache per token, because MLA caches a single compressed 512-dimensional latent plus a 64-dimensional rotated key per layer, rather than per-head keys and values (Chapter 8 derives this). The evolution of attention variants, MHA → GQA → MLA, is above all a story of shrinking \(s_{kv}\).</p>
+
+<figure class="chart" id="fig-3-3">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"KV cache size versus context length (one sequence, BF16)","height":340,
+ "x":{"label":"Context length (tokens)","min":0,"max":131072,"ticks":[0,16384,32768,65536,98304,131072]},
+ "y":{"label":"KV cache (GiB)","min":0,"max":70,"ticks":[0,10,20,30,40,50,60,70]},
+ "hlines":[{"y":15,"text":"Llama 3 8B weights ≈ 15 GiB"}],
+ "series":[
+  {"name":"Llama 2 7B (MHA)","color":"s2","markers":false,"points":[[0,0],[131072,64]]},
+  {"name":"Llama 3 70B (GQA)","color":"s1","markers":false,"points":[[0,0],[131072,40]]},
+  {"name":"Llama 3 8B (GQA)","color":"s3","markers":false,"points":[[0,0],[131072,16]]},
+  {"name":"DeepSeek-V3 (MLA)","color":"s5","markers":false,"points":[[0,0],[131072,8.58]]}
+ ]}
+</script>
+<figcaption><b>Figure 3.3 — The KV cache grows linearly with context.</b> One sequence, BF16 cache. The dashed line marks the size of Llama 3 8B's own weights.</figcaption></figure>
+
+<p>Figure 3.3 plots cache size against context length for one sequence. Every line is straight, since the cache is linear in tokens, and the slopes are the \(s_{kv}\) values of the table. Compare them with the dashed line at Llama 3 8B's weight size: a single 128k-token conversation with that model needs as much memory for its cache as for the entire model. Concurrency multiplies this. A server with 64 users at 8k tokens each holds 512k tokens of cache, 64 GiB for Llama 3 8B. That is why, in practice, <strong>KV-cache capacity, not compute, usually decides how many requests a GPU can serve at once</strong>.</p>
+
+<details class="drill">
+<summary>Drill 3.1 — How many users fit?</summary>
+<p>Serve Llama 3 8B in BF16 on one 80 GB H100. Reserve 4 GB for activations and workspace. Users have 6,144-token contexts on average. How many can be served concurrently?</p>
+<p><em>Solution.</em> Weights take 16.1 GB, so about \(80-16.1-4\approx 59.9\) GB is left for the cache. Each user needs \(6144\times131{,}072\) B ≈ 0.805 GB, so about 74 users fit. With an FP8 cache (\(b_{kv}=1\)) about 148 fit. With Llama 2 7B's multi-head attention, only about 18 would fit.</p>
+</details>
+
+<p>The cache solves the recomputation problem of §3.1, but it creates a new one: every decode step must <em>read</em> it. Before quantifying that cost, we need a way to reason about where time goes on a GPU.</p>
+
+<h2 id="s3-4">3.4 Where does the time go?</h2>
+<p>When an operation runs on a GPU, its time is spent in one of three ways. This decomposition, popularised by Horace He<span class="cite"><a href="#r-brrr">[1]</a></span>, is the first question to ask about any slow computation.</p>
+<ul>
+<li><strong>Compute.</strong> Time spent doing arithmetic on the compute units. For a computation of \(F\) FLOPs on a GPU with peak \(\pi\), this is at least \(F/\pi\).</li>
+<li><strong>Memory.</strong> Time spent moving data between the GPU's main memory (HBM) and its compute units. For \(Q\) bytes moved at bandwidth \(\beta\), this is at least \(Q/\beta\).</li>
+<li><strong>Overhead.</strong> Everything else: the Python interpreter deciding what to run next, the CPU telling the GPU to start each <em>kernel</em> (a function that runs on the GPU), scheduling, sampling logic, network I/O. Overhead does not grow with the size of the tensors, so it dominates when the work is small.</li>
+</ul>
+<p>Modern GPUs can overlap computation with data movement, so to first order an operation takes the <em>larger</em> of its compute time and its memory time, plus whatever overhead is not hidden:</p>
+\[ t \;\approx\; \max\Big(\frac{F}{\pi},\ \frac{Q}{\beta}\Big) + t_{\text{overhead}} . \]
+
+<figure class="diagram" id="fig-3-4">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="Time breakdown of three workloads into compute, memory and overhead">
+<text x="20" y="24" class="t-b">Same model (Llama 3 8B, H100, BF16), three situations — idealised time per forward pass</text>
+<text x="20" y="66" class="t-sm">Prefill, 2,048 tokens</text>
+<rect x="190" y="50" width="440" height="26" rx="4" class="fill-s2" opacity=".75"/><text x="410" y="68" text-anchor="middle" class="t-sm">compute ≈ 32 ms</text>
+<rect x="190" y="80" width="66" height="10" rx="2" class="fill-acc" opacity=".55"/><text x="262" y="89" class="t-xs">memory ≈ 4.8 ms (hidden under compute)</text>
+<text x="20" y="128" class="t-sm">Decode, batch 1</text>
+<rect x="190" y="112" width="66" height="26" rx="4" class="fill-acc" opacity=".8"/><text x="262" y="130" class="t-sm">memory ≈ 4.8 ms</text>
+<rect x="190" y="142" width="2" height="10" class="fill-s2"/><text x="198" y="151" class="t-xs">compute ≈ 0.016 ms</text>
+<text x="20" y="190" class="t-sm">Decode, batch 1,</text><text x="20" y="206" class="t-sm">no CUDA graphs</text>
+<rect x="190" y="176" width="66" height="26" rx="4" class="fill-acc" opacity=".8"/>
+<rect x="258" y="176" width="40" height="26" rx="4" class="fill-s4" opacity=".8"/><text x="306" y="194" class="t-sm">+ overhead ≈ 2–3 ms of kernel launches and Python</text>
+<line x1="190" y1="226" x2="630" y2="226" class="ln"/><text x="190" y="242" class="t-xs">0</text><text x="630" y="220" text-anchor="end" class="t-xs">32 ms</text>
+<rect x="420" y="232" width="10" height="10" class="fill-s2" opacity=".75"/><text x="434" y="241" class="t-xs">compute</text>
+<rect x="490" y="232" width="10" height="10" class="fill-acc" opacity=".8"/><text x="504" y="241" class="t-xs">memory</text>
+<rect x="560" y="232" width="10" height="10" class="fill-s4" opacity=".8"/><text x="574" y="241" class="t-xs">overhead</text>
+</svg>
+<figcaption><b>Figure 3.4 — Compute, memory and overhead.</b> Prefill is dominated by arithmetic. Decode at batch 1 is dominated by reading 16 GB of weights; its arithmetic is negligible. Small steps also expose fixed per-kernel overheads.</figcaption></figure>
+
+<p>Figure 3.4 applies the decomposition to three situations, all with Llama 3 8B on an H100. A 2,048-token prefill performs about \(3.2\times10^{13}\) FLOPs (from §2.10), which takes 32 ms at peak. It also reads the 16 GB of weights once (4.8 ms), but that happens in parallel with the arithmetic, so prefill is <em>compute-bound</em>. A decode step at batch 1 must read the same 16 GB but performs only \(1.5\times10^{10}\) FLOPs, 0.016 ms of arithmetic, so it is <em>memory-bound</em> by a factor of 300. The third bar shows something easy to forget. A decode step on a small model launches hundreds of kernels, one or more per operation per layer, and each launch costs a few microseconds of CPU time. Without countermeasures, the overhead can rival the memory time. Production engines remove most of it by recording the whole step as a single "CUDA graph" that the GPU replays with one launch (Chapter 7). For the rest of this chapter we assume overhead has been dealt with, and focus on the competition between compute and memory.</p>
+
+<h2 id="s3-5">3.5 Arithmetic intensity and the roofline</h2>
+<p>Whether an operation is compute-bound or memory-bound depends on a single number: how much arithmetic it does per byte it moves.</p>
+<div class="box def">
+<div class="box-title">Definition — arithmetic intensity, roofline, ridge point</div>
+<p>The <strong>arithmetic intensity</strong> of an operation is \(I = F/Q\), its FLOPs divided by the bytes it moves to or from main memory. Since \(t\approx\max(F/\pi, Q/\beta)\), its achieved throughput \(F/t\) obeys the <strong>roofline</strong> bound of Williams, Waterman and Patterson<span class="cite"><a href="#r-roofline">[2]</a></span>:
+\[ \text{attainable FLOP/s} = \min(\pi,\ I\cdot\beta). \]
+The two terms are equal at the <strong>ridge point</strong> \(I^{*} = \pi/\beta\). Operations with \(I&lt;I^{*}\) are memory-bound, and those with \(I&gt;I^{*}\) are compute-bound. For an H100 in dense BF16, \(I^{*}\approx 989\times10^{12}/3.35\times10^{12}\approx 295\) FLOPs per byte.</p>
+</div>
+<p>The ridge point is the "295 operations per byte" of the factory-and-warehouse picture in Chapter 1 (§1.9), now given a name. The roofline converts the question "how fast will this run?" into "what is its intensity?", which is a property of the algorithm alone and can be computed with pen and paper. We now compute it for the two kinds of operation that make up an LLM.</p>
+
+<h3 id="ai-linear">Linear layers: intensity equals tokens per weight read</h3>
+<p>A weight matrix \(W\in\mathbb{R}^{k\times n}\) applied to \(m\) token vectors performs \(2mkn\) FLOPs. It moves \(b(kn + mk + mn)\) bytes: the weights, the input activations and the outputs. Hence</p>
+\[ I_{\text{linear}} = \frac{2mkn}{b(kn+mk+mn)} \;\xrightarrow{\;m\ll k,n\;}\; \frac{2m}{b}\qquad(=m\ \text{FLOPs per byte in BF16}). \]
+<p>The interpretation is simple and important. <strong>In BF16, every token that shares a weight read contributes about one FLOP per byte.</strong> In decode, \(m=B\), the number of sequences in the batch: at \(B=1\) the intensity is 1, and at \(B=64\) it is about 64, still well below the ridge. In prefill, \(m=B\cdot n_{\text{in}}\), typically thousands, so the intensity is far above the ridge and prefill is compute-bound. (When \(m\) becomes comparable to \(k\) and \(n\), the activation terms cap the intensity, but at hundreds or thousands of FLOPs per byte, which is still above the ridge.) For weight-dominated decode, the batch size at which the GPU becomes compute-bound is roughly the ridge point itself: \(B^{*}\approx I^{*}b/2\), about 295 on an H100 in BF16 and about 150 on an A100. This is why serving systems try to run hundreds of sequences concurrently.</p>
+
+<h3 id="ai-attention">Decode attention: an intensity that batching cannot raise</h3>
+<p>Attention in decode is different, because its "weights" are the KV cache, and every sequence has its own. For one sequence at context length \(t\), one layer reads its cached keys and values, \(2\,t\,n_{kv}d_h\,b_{kv}\) bytes, and performs \(4\,t\,n_hd_h\) FLOPs (scores and weighted sum over \(n_h\) query heads, §2.10). Therefore</p>
+\[ I_{\text{attn, decode}} = \frac{4\,t\,n_hd_h}{2\,t\,n_{kv}d_h\,b_{kv}} = \frac{2}{b_{kv}}\cdot\frac{n_h}{n_{kv}} = \frac{2g}{b_{kv}} . \]
+<p>In BF16, multi-head attention has intensity 1 and GQA with group size \(g\) has intensity \(g\) (4 for Llama 3 8B, 8 for Llama 3 70B). This number has two remarkable properties. It does not depend on the context length, because both FLOPs and bytes grow linearly in \(t\). And it <strong>does not depend on the batch size</strong>. A batch of \(B\) sequences reads \(B\) separate caches and does \(B\) times the arithmetic, so the ratio is unchanged. Batching amortises the weights but cannot amortise the cache. As contexts grow, the cache read grows to dominate each step, and no amount of batching helps. Only reducing \(s_{kv}\) does: more query heads per KV head (GQA, MQA), compression (MLA), fewer bytes per element (FP8 cache), or reading fewer entries (sparse attention). That list is essentially the table of contents of Chapter 8.</p>
+
+<figure class="chart" id="fig-3-5">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Roofline: H100 and A100 (dense BF16)","height":380,
+ "x":{"label":"Arithmetic intensity (FLOPs / byte, log)","log":true,"min":0.5,"max":10000},
+ "y":{"label":"Attainable TFLOP/s (log)","log":true,"min":1,"max":2000},
+ "series":[
+  {"name":"H100 SXM roofline","color":"s1","markers":false,"points":[[0.5,1.675],[295,989],[10000,989]]},
+  {"name":"A100 SXM roofline","color":"s2","markers":false,"dash":true,"points":[[0.5,1.02],[153,312],[10000,312]]},
+  {"name":"Operators on H100","color":"s3","line":false,"labels":true,"points":[
+    [1,3.35,"decode linear, B=1 / MHA attention",{"dx":-10,"dy":-8,"a":"end"}],[8,26.8,"GQA-8 decode attention",{"dx":-10,"dy":-8,"a":"end"}],[64,214,"decode linear, B=64",{"dx":-8,"a":"end"}],[2000,989,"prefill, 2k tokens",{"dx":-8,"dy":16,"a":"end"}]]}
+ ],
+ "vlines":[{"x":295,"text":"H100 ridge ≈ 295"}]}
+</script>
+<figcaption><b>Figure 3.5 — The roofline for H100 and A100 (dense BF16), with LLM operations placed on it.</b></figcaption></figure>
+
+<p>Figure 3.5 draws the roofline on log–log axes. To the left of the H100's ridge at 295, attainable throughput rises along a line of slope one, the bandwidth \(\beta\). To the right it is flat at \(\pi\). The A100's roofline (dashed) is lower on both counts. Its ridge is further left, at about 153, because it has relatively more bandwidth per FLOP. The green points are our operations. Decode at batch 1 and MHA decode attention sit at intensity 1, achieving at most 3.35 TFLOP/s, a third of one percent of peak. GQA-8 decode attention sits at 8. A decode linear layer at batch 64 reaches about 214 TFLOP/s. Prefill of a 2,048-token prompt sits on the flat part. Every optimisation in this book can be read as moving a point to the right (raising intensity) or raising one of the roofs (better hardware).</p>
+
+<h2 id="s3-6">3.6 A latency model for decode</h2>
+<p>We can now write down the time of one decode step for a batch of \(B\) sequences whose average context is \(\bar t\). The bytes moved are the weights, once, plus every sequence's cache. The FLOPs are the weight FLOPs for \(B\) tokens plus the attention FLOPs:</p>
+<div class="box formula">
+\[ t_{\text{step}}(B) \approx \max\Bigg(\underbrace{\frac{N b_w + B\,\bar t\, s_{kv}}{\beta}}_{\text{memory time}},\ \underbrace{\frac{2N_{\text{mm}}B + 4Ld\bar tB}{\pi}}_{\text{compute time}}\Bigg) + t_{\text{overhead}} . \]
+<p class="small">Per-user speed is \(1/t_{\text{step}}\) tokens per second, and total throughput is \(B/t_{\text{step}}\).</p>
+</div>
+
+
+<figure class="diagram" id="fig-3-6">
+<svg class="dg" viewBox="0 0 720 200" role="img" aria-label="Bytes read per decode step split into weights and KV cache at three batch sizes">
+<text x="20" y="22" class="t-b">Bytes read from HBM per decode step — Llama 3 8B, BF16, 2,048-token contexts</text>
+<text x="20" y="62" class="t-sm">B = 1</text><rect x="110" y="46" width="101" height="24" rx="3" class="fill-s4" opacity=".7"/><rect x="212" y="46" width="2" height="24" class="fill-s5"/><text x="222" y="63" class="t-xs">16.1 GB weights + 0.3 GB KV</text>
+<text x="20" y="102" class="t-sm">B = 64</text><rect x="110" y="86" width="101" height="24" rx="3" class="fill-s4" opacity=".7"/><rect x="212" y="86" width="108" height="24" rx="3" class="fill-s5" opacity=".6"/><text x="328" y="103" class="t-xs">16.1 GB + 17.2 GB KV</text>
+<text x="20" y="142" class="t-sm">B = 224</text><rect x="110" y="126" width="101" height="24" rx="3" class="fill-s4" opacity=".7"/><rect x="212" y="126" width="379" height="24" rx="3" class="fill-s5" opacity=".6"/><text x="598" y="143" class="t-xs">16.1 + 60.1 GB</text>
+<rect x="110" y="172" width="10" height="10" class="fill-s4" opacity=".7"/><text x="125" y="181" class="t-xs">weights (read once, shared by the whole batch)</text>
+<rect x="400" y="172" width="10" height="10" class="fill-s5" opacity=".6"/><text x="415" y="181" class="t-xs">KV caches (one per sequence, not shared)</text>
+</svg>
+<figcaption><b>Figure 3.6 — What a decode step reads.</b> The weight bytes are fixed and shared by every sequence in the batch; the cache bytes grow with batch size and context. By batch 64 the cache already outweighs the model.</figcaption></figure>
+
+<p>Before evaluating the formula, look at the numerator of its memory term, drawn in Figure 3.6. At batch 1 the step reads the 16 GB of weights and a negligible 0.3 GB of cache. At batch 64 it reads the same weights, which are shared, plus 17 GB of caches, which are not. At batch 224 the caches are almost four times the weights. Batching helps exactly as long as the shared part dominates.</p>
+
+<figure class="chart" id="fig-3-7">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Llama 3 8B decode step on one H100, context 2,048","height":340,
+ "x":{"label":"Batch size B","min":0,"max":240,"ticks":[0,32,64,96,128,160,192,224]},
+ "y":{"label":"Time per decode step (ms)","min":0,"max":24,"ticks":[0,4,8,12,16,20,24]},
+ "series":[
+  {"name":"Memory time: (weights + KV) / bandwidth","color":"s1","points":[[1,4.87],[8,5.44],[16,6.08],[32,7.36],[64,9.92],[128,15.05],[224,22.74]]},
+  {"name":"Compute time: FLOPs / peak","color":"s2","points":[[1,0.02],[8,0.14],[16,0.28],[32,0.55],[64,1.11],[128,2.22],[224,3.88]]}
+ ],
+ "notes":[{"x":8,"y":21.5,"text":"KV capacity limit: B ≈ 238 (64 GB of KV) — beyond the right edge"}]}
+</script>
+<figcaption><b>Figure 3.7 — Decode step time for Llama 3 8B on one H100 at 2,048-token contexts.</b> Idealised model: 16.06 GB of weights, 128 KiB of cache per token, 3.35 TB/s, 989 TFLOP/s.</figcaption></figure>
+
+<p>Figure 3.7 evaluates the model for Llama 3 8B on an H100 with 2,048-token contexts. The memory line starts at 4.9 ms, the time to read the weights, and rises by 0.27 GB of cache, about 0.08 ms, per additional sequence. The compute line starts near zero and rises too, but stays far below the memory line. Two conclusions follow. First, the step is memory-bound at every batch size that fits. Second, by \(B\approx64\) the cache traffic (17 GB) already exceeds the weight traffic (16 GB). Memory capacity runs out at about 238 sequences of 2,048 tokens, before the compute line becomes relevant. For this model at these context lengths, throughput is bounded by the size and bandwidth of HBM, not by FLOPs.</p>
+
+<div class="table-wrap">
+<table>
+<caption>Throughput implied by Figure 3.7 (ideal: 100% of bandwidth, no overhead).</caption>
+<thead><tr><th class="num">Batch \(B\)</th><th class="num">Step time (ms)</th><th class="num">Per-user tokens/s</th><th class="num">Total tokens/s</th></tr></thead>
+<tbody>
+<tr><td class="num">1</td><td class="num">4.87</td><td class="num">205</td><td class="num">205</td></tr>
+<tr><td class="num">16</td><td class="num">6.08</td><td class="num">165</td><td class="num">2,633</td></tr>
+<tr><td class="num">64</td><td class="num">9.92</td><td class="num">101</td><td class="num">6,450</td></tr>
+<tr><td class="num">128</td><td class="num">15.05</td><td class="num">66</td><td class="num">8,505</td></tr>
+<tr><td class="num">224</td><td class="num">22.74</td><td class="num">44</td><td class="num">9,850</td></tr>
+</tbody>
+</table>
+</div>
+<p>Read the table as a <strong>latency–throughput frontier</strong>. Going from \(B=1\) to \(B=64\) multiplies total throughput by 31 while per-user speed halves. Going further to \(B=224\) adds only 50% more throughput, at the cost of more than halving per-user speed again. Where to operate is a product decision. An interactive tier might run at \(B\approx16\)–32 for snappy streaming; a batch-processing tier would fill memory. Every optimisation in this book moves the frontier outward. An FP8 cache halves the slope of the memory line. Quantised weights lower its intercept. Speculative decoding (Chapter 20) produces several tokens per step. Prefix sharing (Chapter 10) lets sequences share cache entries.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — Llama 3 70B on one 8×H100 server</div>
+<p><strong>Setup.</strong> Llama 3 70B in BF16, its 141 GB of weights split evenly across eight H100s by tensor parallelism (Chapter 14), so that the server behaves like one device with \(8\times3.35=26.8\) TB/s of bandwidth and \(8\times989\) TFLOP/s of compute. The cache costs \(s_{kv}=2\times80\times8\times128\times2\) B = 320 KiB per token. We run 64 sequences at an average context of 4,096 tokens, with 80% of peak bandwidth, and ignore the cost of communication between the GPUs, which Chapter 17 shows adds 13–30% to a decode step unless it is overlapped with computation.</p>
+<p><strong>Bytes per step.</strong> The cache holds \(64\times4096\times320\) KiB = 80 GiB ≈ 86 GB. Weights plus cache are 227 GB, read (ignoring communication) in \(227/(0.8\times26.8)\approx10.6\) ms. The compute for the same step is \(64\times141\) GFLOP ≈ 9.0 TFLOP, 1.1 ms at full peak, so decode is memory-bound by a factor of ten, just as it was for the 8B model.</p>
+<p><strong>Throughput and cost.</strong> \(64/0.0106\approx6{,}000\) output tokens per second. Eight GPUs at $2.50 per hour cost $20 per hour, so a million output tokens cost \(20/(6000\times3600)\times10^6\approx\$0.92\), about 6.6 times the 8B figure for 8.8 times the parameters. The gap is smaller than the parameter ratio because the 70B model\'s cache per token is only 2.5 times larger: GQA with eight KV heads keeps the cache from growing in step with the weights.</p>
+<p><strong>Capacity.</strong> If about 90% of the 640 GB is usable, \(576-141=435\) GB remain for cache, enough for \(435/1.34\approx320\) sequences at 4k context. Running more sequences per step amortises the weights further, and §3.8 and Chapter 11 show how far that can be pushed before latency suffers.</p>
+</div>
+
+<h2 id="s3-7">3.7 A latency model for prefill</h2>
+<p>Prefill is compute-bound, so its time is FLOPs divided by achieved FLOP/s. From §2.10 a prompt of \(n_{\text{in}}\) tokens costs about \(2N_{\text{mm}}n_{\text{in}} + 2Ld\,n_{\text{in}}^2\) FLOPs. Real kernels do not reach the datasheet peak \(\pi\). The fraction achieved is called <strong>model FLOPs utilisation (MFU)</strong>, typically 40–70% for large prefills. Hence</p>
+<div class="box formula">
+\[ \text{TTFT} \approx t_{\text{queue}} + \frac{2N_{\text{mm}}n_{\text{in}} + 2Ld\,n_{\text{in}}^2}{\text{MFU}\cdot\pi} . \]
+</div>
+
+<figure class="chart" id="fig-3-8">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Prefill time versus prompt length, Llama 3 8B, one H100 at 50% MFU","height":330,
+ "x":{"label":"Prompt length n_in (tokens, log)","log":true,"min":1000,"max":131072,"ticks":[1000,4000,16000,64000,128000]},
+ "y":{"label":"Prefill time (s, log)","log":true,"min":0.01,"max":20,"ticks":[0.01,0.1,1,10]},
+ "hlines":[{"y":0.5,"text":"typical interactive TTFT target ≈ 0.5 s"}],
+ "series":[
+  {"name":"Weights term only (linear)","color":"s1","dash":true,"markers":false,"points":[[1000,0.0303],[4096,0.124],[16384,0.497],[32768,0.994],[65536,1.99],[131072,3.98]]},
+  {"name":"Weights + attention","color":"s2","points":[[1000,0.0309],[4096,0.133],[16384,0.639],[32768,1.55],[65536,4.27],[131072,13.1]]}
+ ]}
+</script>
+<figcaption><b>Figure 3.8 — Prefill time grows superlinearly.</b> The weight term is linear in prompt length; the attention term is quadratic and dominates beyond about 28k tokens.</figcaption></figure>
+
+<p>Figure 3.8 plots this model for Llama 3 8B on one H100 at 50% MFU. On log–log axes the weight term (dashed) is a line of slope one. The full cost bends upward as the quadratic attention term takes over beyond about 28k tokens, the crossover found in §2.10. A 4k-token prompt prefills in about 130 ms, comfortably within an interactive budget. A 32k-token document takes about 1.5 s, and a 128k-token one about 13 s. Long prompts therefore create two problems. The user waits a long time for the first token, and while the GPU is busy with one long prefill, every other user's decode stalls. The second problem motivates <em>chunked prefill</em>, which splits long prompts into pieces interleaved with decode steps (Chapter 11), and <em>disaggregation</em>, which runs prefills on separate GPUs (Chapter 13). Prefix caching (Chapter 10) attacks the first: if the same document was read recently, its cache can be reused and the prefill skipped.</p>
+
+<h2 id="s3-8">3.8 The life of a request, fully costed</h2>
+<p>We now have every piece needed to cost a real workload end to end. Here is a complete worked example of the kind interviewers love, using only quantities derived in this book.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — a chat service on one H100</div>
+<p><strong>Setup.</strong> Llama 3 8B in BF16 on one H100. Requests have \(n_{\text{in}}=2{,}000\) prompt tokens and \(n_{\text{out}}=500\) output tokens. We aim to run about 64 sequences concurrently in decode, and assume realistic efficiencies: 50% MFU in prefill and 80% of peak bandwidth in decode.</p>
+<p><strong>TTFT.</strong> Prefill FLOPs: \(2\times7.5\times10^9\times2000 + 2\times32\times4096\times2000^2 \approx 3.0\times10^{13}+1.0\times10^{12}=3.1\times10^{13}\). At \(0.5\times989\) TFLOP/s this takes about 63 ms, plus any queueing.</p>
+<p><strong>TPOT.</strong> With 64 sequences averaging about 2,250 tokens of context (prompt plus half the output), a step reads 16.06 GB of weights plus \(64\times2250\times131{,}072\) B ≈ 18.9 GB of cache: 35 GB. At \(0.8\times3.35\) TB/s that is 13 ms. Each user therefore sees about 77 tokens per second, comfortably faster than reading speed.</p>
+<p><strong>End-to-end latency.</strong> \(0.063 + 499\times0.013\approx 6.6\) s per request.</p>
+<p><strong>Throughput and load.</strong> \(64/0.013\approx 4{,}900\) output tokens per second. By Little's law (§1.13), sustaining 64 concurrent requests that each last 6.6 s requires an arrival rate of \(\lambda=\bar n/W=64/6.6\approx 9.7\) requests per second. (Prefills for those arrivals consume about \(9.7\times0.063\approx 0.6\) s of GPU time per second. Interleaving them with decode will lengthen TPOT noticeably, which is exactly the interference that Chapters 11 and 13 address.)</p>
+<p><strong>Cost.</strong> At $2.50 per GPU-hour, \(\frac{2.50}{4900\times3600}\times10^6\approx\$0.14\) per million output tokens, before accounting for prefill time.</p>
+</div>
+
+<p>This calculation is deliberately simple, and it is off from reality in ways the rest of the book addresses. Prefill and decode interfere. Requests do not all have the same lengths. The cache must be allocated without fragmentation. The sampling and scheduling overheads are not zero. But the structure is right, and the numbers are within a small factor of what well-tuned engines achieve. An engineer who can produce this calculation in five minutes, and explain which term each optimisation attacks, has the core skill this book is built around.</p>
+
+<details class="drill">
+<summary>Drill 3.2 — Same service, Llama 3 70B on 4×H100</summary>
+<p>Split Llama 3 70B over four H100s with tensor parallelism (each GPU holds a quarter of every weight matrix and a quarter of the KV heads; Chapter 18). Same workload, 64 concurrent sequences. Estimate TPOT, ignoring communication.</p>
+<p><em>Solution.</em> Per GPU per step: weights \(141/4\approx35.3\) GB; cache \(64\times2250\times320\) KiB \(/4\approx 11.8\) GB. Total 47.1 GB at \(0.8\times3.35\) TB/s ≈ 17.6 ms, so about 57 tokens per second per user, before the 160 all-reduces per step that tensor parallelism adds (two per layer). Throughput is about \(64/0.0176\approx3{,}600\) tokens per second on four GPUs, roughly a fifth of what the same four GPUs give with 8B replicas. A bigger model is a direct and large cost multiplier.</p>
+</details>
+
+<h2 id="s3-9">3.9 Code: a KV-cached decoder you can read</h2>
+<p>The following is a complete, runnable Llama-style model with RMSNorm, RoPE, grouped-query attention, SwiGLU and a pre-allocated KV cache. It has been stripped of everything except the inference path, and it uses random weights; loading real ones only requires mapping parameter names from a checkpoint. Read it with Figure 2.1 open. Every line corresponds to a box in that figure or to an equation in this chapter. The <code>generate</code> function at the bottom shows the two phases explicitly: one call that processes the whole prompt (prefill), then a loop that feeds one token at a time (decode).</p>
+<pre><code><span class="c-kw">import</span> torch, torch.nn <span class="c-kw">as</span> nn, torch.nn.functional <span class="c-kw">as</span> F
+
+<span class="c-kw">class</span> Cfg:                                   <span class="c-com"># tiny Llama-style hyper-parameters</span>
+    d, L, n_h, n_kv, d_ff, V, max_T, rope_base = 512, 8, 8, 2, 1408, 32000, 2048, 10000.0
+
+<span class="c-kw">def</span> rope_tables(c, device):
+    d_h = c.d // c.n_h
+    inv = c.rope_base ** (-torch.arange(0, d_h, 2, device=device) / d_h)   <span class="c-com"># θ_i, shape (d_h/2,)</span>
+    ang = torch.outer(torch.arange(c.max_T, device=device), inv)           <span class="c-com"># m·θ_i, shape (max_T, d_h/2)</span>
+    <span class="c-kw">return</span> ang.cos(), ang.sin()
+
+<span class="c-kw">def</span> apply_rope(x, cos, sin):                  <span class="c-com"># x: (B, heads, T, d_h); cos/sin: (T, d_h/2)</span>
+    x1, x2 = x[..., 0::2], x[..., 1::2]          <span class="c-com"># coordinate pairs (2i, 2i+1)</span>
+    rot = torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
+    <span class="c-kw">return</span> rot.flatten(-2)                      <span class="c-com"># re-interleave → (B, heads, T, d_h)</span>
+
+<span class="c-kw">class</span> RMSNorm(nn.Module):
+    <span class="c-kw">def</span> __init__(self, d, eps=1e-6):
+        super().__init__(); self.w = nn.Parameter(torch.ones(d)); self.eps = eps
+    <span class="c-kw">def</span> forward(self, x):
+        <span class="c-kw">return</span> self.w * x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+<span class="c-kw">class</span> Block(nn.Module):
+    <span class="c-kw">def</span> __init__(self, c):
+        super().__init__(); self.c = c; d_h = c.d // c.n_h
+        self.wq = nn.Linear(c.d, c.n_h * d_h, bias=False)
+        self.wk = nn.Linear(c.d, c.n_kv * d_h, bias=False)
+        self.wv = nn.Linear(c.d, c.n_kv * d_h, bias=False)
+        self.wo = nn.Linear(c.n_h * d_h, c.d, bias=False)
+        self.w1 = nn.Linear(c.d, c.d_ff, bias=False)    <span class="c-com"># gate</span>
+        self.w3 = nn.Linear(c.d, c.d_ff, bias=False)    <span class="c-com"># up</span>
+        self.w2 = nn.Linear(c.d_ff, c.d, bias=False)    <span class="c-com"># down</span>
+        self.n1, self.n2 = RMSNorm(c.d), RMSNorm(c.d)
+
+    <span class="c-kw">def</span> forward(self, x, cache, pos, cos, sin):    <span class="c-com"># x: (B, T, d); new tokens occupy positions pos..pos+T-1</span>
+        B, T, _ = x.shape; c = self.c; d_h = c.d // c.n_h
+        h = self.n1(x)
+        q = self.wq(h).view(B, T, c.n_h,  d_h).transpose(1, 2)    <span class="c-com"># (B, n_h,  T, d_h)</span>
+        k = self.wk(h).view(B, T, c.n_kv, d_h).transpose(1, 2)    <span class="c-com"># (B, n_kv, T, d_h)</span>
+        v = self.wv(h).view(B, T, c.n_kv, d_h).transpose(1, 2)
+        cs, sn = cos[pos:pos + T], sin[pos:pos + T]
+        q, k = apply_rope(q, cs, sn), apply_rope(k, cs, sn)        <span class="c-com"># cache stores ROTATED keys</span>
+        K, Vc = cache                                              <span class="c-com"># pre-allocated (B, n_kv, max_T, d_h)</span>
+        K[:, :, pos:pos + T] = k                                   <span class="c-com"># append: the only write to the cache</span>
+        Vc[:, :, pos:pos + T] = v
+        g = c.n_h // c.n_kv                                        <span class="c-com"># GQA group size</span>
+        k_all = K[:, :, :pos + T].repeat_interleave(g, dim=1)      <span class="c-com"># (B, n_h, pos+T, d_h) — real kernels avoid this copy</span>
+        v_all = Vc[:, :, :pos + T].repeat_interleave(g, dim=1)
+        <span class="c-com"># query i (absolute position pos+i) may see keys j ≤ pos+i</span>
+        mask = torch.ones(T, pos + T, dtype=torch.bool, device=x.device).tril(diagonal=pos)
+        o = F.scaled_dot_product_attention(q, k_all, v_all, attn_mask=mask)   <span class="c-com"># (B, n_h, T, d_h)</span>
+        x = x + self.wo(o.transpose(1, 2).reshape(B, T, c.n_h * d_h))
+        h = self.n2(x)
+        <span class="c-kw">return</span> x + self.w2(F.silu(self.w1(h)) * self.w3(h))     <span class="c-com"># SwiGLU FFN</span>
+
+<span class="c-kw">class</span> TinyLlama(nn.Module):
+    <span class="c-kw">def</span> __init__(self, c):
+        super().__init__(); self.c = c
+        self.emb = nn.Embedding(c.V, c.d)
+        self.blocks = nn.ModuleList(Block(c) <span class="c-kw">for</span> _ <span class="c-kw">in</span> range(c.L))
+        self.norm = RMSNorm(c.d)
+        self.head = nn.Linear(c.d, c.V, bias=False)
+
+    <span class="c-kw">def</span> new_cache(self, B, device, dtype):
+        shape = (B, self.c.n_kv, self.c.max_T, self.c.d // self.c.n_h)
+        <span class="c-kw">return</span> [(torch.zeros(shape, device=device, dtype=dtype),
+                 torch.zeros(shape, device=device, dtype=dtype)) <span class="c-kw">for</span> _ <span class="c-kw">in</span> range(self.c.L)]
+
+    <span class="c-kw">def</span> forward(self, ids, cache, pos, cos, sin):
+        x = self.emb(ids)                                          <span class="c-com"># gather, not a matmul</span>
+        <span class="c-kw">for</span> blk, layer_cache <span class="c-kw">in</span> zip(self.blocks, cache):
+            x = blk(x, layer_cache, pos, cos, sin)
+        <span class="c-kw">return</span> self.head(self.norm(x[:, -1:]))                    <span class="c-com"># logits for the LAST position only</span>
+
+@torch.no_grad()
+<span class="c-kw">def</span> generate(model, prompt_ids, n_new, temperature=0.8):
+    B, T0 = prompt_ids.shape; dev = prompt_ids.device
+    cos, sin = rope_tables(model.c, dev)
+    cache = model.new_cache(B, dev, next(model.parameters()).dtype)
+    logits = model(prompt_ids, cache, 0, cos, sin)                 <span class="c-com"># PREFILL: all T0 tokens in one pass</span>
+    out, pos = [], T0
+    <span class="c-kw">for</span> _ <span class="c-kw">in</span> range(n_new):                                        <span class="c-com"># DECODE: one token per step</span>
+        probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+        nxt = torch.multinomial(probs, 1)                          <span class="c-com"># (B, 1)</span>
+        out.append(nxt)
+        logits = model(nxt, cache, pos, cos, sin); pos += 1
+    <span class="c-kw">return</span> torch.cat(out, dim=1)
+
+model = TinyLlama(Cfg()).eval()
+print(generate(model, torch.randint(0, Cfg.V, (2, 16)), n_new=8))   <span class="c-com"># two sequences, 16-token prompts</span></code></pre>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — reading PyTorch</div>
+<p>A <code>torch.Tensor</code> is an \(n\)-dimensional array that lives on a device (CPU or GPU). <code>nn.Linear(k, n)</code> stores a \(k\times n\) weight and computes \(xW\) on the last dimension. <code>view</code> and <code>transpose</code> reinterpret shapes without copying data, which is how heads become a batch dimension. <code>F.scaled_dot_product_attention</code> computes \(\operatorname{softmax}(QK^\top/\sqrt{d_h}+M)V\), dispatching to a fused kernel such as FlashAttention when it can. <code>@torch.no_grad()</code> disables gradient tracking, which saves memory at inference.</p>
+</div>
+
+<h2 id="s3-10">3.10 What production engines do differently</h2>
+<p>The code above is correct, and its cost structure is exactly what we analysed. But a production inference engine such as vLLM, SGLang or TensorRT-LLM differs from it in ways that each correspond to a later chapter, and it is worth previewing them as a road map.</p>
+<p>First, the code allocates a contiguous cache of <code>max_T</code> positions for every sequence, which wastes memory on sequences that end early and caps every sequence at the same length. Engines instead allocate the cache in small fixed-size blocks on demand, with a table mapping each sequence's logical positions to physical blocks: PagedAttention, Chapter 10. Second, the code repeats each KV head \(g\) times with <code>repeat_interleave</code> before attending. That materialises a copy and throws away the intensity gain of GQA computed in §3.5. Real attention kernels load each KV head once into on-chip memory and apply it to all \(g\) queries there (Chapter 9). Third, the code processes a fixed batch in lockstep. Engines pack prefill tokens of new requests and decode tokens of running requests into one ragged batch at every step, admitting and retiring requests continuously (Chapter 11). Fourth, each line of Python launches separate GPU kernels. Engines fuse operations (Chapter 7) and capture whole decode steps as CUDA graphs to remove the overhead of §3.4. Finally, a model too large for one GPU is split across several with tensor or pipeline parallelism (Chapter 18).</p>
+<p>A small but instructive detail: this code pairs RoPE coordinates as \((2r, 2r+1)\), while Hugging Face's Llama implementation pairs \((r, r+d_h/2)\) ("rotate-half"). Both are valid rotary embeddings, but weights trained with one convention give wrong results under the other unless the columns of \(W_Q\) and \(W_K\) are permuted. This is a classic bug when porting checkpoints between frameworks.</p>
+
+<h2 id="looking-ahead" class="unnumbered">Looking ahead</h2>
+<p>We now understand generation as a cost: a compute-bound prefill that sets TTFT, followed by a memory-bound decode loop whose step time is the bytes of weights and cache divided by bandwidth. One piece of the loop has been treated as a black box: <code>sample(logits)</code>. Turning a distribution over 128,256 tokens into one token is a modelling decision (greedy, temperature, top-p?), an engineering problem (doing it for hundreds of sequences per step on a GPU), and a correctness problem (JSON output that must parse, results that should be reproducible). Chapter 4 completes Part I by opening that box. Part II then opens the other black box of this chapter, the GPU itself, to explain where \(\pi\), \(\beta\) and the overheads come from and how kernels approach them.</p>
+
+<h2 id="summary">Chapter summary</h2>
+<ul>
+<li>Naive generation recomputes the prefix at every step and costs \(\approx NT^2\). Caching each layer's keys and values is exact for causal models (proof by induction) and reduces the cost to \(\approx 2N\) per token plus attention.</li>
+<li>Prefill processes all prompt tokens in one pass and is compute-bound; it sets TTFT. Decode processes one token per sequence per step and is memory-bound; it sets TPOT.</li>
+<li>\(s_{kv}=2Ln_{kv}d_hb_{kv}\): 512 KiB per token for Llama 2 7B (MHA), 128 KiB for Llama 3 8B (GQA), ≈ 69 KiB for DeepSeek-V3 (MLA). Cache capacity usually limits concurrency.</li>
+<li>Time ≈ max(FLOPs/\(\pi\), bytes/\(\beta\)) + overhead. Arithmetic intensity \(I\) = FLOPs/byte. The roofline is \(\min(\pi, I\beta)\), with ridge \(I^{*}=\pi/\beta\approx295\) on H100.</li>
+<li>Linear layers have \(I\approx m\) (tokens per weight read) in BF16; decode attention has \(I=2g/b_{kv}\), independent of batch size, so batching cannot fix it.</li>
+<li>Decode step ≈ \((Nb_w + B\bar ts_{kv})/\beta\); TTFT ≈ \((2N_{\text{mm}}n_{\text{in}}+2Ldn_{\text{in}}^2)/(\text{MFU}\cdot\pi)\). Together with Little's law these predict throughput, latency and cost.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+<div class="mcq" data-id="ch03-mcq-18" data-topic="§3.2 Prefill vs decode">
+<p class="q">Which statement is correct?</p>
+<ol class="opts"><li>Prefill is memory-bound; decode is compute-bound</li><li data-correct>Prefill is typically compute-bound; decode is typically memory-bandwidth-bound</li><li>Both are compute-bound</li><li>Both are latency-bound by the CPU</li></ol>
+<div class="explain">Prefill multiplies weights by thousands of token vectors at once; decode by one per sequence.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-19" data-topic="§3.2 Prefill vs decode">
+<p class="q">TTFT is dominated by ___, while TPOT is dominated by ___.</p>
+<ol class="opts"><li>decode; prefill</li><li data-correct>queueing + prefill; decode step time</li><li>tokenisation; detokenisation</li><li>sampling; attention</li></ol>
+<div class="explain">The first token comes out of the prefill pass; subsequent tokens each need a decode step.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-20" data-topic="§3.3 KV cache">
+<p class="q">The KV cache gives exactly the same results as recomputation because:</p>
+<ol class="opts"><li>Keys and values are quantised</li><li data-correct>With causal masking, the hidden state at position j in every layer depends only on tokens 1..j, so earlier K/V never change when tokens are appended</li><li>Attention is linear</li><li>RoPE is applied after caching</li></ol>
+<div class="explain">Induction over layers (§2.10). Without the causal mask (e.g. bidirectional encoders), caching would be invalid.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-21" data-topic="§3.3 KV cache">
+<p class="q">KV-cache bytes per token for a model with \(L=32\), \(n_{kv}=8\), \(d_h=128\) in BF16:</p>
+<ol class="opts"><li>64 KiB</li><li data-correct>128 KiB</li><li>256 KiB</li><li>512 KiB</li></ol>
+<div class="explain">\(2\times32\times8\times128\times2=131{,}072\) B = 128 KiB.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-22" data-topic="§3.3 KV cache">
+<p class="q">Llama 2 7B (MHA, 512 KiB/token) serving 16 sequences of 4,096 tokens needs how much KV memory?</p>
+<ol class="opts"><li>2 GiB</li><li>8 GiB</li><li data-correct>32 GiB</li><li>128 GiB</li></ol>
+<div class="explain">\(0.5\text{ MiB}\times4096\times16 = 32{,}768\) MiB = 32 GiB—more than twice the 13.5 GB of weights.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-23" data-topic="§3.3 KV cache">
+<p class="q">Without a KV cache, generating \(T\) tokens from scratch with a model of \(N\) parameters costs roughly:</p>
+<ol class="opts"><li>\(2NT\)</li><li data-correct>\(NT^2\)</li><li>\(2N\)</li><li>\(NT\log T\)</li></ol>
+<div class="explain">\(\sum_{t=1}^{T}2Nt\approx NT^2\), versus \(2NT\) with caching.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-24" data-topic="§3.5 Arithmetic intensity">
+<p class="q">The H100's ridge point is ≈295 FLOPs/byte (dense BF16). A kernel with intensity 40 FLOPs/byte will achieve at most about:</p>
+<ol class="opts"><li>989 TFLOP/s</li><li data-correct>134 TFLOP/s</li><li>40 TFLOP/s</li><li>3.35 TFLOP/s</li></ol>
+<div class="explain">\(\min(989,\ 40\times3.35)=134\) TFLOP/s.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-25" data-topic="§3.5 Arithmetic intensity">
+<p class="q">In BF16, the arithmetic intensity of a linear layer applied to \(M\) tokens (with \(M\) much smaller than the matrix dimensions) is about:</p>
+<ol class="opts"><li>1 regardless of M</li><li data-correct>M FLOPs/byte</li><li>2M² FLOPs/byte</li><li>\(k n\) FLOPs/byte</li></ol>
+<div class="explain">\(2Mkn/(2kn)=M\). Each additional token sharing the weight read adds ~1 FLOP/byte.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-26" data-topic="§3.5 Arithmetic intensity">
+<p class="q">The arithmetic intensity of decode-time attention for one sequence (BF16, group size \(g=n_h/n_{kv}\)) is approximately:</p>
+<ol class="opts"><li>\(B\), the batch size</li><li data-correct>\(g\), independent of batch size and context length</li><li>\(t\), the context length</li><li>\(d_h\)</li></ol>
+<div class="explain">\(4tn_hd_h/(2tn_{kv}d_h\cdot2)=g\). Each sequence has its own cache, so batching does not amortise it.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-27" data-topic="§3.5 Arithmetic intensity">
+<p class="q">Roughly at what decode batch size does a BF16 dense model's weight GEMM become compute-bound on an H100 (ignoring KV)?</p>
+<ol class="opts"><li>~8</li><li>~32</li><li data-correct>~300</li><li>~10,000</li></ol>
+<div class="explain">Intensity ≈ B must reach the ridge ≈ 295.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-28" data-topic="§3.6 Decode latency">
+<p class="q">According to the decode latency model, which change most reduces step time at <em>large</em> batch with long contexts?</p>
+<ol class="opts"><li>Doubling peak FLOP/s</li><li data-correct>Halving KV bytes per token (e.g. FP8 KV cache or fewer KV heads)</li><li>Halving the vocabulary</li><li>Using LayerNorm instead of RMSNorm</li></ol>
+<div class="explain">At large B and long t the \(B\bar ts_{\text{kv}}/\beta\) term dominates.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-29" data-topic="§3.6 Decode latency">
+<p class="q">Llama 3 8B on one 80 GB H100 with 2k-token contexts: what usually limits the maximum decode batch?</p>
+<ol class="opts"><li>Compute (TFLOP/s)</li><li data-correct>HBM capacity for KV cache</li><li>PCIe bandwidth</li><li>Number of SMs</li></ol>
+<div class="explain">~64 GB free / 256 MiB per sequence ≈ 238 sequences, while compute time is still a fraction of memory time.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-32" data-topic="§3.10 Engines">
+<p class="q">During prefill of a 4,000-token prompt, a well-implemented engine computes the LM head for:</p>
+<ol class="opts"><li>All 4,000 positions</li><li data-correct>Only the last position (unless prompt log-probs are requested)</li><li>The first position</li><li>No positions</li></ol>
+<div class="explain">Only the last position's logits are needed to sample the first output token; this saves \(2d|V|(T-1)\) FLOPs and a huge \(T\times|V|\) tensor.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-34" data-topic="§3.3 KV cache (MLA)">
+<p class="q">DeepSeek-V3 caches about 576 values per token per layer (61 layers). In BF16 this is roughly:</p>
+<ol class="opts"><li>~7 KiB per token</li><li data-correct>~69 KiB per token</li><li>~512 KiB per token</li><li>~4 MiB per token</li></ol>
+<div class="explain">\(576\times61\times2=70{,}272\) B ≈ 68.6 KiB—less than Llama 3 8B's 128 KiB despite a model 80× larger.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-35" data-topic="§3.9 Code">
+<p class="q">In the chapter's code, why is the mask built with <code>tril(diagonal=pos)</code> rather than using <code>is_causal=True</code>?</p>
+<ol class="opts"><li>It is faster</li><li data-correct>When the new chunk starts at position pos &gt; 0, query i must see keys up to pos+i; the default causal mask aligns to the top-left and would be wrong for a query block shorter than the key block</li><li>Because RoPE requires it</li><li>To disable attention during decode</li></ol>
+<div class="explain">This generalises to chunked prefill. For a single decode token (T=1) the mask is all-true.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-50" data-topic="§3.1 Generation loop">
+<p class="q">Without a KV cache, the naive loop that re-runs the model on the whole sequence at every step spends roughly what fraction of its FLOPs on work it has already done, when generating a 1,000-token sequence?</p>
+<ol class="opts"><li>About 50%</li><li>About 90%</li><li data-correct>Over 99%</li><li>None; the work is all new</li></ol>
+<div class="explain">Total ≈ \(NT^2\) versus \(2NT\) necessary, a ratio of \(T/2=500\). Only 0.2% of the work is new.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-51" data-topic="§3.2 KV cache">
+<p class="q">Why does the cache store keys and values, rather than the full hidden states of earlier positions?</p>
+<ol class="opts"><li>Hidden states are larger than keys and values in every model</li><li data-correct>The only way a new position uses earlier positions is through attention to their keys and values; every other operation is position-wise</li><li>Keys and values are quantised</li><li>Hidden states change when new tokens arrive</li></ol>
+<div class="explain">Norms, projections and FFNs act on each position independently. What the new token needs from the past, in each layer, is exactly \(\{k_j,v_j\}_{j\le t}\). (With GQA, keys and values are also smaller than the hidden state: \(2n_{kv}d_h=2048\) versus \(d=4096\) for Llama 3 8B.)</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-52" data-topic="§3.4 Where time goes">
+<p class="q">A tiny model's decode step takes 3 ms, but its weights take only 0.2 ms to read and its arithmetic takes 0.01 ms. The dominant cost is most likely:</p>
+<ol class="opts"><li>Compute</li><li>Memory bandwidth</li><li data-correct>Overhead (kernel launches, Python, scheduling)</li><li>HBM capacity</li></ol>
+<div class="explain">When neither \(F/\pi\) nor \(Q/\beta\) explains the time, fixed per-operation costs do. CUDA graphs, operator fusion and moving scheduling off the critical path are the remedies.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-53" data-topic="§3.4 Where time goes">
+<p class="q">What does capturing a decode step as a CUDA graph primarily reduce?</p>
+<ol class="opts"><li>HBM traffic</li><li>FLOPs</li><li data-correct>CPU-side launch overhead, by replaying many kernels with a single launch</li><li>KV-cache size</li></ol>
+<div class="explain">The graph records the sequence of kernels once; replaying it avoids per-kernel CPU dispatch, which matters most at small batch where kernels are short.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-54" data-topic="§3.5 Roofline">
+<p class="q">An A100 (312 TFLOP/s, 2.04 TB/s) and an H100 (989 TFLOP/s, 3.35 TB/s) run the same batch-1 decode. The speed-up of H100 over A100 is closest to:</p>
+<ol class="opts"><li>3.2× (ratio of FLOP/s)</li><li data-correct>1.6× (ratio of bandwidths)</li><li>1.0×</li><li>5×</li></ol>
+<div class="explain">Batch-1 decode is memory-bound, so speed scales with \(\beta\): 3.35/2.04 ≈ 1.64.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-55" data-topic="§3.5 Roofline">
+<p class="q">The A100's ridge point (≈ 153) is lower than the H100's (≈ 295). This means that, relative to its peak, the A100:</p>
+<ol class="opts"><li>Is worse for memory-bound workloads</li><li data-correct>Reaches its compute peak at a smaller batch size, because it has more bandwidth per FLOP</li><li>Has more HBM capacity</li><li>Runs attention faster in absolute terms</li></ol>
+<div class="explain">A lower ridge means compute saturates at lower intensity. In absolute terms the H100 is faster at both compute and bandwidth.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-56" data-topic="§3.6 Decode latency">
+<p class="q">Switching the KV cache from BF16 to FP8 (keeping weights in BF16) mostly changes which part of the decode latency model?</p>
+<ol class="opts"><li>The intercept (weight bytes)</li><li data-correct>The slope with respect to batch size and context (cache bytes per token)</li><li>The compute term</li><li>Nothing</li></ol>
+<div class="explain">\(s_{kv}\) halves, so the \(B\bar ts_{kv}/\beta\) term halves; and twice as many sequences fit in memory.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-57" data-topic="§3.6 Decode latency">
+<p class="q">Per Figure 3.7, raising batch size from 64 to 224 for Llama 3 8B at 2k contexts:</p>
+<ol class="opts"><li>Triples total throughput</li><li data-correct>Raises total throughput by about 50% while more than halving per-user speed</li><li>Leaves per-user speed unchanged</li><li>Makes the step compute-bound</li></ol>
+<div class="explain">6,450 → 9,850 tokens/s total; 101 → 44 tokens/s per user. Cache traffic dominates, so returns diminish.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-58" data-topic="§3.7 Prefill latency">
+<p class="q">Model FLOPs utilisation (MFU) is:</p>
+<ol class="opts"><li>The fraction of HBM capacity in use</li><li data-correct>Achieved useful FLOP/s divided by the hardware's peak FLOP/s</li><li>The fraction of GPU time spent in prefill</li><li>The ratio of weight FLOPs to attention FLOPs</li></ol>
+<div class="explain">The analogous metric for memory-bound phases is memory-bandwidth utilisation (MBU): achieved bytes/s divided by peak bandwidth.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-59" data-topic="§3.7 Prefill latency">
+<p class="q">Llama 3 8B, one H100 at 50% MFU: a 4,096-token prompt prefills in about:</p>
+<ol class="opts"><li>13 ms</li><li data-correct>130 ms</li><li>1.3 s</li><li>13 s</li></ol>
+<div class="explain">\(2\times7.5\times10^9\times4096+2\times32\times4096\times4096^2\approx6.6\times10^{13}\) FLOPs ÷ \(4.9\times10^{14}\) FLOP/s ≈ 0.13 s.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-60" data-topic="§3.7 Prefill latency">
+<p class="q">Doubling the prompt length from 64k to 128k tokens (Llama 3 8B) multiplies prefill time by about:</p>
+<ol class="opts"><li>2×</li><li data-correct>3×</li><li>4×</li><li>8×</li></ol>
+<div class="explain">From Figure 3.8, 4.3 s → 13.1 s. The quadratic attention term dominates but the linear weight term is still significant, so the factor lies between 2 and 4.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-61" data-topic="§3.8 Life of a request">
+<p class="q">A deployment keeps 64 requests in flight, each lasting 6.6 s end to end. By Little's law, the sustainable arrival rate is about:</p>
+<ol class="opts"><li>0.1 requests/s</li><li data-correct>9.7 requests/s</li><li>64 requests/s</li><li>422 requests/s</li></ol>
+<div class="explain">\(\lambda=\bar n/W=64/6.6\approx9.7\).</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-62" data-topic="§3.8 Life of a request">
+<p class="q">In the worked chat-service example, which change would most reduce cost per million output tokens without changing the model?</p>
+<ol class="opts"><li>A faster CPU</li><li data-correct>Fitting more concurrent sequences per step (e.g. an FP8 KV cache) while staying within the TPOT target</li><li>Increasing MFU in prefill from 50% to 60%</li><li>Using a larger vocabulary</li></ol>
+<div class="explain">Decode dominates GPU time; more sequences per (memory-bound) step raises throughput nearly proportionally, until the TPOT target binds.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-63" data-topic="§3.5 Decode attention">
+<p class="q">Which of the following raise the arithmetic intensity of decode-time attention? (select all that apply)</p>
+<ol class="opts"><li data-correct>Grouped-query attention with a larger group size \(g\)</li><li data-correct>Storing the KV cache in FP8 instead of BF16</li><li>Increasing the batch size</li><li>Increasing the context length</li></ol>
+<div class="explain">\(I=2g/b_{kv}\). Batch size and context length cancel out of the ratio.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-64" data-topic="§3.10 Engines">
+<p class="q">Why does the chapter's <code>repeat_interleave</code> of KV heads forfeit the bandwidth benefit of GQA?</p>
+<ol class="opts"><li>It changes the result</li><li data-correct>It materialises \(g\) copies of each KV head, so attention reads \(g\) times more bytes than necessary</li><li>It disables RoPE</li><li>It forces FP32</li></ol>
+<div class="explain">A GQA-aware kernel loads each KV head once into on-chip memory and reuses it for the \(g\) query heads of its group.</div>
+</div>
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+<details class="qa" data-id="ch03-qa-04">
+<summary><span class="lvl core">Core</span> Derive the KV-cache size and compute it for Llama 2 70B at 8 concurrent 16k-token requests.</summary>
+<div class="answer">
+<p>Each layer caches a key and a value vector for each KV head: \(2\times n_{kv}\times d_h\) elements per token per layer. Over \(L\) layers at \(b\) bytes: \(s_{kv}=2Ln_{kv}d_hb\). Llama 2 70B: \(2\times80\times8\times128\times2=327{,}680\) B = 320 KiB/token. For 8 × 16,384 tokens: \(131{,}072\times320\) KiB = 40 GiB. Weights are ~138 GB in BF16, so with 2×H100 (160 GB) there is only ~20 GB left—insufficient; you'd need 4×H100 with TP=4, FP8 weights, or FP8 KV (20 GiB). Point out that without GQA (MHA, 64 KV heads) it would be 8× more: 320 GiB.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch03-qa-05">
+<summary><span class="lvl core">Core</span> Why is decode memory-bound but prefill compute-bound? Use arithmetic intensity.</summary>
+<div class="answer">
+<p>A linear layer with weights \(k\times n\) applied to \(M\) tokens does \(2Mkn\) FLOPs and reads \(\approx bkn\) weight bytes; intensity ≈ \(2M/b\) (= \(M\) in BF16). Prefill has \(M=B\cdot n_{\text{in}}\) (thousands) → intensity far above the ridge (≈295 on H100) → compute-bound. Decode has \(M=B\) (1 to a few hundred) → below the ridge → bandwidth-bound. Decode attention is worse: intensity \(2g/b\) (1 for MHA, 8 for GQA-8) regardless of batch, because each sequence's KV cache is private. Hence prefill time ∝ FLOPs/peak and decode time ∝ bytes/bandwidth.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch03-qa-08">
+<summary><span class="lvl core">Core</span> Estimate the decode throughput of Llama 3 8B on one H100 at batch 64 with 2k-token contexts.</summary>
+<div class="answer">
+<p>Bytes per step: weights 16.06 GB + KV \(64\times2048\times128\text{ KiB}=17.2\) GB ≈ 33.3 GB → at 3.35 TB/s ≈ 9.9 ms. Compute: \(2\times7.5\times10^9\times64\approx9.6\times10^{11}\) + attention \(\approx 7\times10^{10}\) FLOPs → ~1.0 ms at peak. Memory-bound: step ≈ 10 ms ideal, say 12–14 ms at 70–80% MBU. Throughput ≈ 64/0.013 ≈ 4,500–5,000 tokens/s; per-user ≈ 75–80 tokens/s. To improve: FP8 KV (~7 ms ideal), FP8 weights, larger batch until memory is full, prefix sharing.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch03-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> Show that attention FLOPs equal weight FLOPs at \(t\approx6d\). What changes for GQA and for long-context serving?</summary>
+<div class="answer">
+<p>Per token at context \(t\): attention scores + weighted sum = \(4Ln_hd_ht=4Ldt\) FLOPs. Weight FLOPs = \(2N\approx24Ld^2\) for an MHA model with a 4d FFN. Equal when \(t=6d\). For GQA, weight FLOPs fall a bit (smaller \(W_K,W_V\)) but attention FLOPs are unchanged, so the crossover moves slightly earlier (for Llama 3 8B's actual parameter count, \(2\times7.5\text{B}/(4\times32\times4096)\approx 28.6\)k tokens because of its wide FFN). For long-context <em>prefill</em>, total attention FLOPs grow as \(\approx2Ldt^2\) and dominate at 128k (hence FlashAttention, context parallelism, sparse attention). For decode, attention's <em>bytes</em> matter far earlier than its FLOPs: KV bytes per step equal weight bytes when \(t\cdot s_{kv}=Nb\), e.g. Llama 3 8B: \(16\text{ GB}/128\text{ KiB}\approx122\)k tokens for one sequence—but with batch 64 the crossover is at under 2k tokens each.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch03-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> Prove that KV caching is exact. Where can numerical results nevertheless differ?</summary>
+<div class="answer">
+<p>Induction on layers: hidden state \(h^{(\ell)}_j\) depends only on \(x_{1:j}\). Base: embedding of \(x_j\). Step: position-wise operations preserve the property; causal attention at \(j\) uses \(k_i,v_i\) for \(i\le j\), functions of \(h^{(\ell-1)}_i\), which by hypothesis depend only on \(x_{1:i}\). So appending tokens never changes earlier K/V; caching is memoisation. Numerical differences: floating-point addition is not associative, and the kernels used for prefill (big GEMMs, tiled attention over many queries) and for decode (GEMV, split-K attention) reduce in different orders and tile sizes; batch composition can change kernel choice. Results agree to within rounding but not bit-for-bit, which matters for "temperature 0" reproducibility and for comparing speculative-decoding outputs. Truly batch-invariant kernels fix this at some speed cost (Chapter 3).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch03-qa-12">
+<summary><span class="lvl deep">Deep-dive</span> Derive the decode-attention arithmetic intensity, and explain why batching does not help it but GQA and MLA do.</summary>
+<div class="answer">
+<p>One sequence, one layer, context \(t\): read \(K,V\): \(2tn_{kv}d_hb\) bytes. FLOPs: for each of \(n_h\) query heads, \(2td_h\) (scores) + \(2td_h\) (weighted sum) → \(4tn_hd_h\). Intensity \(=2n_h/(n_{kv}b)=2g/b\). A batch of \(B\) sequences reads \(B\) separate caches and does \(B\) times the FLOPs: the ratio is unchanged, unlike weights, which are shared. GQA raises it to \(g\) (BF16) by reusing each loaded KV head for \(g\) query heads in on-chip memory. MLA (with weight absorption) makes all \(n_h=128\) heads attend over the same 576-dim latent, so per byte of cache read it performs \(\sim 2n_h\cdot\frac{(512+64)+512}{576\cdot b}\) FLOPs—hundreds of FLOPs/byte, close to compute-bound on H100, which is why DeepSeek wrote dedicated kernels (FlashMLA). Prefix sharing (many sequences attending to the same cached prefix, e.g. a shared system prompt or parallel sampling) also raises it, enabling "cascade"/shared-prefix attention kernels.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch03-qa-13">
+<summary><span class="lvl core">Core</span> Why must engines compute only last-position logits in prefill, and how does that interact with returning prompt log-probs?</summary>
+<div class="answer">
+<p>Logits are \(T\times|V|\): for a 32k-token prompt and 128k vocabulary that is 4.2B elements (8.4 GB in BF16) and \(2d|V|T\) FLOPs (~34 TFLOPs for Llama 3 8B)—wasted unless needed. Engines gather the hidden state of each sequence's last token before the LM head. If the API requests prompt log-probs (common in evaluation), the engine must compute logits for all prompt positions, usually in chunks to bound memory, and may bypass optimisations such as prefix caching (vLLM documents that requests with prompt logprobs recompute the full prefill).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch03-qa-14">
+<summary><span class="lvl core">Core</span> Implement single-step decode attention for one head, given cached K and V. What is its complexity?</summary>
+<div class="answer">
+<pre><code>def decode_attn(q, K, V):            # q: (d_h,), K, V: (t, d_h)
+    s = K @ q / math.sqrt(q.shape[0]) # (t,)  scores; no mask needed: all t are in the past
+    s = s - s.max()                   # numerical stability
+    p = torch.exp(s); p = p / p.sum() # softmax
+    return p @ V                      # (d_h,)</code></pre>
+<p>Time \(O(td_h)\) FLOPs (\(4td_h\)), memory traffic \(O(td_h)\) bytes; it is bandwidth-bound. Follow-ups: batch over heads/sequences; GQA (one K/V for \(g\) queries); for long \(t\), split the sequence into chunks processed by different thread blocks and combine partial softmaxes with the log-sum-exp trick (FlashDecoding, Chapter 8); paged K/V via a block table (Chapter 9).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch03-qa-16">
+<summary><span class="lvl design">Design</span> You must serve a 7B-class model with 32k contexts to as many concurrent users as possible on one 80 GB GPU. Which architectural and serving choices matter most?</summary>
+<div class="answer">
+<p>Start from memory: weights ~14–16 GB (BF16). KV per user at 32k: MHA 7B = 16 GiB (only ~4 users!), GQA-8 (Llama 3 8B-like) = 4 GiB (~15 users). Levers, in order: (1) choose a model with GQA/MLA or sliding-window layers (e.g. interleaved local/global attention cuts most layers' cache to the window); (2) FP8 KV cache (2×) or INT4 KV with careful calibration; (3) FP8/INT4 weights to free ~8–12 GB; (4) PagedAttention to avoid reserving 32k per user when most use far less (Little's law on actual lengths); (5) prefix caching if users share system prompts/documents; (6) KV offload to CPU memory for idle conversations; (7) admission control/preemption policy. Then check bandwidth: at 32k, KV reads per step dominate; expect TPOT to grow with total live tokens, so set an SLO-aware cap on concurrent live tokens rather than users.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch03-qa-18">
+<summary><span class="lvl design">Design</span> An interviewer gives you a new model config and an accelerator spec sheet. Outline, step by step, how you'd predict TTFT and TPOT.</summary>
+<div class="answer">
+<ol>
+<li>From the config: compute \(N\) (and active \(N\) for MoE), weight bytes at the serving precision, KV bytes per token \(2Ln_{kv}d_hb\) (or the MLA/sliding-window variant).</li>
+<li>From the spec sheet: dense peak FLOP/s at the precision used (not the sparse number), HBM bandwidth, capacity; interconnect if multi-GPU. Ridge point \(P/\beta\).</li>
+<li>Fit: weights + KV(batch × context) + workspace ≤ capacity → decide TP degree / max batch.</li>
+<li>TTFT ≈ queueing + prefill FLOPs \((2N_{\text{mm}}n_{\text{in}}+2Ldn_{\text{in}}^2)\) / (P × MFU≈0.4–0.6) (+ TP communication).</li>
+<li>TPOT ≈ max((weight bytes/TP + per-GPU KV bytes)/(β × MBU≈0.7–0.85), compute time) + per-step overhead (~0.5–2 ms without CUDA graphs) + TP all-reduce latency × 2L.</li>
+<li>Sanity-check against known benchmarks; state assumptions; discuss which lever (quantisation, speculative decoding, batching, disaggregation) moves which term.</li>
+</ol>
+</div>
+</details>
+
+<details class="qa" data-id="ch03-qa-30">
+<summary><span class="lvl warm">Warm-up</span> What are prefill and decode, and why do they behave so differently on a GPU?</summary>
+<div class="answer">
+<p>Prefill runs the model once over all prompt tokens. Every weight matrix multiplies a matrix with \(B\cdot n_{\text{in}}\) rows (thousands), so each weight byte fetched is used for thousands of FLOPs. That is far above the H100's ridge of ≈ 295 FLOPs/byte, so prefill is compute-bound, and it writes the KV cache for the whole prompt and produces the first token (setting TTFT). Decode runs once per output token. Each weight matrix multiplies only \(B\) rows, about \(B\) FLOPs per byte, and every step also reads each sequence's whole KV cache at an intensity of \(2g/b_{kv}\). Decode is therefore memory-bandwidth-bound, and its step time sets TPOT. Consequences: prefill benefits from more FLOP/s and is hurt by long prompts (quadratic attention); decode benefits from more bandwidth, fewer bytes (quantisation, GQA/MLA) and larger batches.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch03-qa-31">
+<summary><span class="lvl core">Core</span> Explain the compute / memory / overhead decomposition and give an example of each regime in LLM serving.</summary>
+<div class="answer">
+<p>Time ≈ max(FLOPs/π, bytes/β) + overhead. <strong>Compute-bound:</strong> long-prompt prefill (Llama 3 8B, 2k tokens: ≈ 32 ms of arithmetic versus ≈ 5 ms of weight reads); remedies are lower precision (FP8 tensor cores), better kernels and more GPUs. <strong>Memory-bound:</strong> decode at practical batch sizes, and decode attention always; remedies are quantisation of weights and cache, GQA/MLA, batching (for weights only), and speculative decoding. <strong>Overhead-bound:</strong> decode of small models or small batches where hundreds of short kernels each cost microseconds to launch, plus Python scheduling and sampling; remedies are CUDA graphs, kernel fusion, and overlapping CPU scheduling with GPU execution (vLLM V1, SGLang). Diagnose with a profiler: if GPU kernels are idle between launches, you are overhead-bound.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch03-qa-32">
+<summary><span class="lvl core">Core</span> Users complain that TTFT is several seconds for long documents. Diagnose and propose fixes.</summary>
+<div class="answer">
+<p>Prefill time is ≈ \((2N_{\text{mm}}n_{\text{in}}+2Ldn_{\text{in}}^2)/(\text{MFU}\cdot\pi)\); for Llama 3 8B a 32k-token document takes ≈ 1.5 s at 50% MFU, and queueing behind other prefills adds more. Check traces to split TTFT into queueing and prefill. Fixes: (1) <strong>prefix caching</strong>: if the same document or system prompt recurs, reuse its KV cache and skip prefill (Chapter 10); (2) <strong>chunked prefill / priority scheduling</strong> so long prefills do not block everyone (Chapter 11); (3) <strong>disaggregated or dedicated prefill capacity</strong> (Chapter 13); (4) <strong>more FLOP/s</strong>: FP8 prefill, tensor or context parallelism across GPUs (Chapters 14, 18); (5) <strong>efficient attention kernels</strong> for long sequences (Chapter 9); (6) product changes: retrieval instead of stuffing whole documents, streaming a status message.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch03-qa-33">
+<summary><span class="lvl deep">Deep-dive</span> Cost a chat service end to end: Llama 3 8B on one H100, 2,000-token prompts, 500-token answers, ~64 concurrent decodes. Give TTFT, TPOT, throughput, request rate and cost per million tokens.</summary>
+<div class="answer">
+<p><strong>TTFT:</strong> prefill ≈ \(2\cdot7.5\text{e}9\cdot2000+2\cdot32\cdot4096\cdot2000^2\approx3.1\text{e}13\) FLOPs; at 50% MFU ≈ 63 ms (+ queueing). <strong>TPOT:</strong> bytes per step = 16.06 GB of weights + \(64\times2250\times128\) KiB ≈ 18.9 GB of cache ≈ 35 GB; at 80% of 3.35 TB/s ≈ 13 ms, so ≈ 77 tokens/s per user. <strong>E2E:</strong> ≈ 0.063 + 499 × 0.013 ≈ 6.6 s. <strong>Throughput:</strong> 64/0.013 ≈ 4,900 output tokens/s. <strong>Load:</strong> Little's law gives λ = 64/6.6 ≈ 9.7 requests/s, and their prefills consume ≈ 0.6 s of GPU per second, so interference will lengthen TPOT unless prefill is chunked or disaggregated. <strong>Cost:</strong> $2.50/h ÷ (4,900 × 3,600) × 10⁶ ≈ $0.14 per million output tokens (more once prefill time is charged). Then name the levers: FP8 cache/weights, prefix caching, speculative decoding, batching policy.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch03-qa-34">
+<summary><span class="lvl core">Core</span> What are MFU and MBU, and which should you report for prefill and for decode?</summary>
+<div class="answer">
+<p><strong>MFU</strong> (model FLOPs utilisation) = useful FLOPs performed per second ÷ peak FLOP/s, counting only the model's required FLOPs (not recomputation or padding). <strong>MBU</strong> (memory-bandwidth utilisation) = bytes that must be moved per second (weights + KV cache) ÷ peak bandwidth. Prefill is compute-bound, so MFU tells you how close to the limit you are (40–70% is good). Decode is memory-bound, so its MFU is necessarily tiny (often &lt;5%) even when perfectly optimised; MBU is the meaningful metric (60–85% is good). Reporting decode MFU as "the GPU is only 3% utilised" is a classic interview mistake.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-brrr">H. He. Making Deep Learning Go Brrrr From First Principles. 2022. <a href="https://horace.io/brrr_intro.html">horace.io</a>.</li>
+<li id="r-roofline">S. Williams, A. Waterman, D. Patterson. Roofline: An Insightful Visual Performance Model for Multicore Architectures. <em>Communications of the ACM</em>, 52(4), 2009.</li>
+<li>R. Pope et al. Efficiently Scaling Transformer Inference. <em>MLSys</em>, 2023. <a href="https://arxiv.org/abs/2211.05102">arXiv:2211.05102</a>.</li>
+<li>kipply. Transformer Inference Arithmetic. 2022. <a href="https://kipp.ly/transformer-inference-arithmetic/">kipp.ly</a>.</li>
+<li>J. Austin et al. <em>How to Scale Your Model</em>, Part 7 "All About Transformer Inference". Google DeepMind, 2025. <a href="https://jax-ml.github.io/scaling-book/inference">jax-ml.github.io/scaling-book/inference</a>.</li>
+<li>N. Shazeer. Fast Transformer Decoding: One Write-Head is All You Need. <a href="https://arxiv.org/abs/1911.02150">arXiv:1911.02150</a>, 2019.</li>
+<li>J. Ainslie et al. GQA. <em>EMNLP</em>, 2023. <a href="https://arxiv.org/abs/2305.13245">arXiv:2305.13245</a>.</li>
+<li>DeepSeek-AI. DeepSeek-V3 Technical Report. <a href="https://arxiv.org/abs/2412.19437">arXiv:2412.19437</a>, 2024.</li>
+<li>W. Kwon et al. Efficient Memory Management for Large Language Model Serving with PagedAttention. <em>SOSP</em>, 2023. <a href="https://arxiv.org/abs/2309.06180">arXiv:2309.06180</a>.</li>
+<li>A. Agrawal et al. Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve. <em>OSDI</em>, 2024. <a href="https://arxiv.org/abs/2403.02310">arXiv:2403.02310</a>.</li>
+<li>A. Gordić. Inside vLLM: Anatomy of a High-Throughput LLM Inference System. vLLM blog, 2025. <a href="https://vllm.ai/blog/2025-09-05-anatomy-of-vllm">vllm.ai</a>.</li>
+<li>BentoML. LLM Inference Handbook: How does LLM inference work? <a href="https://bentoml.com/llm/llm-inference-basics/how-does-llm-inference-work">bentoml.com</a>.</li>
+<li>NVIDIA. H100 Tensor Core GPU Architecture (whitepaper), 2022.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

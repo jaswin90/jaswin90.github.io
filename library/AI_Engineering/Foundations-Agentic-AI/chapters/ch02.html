@@ -1,0 +1,805 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 2 · Agents as Decision Processes — Foundations of Agentic AI</title>
+<meta name="description" content="Chapter 2 of Foundations of Agentic AI: MDPs, POMDPs and belief states; the LLM agent as a policy over strings; the context as a belief; workflows versus agents; compounding error with recovery; stopping; the cost of an episode.">
+<script>try{var t=localStorage.getItem('aai-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script defer src="/library/assets/book-shim.js" data-library="/library/" data-field="/library/AI_Engineering/" data-field-title="AI Engineering"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-chapter="ch02" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Part I · What Is an Agent? — Chapter 2</div>
+<h1 id="top">Agents as Decision Processes</h1>
+<p class="lede">Chapter 1 drew an agent as a loop and measured it with a crude formula. To reason about agents with any precision we need a mathematical object that captures what the agent knows, what it can do, and how the world responds. That object is the partially observable Markov decision process, and the language-model agent is a policy in one.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>An interviewer who asks "why does your agent loop?" or "why not just give it more context?" or "when would you use a fixed workflow instead?" is asking a question about decision processes, whether or not they use the words. Each has a crisp answer once we know what the agent's state is, what information its policy sees, which policies the architecture allows, and how errors propagate through a trajectory. Without that vocabulary the answers are anecdotes.</p>
+<p>This chapter builds the vocabulary from the ground up, assuming only probability. We start with Markov decision processes, where the agent sees the state of the world, and then remove that assumption to reach partially observable processes, where it does not. We then show precisely how a language-model agent fits the framework: its actions are strings, its observations are strings, and its context is a lossy, hand-engineered substitute for the belief state that an ideal agent would maintain. That one identification explains a surprising amount of agent engineering. We use it to compare fixed workflows with autonomous agents as nested classes of policies, to refine Chapter 1's \(\rho^H\) law into a model with error detection and recovery, to treat stopping as a decision in its own right, and to compute the expected cost and latency of an episode.</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Define an MDP and a POMDP, state the Bellman equation, and derive the Bayesian belief update.</li>
+<li>Explain why the belief state is a sufficient statistic for the history, and why an LLM agent's context is only an approximation to it.</li>
+<li>Formalise an LLM agent at two levels (tokens and steps) and identify the harness as a deterministic map from histories to contexts.</li>
+<li>Characterise fixed workflows, routers and autonomous agents as nested policy classes, and argue when each is preferable.</li>
+<li>Derive the success probability and expected length of an episode with error detection and recovery, and compare with \(\rho^H\).</li>
+<li>Treat termination as an action and analyse the cost of premature and false success claims.</li>
+<li>Compute the expected cost and latency of an episode as a functional of its trajectory.</li>
+</ol>
+</div>
+<p>This chapter uses Chapter 1's agent loop (§1.1), the reliability law (§1.8) and the cost model (§1.10). No reinforcement-learning background is assumed; Chapter 18 builds on the definitions given here.</p>
+
+<h2 id="s2-1">2.1 Why we need a model</h2>
+<p>Consider the support agent at work. A customer writes: "I need to change my flight to Friday." The agent cannot see the customer's booking, the customer's real constraints (perhaps any flight before noon will do), the fare rules, or the seats available on Friday. It can ask questions, look up the reservation, search flights and, eventually, modify the booking. Every one of these actions reveals part of a world the agent cannot see directly, and some of them (modifying the booking) change that world irreversibly. Whether the agent succeeds depends on whether its sequence of questions and look-ups uncovers enough of the hidden facts before it commits.</p>
+<p>Informal pictures like Figure 1.1 are good at suggesting such stories but bad at answering questions about them. Is it better to ask the customer a clarifying question or to look up the booking first? How much of the conversation must the agent keep in its context to act correctly? If it errs on one step in twenty but notices most of its errors, how likely is it to finish correctly? These are questions about expected outcomes under uncertainty, and the branch of mathematics built for them is the theory of sequential decision-making. It was created in the 1950s by Bellman<span class="cite"><a href="#ref-bellman">[1]</a></span> and others for problems of inventory, control and search, and it applies to language agents with surprisingly little modification. We begin with the case in which the agent can see everything.</p>
+
+<h2 id="s2-2">2.2 Markov decision processes</h2>
+<p>A <strong>Markov decision process</strong> (MDP) is the simplest model of an agent acting over time in a random world. Its defining assumption is that the agent observes the full state of the world at every step, and that the state contains everything relevant to the future: given the present state and action, the past is irrelevant. This is the Markov property, and the art of modelling is choosing a state rich enough that it holds.</p>
+
+<div class="box def">
+<div class="box-title">Definition — Markov decision process</div>
+<p>An MDP is a tuple \((\mathcal S,\mathcal A,P,R,\gamma)\): a state space \(\mathcal S\), an action space \(\mathcal A\), a transition kernel \(P(s'\mid s,a)\), a reward function \(R(s,a)\) and a discount factor \(\gamma\in[0,1]\). A policy \(\pi(a\mid s)\) generates a trajectory \(s_1,a_1,r_1,s_2,\dots\) with \(a_t\sim\pi(\cdot\mid s_t)\), \(r_t=R(s_t,a_t)\), \(s_{t+1}\sim P(\cdot\mid s_t,a_t)\). Its <strong>value</strong> is the expected return
+\[ V^\pi(s)=\mathbb E_\pi\Big[\sum_{t\ge1}\gamma^{t-1}r_t\;\Big|\;s_1=s\Big], \qquad Q^\pi(s,a)=R(s,a)+\gamma\,\mathbb E_{s'\sim P(\cdot\mid s,a)}V^\pi(s'). \]</p>
+</div>
+
+<p>The central fact about MDPs is the <strong>Bellman optimality equation</strong>. The optimal value \(V^*(s)=\max_\pi V^\pi(s)\) satisfies</p>
+\[ V^*(s)=\max_{a\in\mathcal A}\Big[R(s,a)+\gamma\sum_{s'}P(s'\mid s,a)\,V^*(s')\Big], \]
+<p>and any policy that chooses a maximising action in every state is optimal. The equation says something intuitive and powerful: the value of being somewhere is the value of the best immediate choice, counting both its reward and the value of where it leads. For \(\gamma&lt;1\) the right-hand side is a contraction in the sup norm, so the equation has a unique solution which value iteration finds by repeated application. Crucially, the optimal policy is <em>deterministic</em> and <em>stationary</em>: it depends only on the current state, not on time or history. That simplicity is the payoff of assuming the state is observed.</p>
+<p>Agent tasks are usually <strong>episodic</strong> with a goal: the episode ends when the goal is reached or the agent gives up, and the natural reward is 1 for success and 0 otherwise, with \(\gamma=1\). Then \(V^\pi(s)\) is simply the probability of eventually succeeding from \(s\), which is the quantity Chapter 1 studied. A per-step cost can be added (\(r_t=-c\) per step) to express a preference for short episodes, and the trade-off between success probability and cost becomes explicit in the value.</p>
+<p>For a language agent, the MDP's assumption fails at once. The coding agent does not observe the code base; it observes the files it has opened. The support agent does not observe the customer's intentions; it observes their messages. What the agent sees is a function of the state, corrupted and incomplete, and we need a model that says so.</p>
+
+<h2 id="s2-3">2.3 Partial observability and belief</h2>
+<p>A <strong>partially observable Markov decision process</strong> (POMDP) adds an observation model to an MDP. The world still evolves as a Markov chain driven by the agent's actions, but the agent sees only observations drawn from a distribution that depends on the state. The model was introduced by Åström in 1965 for control with noisy measurements<span class="cite"><a href="#ref-astrom">[2]</a></span> and brought into AI planning by Kaelbling, Littman and Cassandra in 1998<span class="cite"><a href="#ref-klc">[3]</a></span>.</p>
+
+<div class="box def">
+<div class="box-title">Definition — POMDP and belief state</div>
+<p>A POMDP is \((\mathcal S,\mathcal A,\mathcal O,P,Z,R,\gamma)\), an MDP together with an observation space \(\mathcal O\) and an observation kernel \(Z(o\mid s)\). The agent sees \(o_t\sim Z(\cdot\mid s_t)\) but not \(s_t\). Its information at step \(t\) is the history \(h_t=(o_1,a_1,\dots,a_{t-1},o_t)\). The <strong>belief</strong> \(b_t\) is the posterior distribution of the state given the history, \(b_t(s)=\Pr(s_t=s\mid h_t)\).</p>
+</div>
+
+<p>Because the agent cannot see the state, an optimal policy must in general depend on the whole history: two histories ending in the same observation can imply very different things about the world. Histories grow without bound, which looks hopeless. The rescue is that the belief can be updated recursively. After taking action \(a\) in belief \(b\) and observing \(o\), Bayes' rule gives</p>
+<div class="box formula">
+\[ b'(s')\;=\;\frac{Z(o\mid s')\sum_{s\in\mathcal S}P(s'\mid s,a)\,b(s)}{\sum_{\tilde s\in\mathcal S}Z(o\mid \tilde s)\sum_{s\in\mathcal S}P(\tilde s\mid s,a)\,b(s)}. \]
+</div>
+<p>The numerator is "predict, then correct": push the old belief through the dynamics to get a prior over the new state, then weight each candidate state by how likely it was to produce the observation actually seen. The denominator normalises. This is exactly the Kalman filter of §1.2 when everything is linear and Gaussian, and a discrete Bayes filter otherwise.</p>
+
+<div class="box thm">
+<div class="box-title">Theorem — the belief is a sufficient statistic</div>
+<p>For any POMDP, the belief \(b_t\) is a sufficient statistic of the history \(h_t\) for decision-making: the process \((b_t)\) is itself a (fully observed) MDP on the simplex \(\Delta(\mathcal S)\), the <em>belief MDP</em>, with reward \(\bar R(b,a)=\sum_s b(s)R(s,a)\), and there is an optimal policy of the form \(a_t=\pi^*(b_t)\).</p>
+<p><em>Sketch.</em> The distribution of the next observation, and hence of the next belief, given \(h_t\) and \(a_t\), depends on \(h_t\) only through \(b_t\), by the update formula. The expected reward also depends on \(h_t\) only through \(b_t\). So the pair (belief, action) determines the law of everything that follows, and the Bellman argument of §2.2 applies on the belief space.</p>
+</div>
+
+<p>The theorem tells us what an ideal agent would carry from step to step: not the raw history, but a posterior over the state of the world, updated by Bayes' rule after every observation. It also tells us why POMDPs are hard. The belief space is a simplex of dimension \(\lvert\mathcal S\rvert-1\), and for a code base or a customer \(\mathcal S\) is astronomically large. Exact POMDP solution is PSPACE-hard even for finite horizons (Papadimitriou and Tsitsiklis, 1987)<span class="cite"><a href="#ref-papa">[4]</a></span>, and nobody writes down the transition kernel of a repository. Classical POMDP methods therefore do not apply directly to language agents. What does apply is the <em>structure</em>: an agent must compress its history into something that predicts the future, and it acts well to the extent that the compression keeps what matters. Figure 2.1 contrasts the three settings.</p>
+
+<figure class="diagram" id="fig-2-1">
+<svg class="dg" viewBox="0 0 720 270" role="img" aria-label="MDP, POMDP and LLM agent compared">
+<defs><marker id="ah21" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<text x="120" y="22" text-anchor="middle" class="t-b">MDP</text>
+<text x="360" y="22" text-anchor="middle" class="t-b">POMDP</text>
+<text x="600" y="22" text-anchor="middle" class="t-b">LLM agent</text>
+<line x1="240" y1="10" x2="240" y2="260" class="grid"/><line x1="480" y1="10" x2="480" y2="260" class="grid"/>
+<rect x="70" y="44" width="100" height="36" rx="8" class="bx4"/><text x="120" y="67" text-anchor="middle" class="t-sm">state sₜ</text>
+<line x1="120" y1="80" x2="120" y2="118" class="ln" marker-end="url(#ah21)"/><text x="128" y="104" class="t-xs">seen directly</text>
+<rect x="70" y="120" width="100" height="36" rx="8" class="bx3"/><text x="120" y="143" text-anchor="middle" class="t-sm">π(a | sₜ)</text>
+<text x="120" y="196" text-anchor="middle" class="t-xs">optimal policy depends</text><text x="120" y="212" text-anchor="middle" class="t-xs">only on the current state</text>
+<rect x="310" y="44" width="100" height="36" rx="8" class="bx4"/><text x="360" y="67" text-anchor="middle" class="t-sm">state sₜ (hidden)</text>
+<line x1="360" y1="80" x2="360" y2="100" class="ln" marker-end="url(#ah21)"/>
+<text x="368" y="94" class="t-xs">Z(o | s)</text>
+<rect x="300" y="102" width="120" height="30" rx="8" class="bx2"/><text x="360" y="122" text-anchor="middle" class="t-sm">belief bₜ (Bayes)</text>
+<line x1="360" y1="132" x2="360" y2="152" class="ln" marker-end="url(#ah21)"/>
+<rect x="310" y="154" width="100" height="32" rx="8" class="bx3"/><text x="360" y="175" text-anchor="middle" class="t-sm">π(a | bₜ)</text>
+<text x="360" y="212" text-anchor="middle" class="t-xs">belief is a sufficient statistic</text><text x="360" y="228" text-anchor="middle" class="t-xs">but intractable for large 𝒮</text>
+<rect x="550" y="44" width="100" height="36" rx="8" class="bx4"/><text x="600" y="67" text-anchor="middle" class="t-sm">state sₜ (hidden)</text>
+<line x1="600" y1="80" x2="600" y2="100" class="ln" marker-end="url(#ah21)"/>
+<rect x="520" y="102" width="160" height="30" rx="8" class="bx2"/><text x="600" y="122" text-anchor="middle" class="t-sm">context cₜ = f(hₜ)</text>
+<line x1="600" y1="132" x2="600" y2="152" class="ln" marker-end="url(#ah21)"/>
+<rect x="540" y="154" width="120" height="32" rx="8" class="fill-acc"/><text x="600" y="175" text-anchor="middle" class="t-sm t-on">π_θ(a | cₜ)</text>
+<text x="600" y="212" text-anchor="middle" class="t-xs">a string the harness builds;</text><text x="600" y="228" text-anchor="middle" class="t-xs">the model infers implicitly</text>
+</svg>
+<figcaption><b>Figure 2.1 — Three levels of observability.</b> In an MDP the policy sees the state. In a POMDP it sees a belief computed by Bayes' rule from the history. In an LLM agent it sees a context string \(c_t\) that the harness builds from the history; the model's own computation plays the role of the Bayes update.</figcaption></figure>
+
+<p>Read Figure 2.1 from left to right as a sequence of approximations. The MDP is an idealisation that never holds for language agents. The POMDP is the right model but cannot be solved. The LLM agent is a practical compromise: rather than maintaining an explicit posterior, it keeps the history itself (or an edited version of it) as text and relies on the model, which has learned from vast amounts of text how situations tend to unfold, to perform the inference implicitly every time it reads the context. The next section makes this precise.</p>
+
+<h2 id="s2-4">2.4 The language-model agent as a policy</h2>
+<p>A language model defines a distribution over strings. To use it as a policy we need actions and observations to be strings too, and a rule for turning the history into the string the model reads. There are two natural levels of description, and confusing them causes real mistakes in both engineering and training.</p>
+<p>At the <strong>token level</strong>, the agent is a policy whose actions are single tokens. The "state" is the token sequence so far; each action appends one token; most transitions are deterministic (the token is appended) except at the moments when the harness intercepts a completed tool call, executes it, and appends the observation's tokens, which are drawn by the environment. In this view the language model is exactly a stochastic policy \(p_\theta(x_i\mid x_{&lt;i})\), and the whole episode is one long sequence in which some spans are written by the model and others by the world. This is the right view for training with reinforcement learning (Chapter 18; see Sutton and Barto<span class="cite"><a href="#ref-sutton">[5]</a></span> for the general theory), because gradients flow through the probabilities of individual tokens, and observation tokens, which the model did not choose, must be masked out of the loss.</p>
+<p>At the <strong>step level</strong>, the agent is a policy whose actions are whole messages: a block of reasoning followed by zero or more tool calls, or a final answer. One step is one model call. The action space \(\mathcal A\) is the set of all strings up to some length, and the policy is the distribution over complete outputs that the model induces. This is the right view for reasoning about reliability, cost and latency, because errors, tool calls and charges happen per step. Chapter 1's horizon \(H\) counts steps in this sense.</p>
+
+<div class="box def">
+<div class="box-title">Definition — the LLM agent</div>
+<p>An <strong>LLM agent</strong> consists of a language model \(p_\theta\), a <strong>context map</strong> \(f\) and an <strong>action parser</strong> \(g\). At step \(t\) the harness forms the context \(c_t=f(h_t)\), a token string; samples an output \(y_t\sim p_\theta(\cdot\mid c_t)\); and parses it into an action \(a_t=g(y_t)\), such as a set of tool calls or a final answer. The environment returns \(o_{t+1}\), and the history becomes \(h_{t+1}=(h_t,y_t,o_{t+1})\). The induced step-level policy is
+\[ \pi_\theta(a\mid h_t)=\sum_{y:\,g(y)=a}p_\theta(y\mid f(h_t)). \]</p>
+</div>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — the harness is a deterministic map</div>
+<p>In software terms the harness is "the program that calls the model". Mathematically it is two deterministic functions. The context map \(f:\mathcal H\to\mathcal V^*\) sends a history to a token string: typically a fixed prefix (system prompt and tool schemas), followed by a serialisation of the history in a chat template, possibly truncated or summarised. The parser \(g:\mathcal V^*\to\mathcal A\cup\{\bot\}\) sends the model's output to an action, or to a failure symbol \(\bot\) when the output is malformed. Every engineering choice about prompts, memory and tool formats is a choice of \(f\) or \(g\); the weights \(\theta\) are a separate choice. Since \(f\) is not injective once it truncates or summarises, two different histories can map to the same context, and the policy cannot distinguish them, which is how information is lost.</p>
+</div>
+
+<p>The definition makes precise the claim that the context is the agent's working state. In the ideal POMDP agent, the belief \(b_t\) is a sufficient statistic; in the LLM agent, the policy sees only \(c_t=f(h_t)\). If \(f\) is the identity (the full history, verbatim) then no information is lost, and the model's implicit inference has everything an ideal agent would. Three things break this in practice. First, the context window is finite: once \(\lvert h_t\rvert\) exceeds \(n_{\max}\) tokens, \(f\) must drop or compress something. Second, even within the window, models do not use all positions equally well; information buried in the middle of a long context is used less reliably than information near the start or end<span class="cite"><a href="#ref-lost">[6]</a></span>, an effect Chapter 4 quantifies. Third, cost: every token in \(c_t\) is paid for at every step (§1.10), so there is pressure to make \(f\) lossy long before the window is full. Context engineering, the subject of Chapter 4, is the design of \(f\) under these constraints, and its goal can be stated in this chapter's language: choose \(f\) so that \(c_t\) preserves as much of the decision-relevant information in \(h_t\) as a limited budget of tokens allows.</p>
+<p>What does "decision-relevant" mean? The POMDP gives a precise answer: \(f\) loses nothing that matters if the optimal policy depends on \(h_t\) only through \(f(h_t)\), that is, if \(f(h_t)\) is itself a sufficient statistic. For the coding agent, a context that keeps the issue, the current contents of the edited files and the latest test output, but drops the contents of files that turned out to be irrelevant, can be nearly sufficient. A context that drops the original issue text after a summarisation step is not, and agents whose compaction loses the goal are a classic failure mode. The test an engineer can apply is the one the definition suggests: could an expert human, given only \(c_t\), choose the right next action? If not, the policy cannot either, however capable the model.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — the support agent's belief, explicitly</div>
+<p>A customer writes "change my flight to Friday". Suppose there are two hypotheses about intent: \(s_A\) = "the cheapest Friday flight", \(s_B\) = "a Friday flight arriving before noon, even if it costs more", with prior \(b(s_A)=0.7\), \(b(s_B)=0.3\). The agent can ask "Do you have a preferred time?" Under \(s_A\) the customer says "no preference" with probability 0.9; under \(s_B\) they say "morning, please" with probability 0.95 and "no preference" with probability 0.05.</p>
+<p><b>Value of asking.</b> The cheapest Friday flight arrives at 15:00, so no single booking satisfies both hypotheses. If the agent books the cheapest flight without asking, it succeeds only under \(s_A\): success 0.7. If it asks first, then after "no preference" the posterior is \(b'(s_A)=\frac{0.9\times0.7}{0.9\times0.7+0.05\times0.3}=\frac{0.63}{0.645}=0.977\); after "morning" it is \(b'(s_B)=\frac{0.95\times0.3}{0.95\times0.3+0.1\times0.7}=\frac{0.285}{0.355}=0.803\), and it books a morning flight. Success with asking is \(0.645\times0.977+0.355\times0.803=0.630+0.285=0.915\).</p>
+<p><b>Interpretation.</b> One clarifying turn raises the success rate from 0.70 to about 0.92 at the cost of one extra step. A language model does not compute these numbers, but a good one behaves as if it had: it asks when the posterior over intent is spread out and the cost of a wrong irreversible action is high. Prompting a support agent to "ask clarifying questions when the request is ambiguous" is an instruction to act on an implicit belief state.</p>
+</div>
+
+<p>The worked example also shows what an observation is worth. Asking a question is an action with no effect on the world but a large effect on the belief, an <em>information-gathering action</em>. Much of what distinguishes a good agent from a bad one is the judgement of when to gather information (read another file, run a diagnostic command, ask the user) and when to commit (make the edit, issue the refund). The POMDP makes the trade-off precise; Chapter 6 shows how search methods exploit it, and Chapter 18 how training can teach it. Before that we need to see how the architecture of an agent constrains which policies are even possible.</p>
+
+<h2 id="s2-5">2.5 Workflows and agents as policy classes</h2>
+<p>Practitioners distinguish <strong>workflows</strong>, systems in which language-model calls are orchestrated through predefined code paths, from <strong>agents</strong>, in which the model itself decides what to do next and how many steps to take<span class="cite"><a href="#ref-bea">[7]</a></span>. The distinction is often presented as a matter of taste. In the language of this chapter it is a precise statement about which policies the system can represent, and that makes the trade-off analysable.</p>
+<p>Write the control flow of a system as a directed graph whose nodes are model calls or tool calls and whose edges say what may follow what. A <strong>fixed workflow</strong> (a <em>prompt chain</em>) is a path: extract the customer's request, look up the booking, draft a reply, check it against the policy. The sequence of actions is the same for every input; only their contents vary. A <strong>router</strong> adds branching chosen by a model: classify the request, then follow the path for its class. An <strong>agent</strong> is the complete graph with self-loops: at every step the model may call any tool, any number of times, or stop. Each class contains the previous one, since an agent could always choose to behave like a workflow. Figure 2.2 draws the three.</p>
+
+<figure class="diagram" id="fig-2-2">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="Fixed workflow, router and agent as control-flow graphs">
+<defs><marker id="ah22" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<text x="110" y="22" text-anchor="middle" class="t-b">Fixed workflow</text>
+<text x="350" y="22" text-anchor="middle" class="t-b">Router</text>
+<text x="600" y="22" text-anchor="middle" class="t-b">Agent</text>
+<g class="t-sm">
+<rect x="60" y="40" width="100" height="30" rx="6" class="bx2"/><text x="110" y="60" text-anchor="middle">extract</text>
+<rect x="60" y="92" width="100" height="30" rx="6" class="bx3"/><text x="110" y="112" text-anchor="middle">look up</text>
+<rect x="60" y="144" width="100" height="30" rx="6" class="bx2"/><text x="110" y="164" text-anchor="middle">draft reply</text>
+<rect x="60" y="196" width="100" height="30" rx="6" class="bx4"/><text x="110" y="216" text-anchor="middle">check policy</text>
+</g>
+<line x1="110" y1="70" x2="110" y2="90" class="ln" marker-end="url(#ah22)"/>
+<line x1="110" y1="122" x2="110" y2="142" class="ln" marker-end="url(#ah22)"/>
+<line x1="110" y1="174" x2="110" y2="194" class="ln" marker-end="url(#ah22)"/>
+<g class="t-sm">
+<rect x="300" y="40" width="100" height="30" rx="6" class="bx2"/><text x="350" y="60" text-anchor="middle">classify</text>
+<rect x="250" y="110" width="80" height="30" rx="6" class="bx3"/><text x="290" y="130" text-anchor="middle">change</text>
+<rect x="370" y="110" width="80" height="30" rx="6" class="bx3"/><text x="410" y="130" text-anchor="middle">refund</text>
+<rect x="300" y="190" width="100" height="30" rx="6" class="bx4"/><text x="350" y="210" text-anchor="middle">reply</text>
+</g>
+<line x1="335" y1="70" x2="295" y2="108" class="ln" marker-end="url(#ah22)"/>
+<line x1="365" y1="70" x2="405" y2="108" class="ln" marker-end="url(#ah22)"/>
+<line x1="295" y1="140" x2="335" y2="188" class="ln" marker-end="url(#ah22)"/>
+<line x1="405" y1="140" x2="365" y2="188" class="ln" marker-end="url(#ah22)"/>
+<circle cx="600" cy="125" r="34" class="fill-acc"/><text x="600" y="122" text-anchor="middle" class="t-on t-sm">model</text><text x="600" y="138" text-anchor="middle" class="t-on t-xs">decides</text>
+<g class="t-xs">
+<rect x="510" y="40" width="66" height="26" rx="6" class="bx3"/><text x="543" y="58" text-anchor="middle">search</text>
+<rect x="626" y="40" width="66" height="26" rx="6" class="bx3"/><text x="659" y="58" text-anchor="middle">look up</text>
+<rect x="500" y="184" width="66" height="26" rx="6" class="bx3"/><text x="533" y="202" text-anchor="middle">modify</text>
+<rect x="636" y="184" width="66" height="26" rx="6" class="bx3"/><text x="669" y="202" text-anchor="middle">ask user</text>
+<rect x="676" y="112" width="40" height="26" rx="6" class="bx4"/><text x="696" y="130" text-anchor="middle">stop</text>
+</g>
+<line x1="575" y1="102" x2="555" y2="68" class="ln" marker-end="url(#ah22)" marker-start="url(#ah22)"/>
+<line x1="625" y1="102" x2="645" y2="68" class="ln" marker-end="url(#ah22)" marker-start="url(#ah22)"/>
+<line x1="575" y1="148" x2="548" y2="182" class="ln" marker-end="url(#ah22)" marker-start="url(#ah22)"/>
+<line x1="625" y1="148" x2="652" y2="182" class="ln" marker-end="url(#ah22)" marker-start="url(#ah22)"/>
+<line x1="634" y1="125" x2="674" y2="125" class="ln" marker-end="url(#ah22)"/>
+<text x="600" y="240" text-anchor="middle" class="t-xs">any tool, any number of times, then stop</text>
+</svg>
+<figcaption><b>Figure 2.2 — Three policy classes.</b> A fixed workflow is a path; a router adds model-chosen branches; an agent lets the model choose any action at every step. Each class contains the one to its left, so the agent class can represent more policies, including more bad ones.</figcaption></figure>
+
+<p>Figure 2.2 makes the trade-off visible as a classic bias–variance problem in policy space. The larger class contains better policies: an agent can investigate a strange booking, retry a failed look-up or ask a question the workflow's designer did not anticipate. But it also contains far worse ones, and the policy actually executed is the one the model picks, step by step, with errors. A workflow constrains the model to a small set of trajectories that an engineer has verified; its failure modes are known and testable, its cost and latency are bounded, and it cannot loop. Write \(\Pi_W\subset\Pi_R\subset\Pi_A\) for the three classes. If \(V^*_\Pi\) is the best value attainable within a class and \(\hat\pi_\Pi\) is the policy the system actually realises, the quantity that matters is \(V^{\hat\pi_\Pi}=V^*_\Pi-(V^*_\Pi-V^{\hat\pi_\Pi})\): the best achievable value minus the realisation gap. Enlarging the class raises the first term and, for a fallible model, usually also raises the second.</p>
+<p>Three properties of a task decide which effect wins. The first is <strong>variability</strong>: if the right sequence of actions differs a lot from input to input (debugging, research), a workflow's \(V^*_{\Pi_W}\) is low and an agent is needed. If most inputs need the same steps (extracting fields from invoices), the workflow's ceiling is already high. The second is <strong>feedback</strong>: an agent closes its realisation gap by observing the consequences of its actions, so tasks whose environment gives informative signals (tests, error messages, search results) favour agents. The third is the <strong>cost of error</strong>: where a wrong action is expensive or irreversible, the predictability of a workflow, perhaps with an agent confined to the steps that genuinely vary, is worth more than the agent's flexibility. The practical rule that follows, and which most successful deployments follow, is to start with the smallest class that can do the task and move up only when measurement shows the ceiling binding. Chapter 16 develops the patterns in between, such as orchestrator–worker and evaluator–optimiser designs.</p>
+
+<h2 id="s2-6">2.6 Compounding error with recovery</h2>
+<p>Chapter 1's law \(\rho^H\) assumed that every error is fatal. Real agents notice many of their errors: the test still fails, the search returns nothing, the tool reports invalid arguments, the customer says "that's not what I asked". They then spend a few steps putting things right. To see how much this matters we model an episode as a Markov chain on a small set of abstract states, the standard way to turn a story about failure into a number.</p>
+<p>At each nominal step the agent is <em>on track</em>. With probability \(1-\epsilon\) it completes the step correctly and remains on track. With probability \(\epsilon\) it makes an error. An error is <em>detected</em> with probability \(r\), in which case the agent spends on average \(\delta\) extra steps recovering and returns to on track; with probability \(1-r\) it goes undetected and the episode is doomed, an <em>absorbing</em> failure state. Figure 2.3 draws the chain.</p>
+
+<figure class="diagram" id="fig-2-3">
+<svg class="dg" viewBox="0 0 720 256" role="img" aria-label="Markov chain of an episode with error detection and recovery">
+<defs><marker id="ah23" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker>
+<marker id="ah23a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead-acc"/></marker></defs>
+<g transform="translate(0,26)">
+<circle cx="140" cy="110" r="46" class="bx3"/><text x="140" y="106" text-anchor="middle" class="t-b">on track</text><text x="140" y="124" text-anchor="middle" class="t-xs">nominal step</text>
+<circle cx="380" cy="60" r="40" class="bx2"/><text x="380" y="56" text-anchor="middle" class="t-sm">detected</text><text x="380" y="72" text-anchor="middle" class="t-xs">≈ δ extra steps</text>
+<circle cx="380" cy="170" r="40" class="bx4"/><text x="380" y="166" text-anchor="middle" class="t-sm">undetected</text><text x="380" y="182" text-anchor="middle" class="t-xs">error</text>
+<rect x="560" y="140" width="130" height="60" rx="10" class="fill-s2"/><text x="625" y="168" text-anchor="middle" class="t-on t-b">failed</text><text x="625" y="186" text-anchor="middle" class="t-on t-xs">absorbing</text>
+<rect x="560" y="20" width="130" height="60" rx="10" class="fill-acc"/><text x="625" y="48" text-anchor="middle" class="t-on t-b">success</text><text x="625" y="66" text-anchor="middle" class="t-on t-xs">after H steps</text>
+<path d="M118,68 C90,20 190,20 166,70" class="ln" marker-end="url(#ah23)"/><text x="140" y="22" text-anchor="middle" class="t-xs">1 − ε</text>
+<line x1="184" y1="94" x2="340" y2="66" class="ln" marker-end="url(#ah23)"/><text x="260" y="66" text-anchor="middle" class="t-xs">ε r</text>
+<path d="M342,74 C290,110 230,112 186,112" class="ln-acc" marker-end="url(#ah23a)"/><text x="268" y="122" text-anchor="middle" class="t-xs t-acc">recover</text>
+<line x1="182" y1="130" x2="340" y2="166" class="ln" marker-end="url(#ah23)"/><text x="250" y="166" text-anchor="middle" class="t-xs">ε (1 − r)</text>
+<line x1="420" y1="170" x2="558" y2="170" class="ln" marker-end="url(#ah23)"/>
+<path d="M170,78 C300,-20 480,-20 558,46" class="ln dash" marker-end="url(#ah23)"/><text x="480" y="-6" text-anchor="middle" class="t-xs">H correct steps done</text>
+</g>
+</svg>
+<figcaption><b>Figure 2.3 — An episode as a Markov chain.</b> Each nominal step succeeds with probability \(1-\epsilon\). An error is detected with probability \(r\) and costs about \(\delta\) extra steps; an undetected error leads to the absorbing failure state. Only undetected errors kill the episode.</figcaption></figure>
+
+<p>Reading the chain, only the transition with probability \(\epsilon(1-r)\) leads to failure. Every nominal step therefore survives with probability \(1-\epsilon(1-r)\), and, ignoring errors made during recovery itself, the episode succeeds with probability</p>
+<div class="box formula">
+\[ \Pr[\text{success}]=\big(1-\epsilon(1-r)\big)^{H}\approx e^{-H\epsilon(1-r)},\qquad \mathbb E[\text{steps}]\approx H\big(1+\epsilon\, r\,\delta\big). \]
+</div>
+<p>Detection divides the effective error rate by \(1/(1-r)\). An agent that catches 80% of its errors behaves, for survival, like one with a fifth of the error rate; at 95% detection, a twentieth. The price is paid in steps, and hence in cost and time, but only in proportion to \(\epsilon r\delta\), which is small when errors are rare. Figure 2.4 compares the curves for \(\epsilon=0.05\).</p>
+
+<figure class="chart" id="fig-2-4">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Success probability with error detection (ε = 0.05)","height":340,
+ "x":{"label":"Number of nominal steps H","min":0,"max":100,"ticks":[0,10,20,30,40,50,60,70,80,90,100]},
+ "y":{"label":"Probability the task succeeds","min":0,"max":1,"fmt":"pct"},
+ "series":[
+  {"name":"no detection (r = 0)","color":"s2","markers":false,"points":[[0,1],[5,0.7738],[10,0.5987],[15,0.4633],[20,0.3585],[25,0.2774],[30,0.2146],[40,0.1285],[50,0.0769],[60,0.0461],[80,0.0165],[100,0.0059]]},
+  {"name":"r = 0.8","color":"s1","markers":false,"points":[[0,1],[10,0.9044],[20,0.8179],[30,0.7397],[40,0.6690],[50,0.6050],[60,0.5472],[70,0.4948],[80,0.4475],[90,0.4047],[100,0.3660]]},
+  {"name":"r = 0.95","color":"s3","markers":false,"points":[[0,1],[10,0.9753],[20,0.9512],[30,0.9277],[40,0.9048],[50,0.8825],[60,0.8607],[70,0.8394],[80,0.8187],[90,0.7985],[100,0.7787]]}
+ ]}
+</script>
+<figcaption><b>Figure 2.4 — Recovery flattens the exponential.</b> With a 5% per-step error rate, detecting 80% of errors gives the survival curve of a 1%-error agent; detecting 95% gives that of a 0.25%-error agent. At 50 steps success rises from 8% to 61% and 88%.</figcaption></figure>
+
+<p>Figure 2.4 is the quantitative case for the design principle that dominates good agent engineering: <em>make errors observable</em>. The orange curve is Chapter 1's pessimistic world. The blue and green curves are the same model, same per-step error rate, in an environment that reports when something has gone wrong and a harness that lets the agent react. This is why coding agents, whose environment includes a test suite and a compiler, became reliable before agents in domains with no such signals; why tools should return explicit, informative errors instead of silently doing nothing; and why a support agent should read back the booking after modifying it. Every mechanism that raises \(r\) is worth as much as a model that makes fewer errors in the first place, and is usually much cheaper.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — the value of a test suite</div>
+<p>The coding agent makes an error on 5% of steps, and a typical fix needs \(H=50\) nominal steps. Without running tests it detects few errors, say \(r=0.2\); with a habit of running the relevant tests after each edit, \(r=0.8\), and a detected error costs \(\delta=2\) extra steps.</p>
+<p><b>Success.</b> At \(r=0.2\): \((1-0.05\times0.8)^{50}=0.96^{50}=e^{50\ln0.96}=e^{-2.041}=0.130\). At \(r=0.8\): \((1-0.05\times0.2)^{50}=0.99^{50}=0.605\).</p>
+<p><b>Cost in steps.</b> At \(r=0.8\): \(50(1+0.05\times0.8\times2)=50\times1.08=54\) steps, plus the test runs themselves, say one per edit, of which there are perhaps ten: about 64 steps against 50.</p>
+<p><b>Interpretation.</b> A 28% increase in steps buys a 4.7-fold increase in success. In cost per <em>successful</em> episode, the instrumented agent is far cheaper: if an episode costs roughly in proportion to its steps, the cost per success falls from \(50/0.130\approx385\) step-units to \(64/0.605\approx106\).</p>
+</div>
+
+<p>The model has limits, and they are instructive. Errors during recovery are ignored; including them multiplies \(\epsilon(1-r)\) by a factor slightly above one. Detection is assumed to be immediate; an error detected ten steps later may have contaminated those ten steps, so \(\delta\) grows with detection delay, which is a second argument for checking early and often. Most importantly, errors are assumed independent. In reality an agent that misunderstood the task makes correlated errors that no local check reveals: every test it writes encodes the same misunderstanding. Such errors are invisible to the chain in Figure 2.3 and must be caught by checks against the <em>goal</em> rather than against the agent's own intermediate products: hidden tests, a reviewer, the customer's confirmation. This leads directly to the question of when an episode should end.</p>
+
+<details class="drill">
+<summary>Drill 2.1 — detection versus accuracy</summary>
+<p>Agent A has error rate \(\epsilon=0.1\) per step and detects 90% of its errors. Agent B has \(\epsilon=0.03\) and detects none. Which is more likely to complete a 30-step task, and how many expected steps does A take if each recovery costs \(\delta=3\) steps?</p>
+<p>A's fatal rate is \(0.1\times0.1=0.01\): success \(0.99^{30}=0.740\). B's is \(0.03\): success \(0.97^{30}=e^{-0.914}=0.401\). A is far more reliable despite making more than three times as many errors. A's expected steps are \(30(1+0.1\times0.9\times3)=30\times1.27=38.1\). Detection beats raw accuracy whenever \(\epsilon_A(1-r_A)&lt;\epsilon_B(1-r_B)\).</p>
+</details>
+
+<h2 id="s2-7">2.7 Stopping as a decision</h2>
+<p>An agent must decide when it is done, and this decision is as important as any other. In the POMDP, termination is simply one more action, "submit" or "answer", which ends the episode and collects the terminal reward: 1 if the goal is actually achieved and 0 otherwise. Two failure modes bracket the right behaviour. <strong>Premature stopping</strong> submits while the belief that the goal is achieved is still low: the coding agent submits a patch without running the tests. <strong>Non-termination</strong> never submits: the agent keeps exploring, re-reading files or retrying the same failing command, until it runs out of budget. Auto-GPT suffered badly from both.</p>
+<p>The decision-theoretic view gives a clean rule. Let \(q_t\) be the agent's (implicit) belief that the goal is achieved if it stops now, \(U\) the value of success and \(c\) the cost of one more step. Continuing for one step changes the belief to some \(q_{t+1}\), random from the agent's point of view, and the expected gain from continuing one step and then stopping is \(U(\mathbb E[q_{t+1}]-q_t)-c\). The <strong>one-step look-ahead rule</strong> stops when this is negative: when no available action is expected to raise the probability of success by more than \(c/U\). With \(U=\$50\) (an engineer's time saved by a resolved issue) and \(c=\$0.05\) (a cached step), the threshold is a 0.1-percentage-point gain per step, which says the agent should keep checking long after it believes it is done. For a support agent, where a step is a turn that keeps a customer waiting, \(c\) includes the customer's time and the threshold is much higher. The rule is myopic (a sequence of steps can be worthwhile when no single step is), but it identifies the right quantities.</p>
+<p>The harder problem is that the agent's belief \(q_t\) may be badly calibrated. Language models are often overconfident about their own answers<span class="cite"><a href="#ref-kadavath">[8]</a></span> and claim success they have not achieved, a phenomenon familiar to anyone who has used coding agents: "All tests pass" when the tests were never run. Suppose an agent's episodes truly succeed with probability \(p\), and on failed episodes it nonetheless reports success with probability \(\varphi\). Then the fraction of <em>reported</em> successes that are real is</p>
+\[ \Pr[\text{real}\mid\text{reported}]=\frac{p}{p+(1-p)\varphi}. \]
+<p>At \(p=0.6\) and \(\varphi=0.5\), only \(0.6/0.8=75\%\) of claimed successes are real, and a user who trusts the claims is wrong a quarter of the time. This quantity, not the raw success rate, determines how much human review a deployment needs. Figure 2.5 shows the structure of a <em>verification gate</em> that addresses it: the agent's "done" is treated as a proposal, an independent check against the goal decides whether the episode really ends, and a rejected proposal returns the agent to work with the check's output as a new observation.</p>
+
+<figure class="diagram" id="fig-2-5">
+<svg class="dg" viewBox="0 0 720 200" role="img" aria-label="A verification gate on the stop action">
+<defs><marker id="ah25" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker>
+<marker id="ah25a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead-acc"/></marker></defs>
+<rect x="20" y="70" width="140" height="56" rx="10" class="fill-acc"/><text x="90" y="95" text-anchor="middle" class="t-on t-b">agent loop</text><text x="90" y="113" text-anchor="middle" class="t-on t-xs">act, observe, repeat</text>
+<line x1="160" y1="98" x2="238" y2="98" class="ln" marker-end="url(#ah25)"/><text x="199" y="88" text-anchor="middle" class="t-xs">"done"</text>
+<rect x="240" y="66" width="170" height="64" rx="10" class="bx4"/><text x="325" y="92" text-anchor="middle" class="t-b">verification gate</text><text x="325" y="112" text-anchor="middle" class="t-xs">hidden tests · DB end-state · reviewer</text>
+<line x1="410" y1="98" x2="518" y2="98" class="ln-acc" marker-end="url(#ah25a)"/><text x="464" y="88" text-anchor="middle" class="t-xs t-acc">passes</text>
+<rect x="520" y="70" width="180" height="56" rx="10" class="bx3"/><text x="610" y="95" text-anchor="middle" class="t-b">episode ends</text><text x="610" y="113" text-anchor="middle" class="t-xs">report result to user</text>
+<path d="M325,130 C325,180 90,180 90,128" class="ln dash" marker-end="url(#ah25)"/><text x="210" y="190" text-anchor="middle" class="t-xs">fails: check output becomes the next observation</text>
+<text x="360" y="30" text-anchor="middle" class="t-sm">the agent proposes termination; an independent check decides it</text>
+</svg>
+<figcaption><b>Figure 2.5 — A verification gate on the stop action.</b> Treating "done" as a proposal and checking it against the goal turns false success claims into extra steps, and gives the agent an informative observation when it is wrong.</figcaption></figure>
+
+<p>Figure 2.5 is the recovery idea of §2.6 applied to the last step. A false claim of success is an error, and the gate is a detector for it. With a gate whose check catches a fraction \(r_g\) of false claims, the rate of false reported successes falls from \((1-p)\varphi\) to \((1-p)\varphi(1-r_g)\), and many of the caught episodes go on to succeed. The catch is that gates exist only where the goal can be checked automatically. Coding tasks often have tests; database tasks have end-states; research reports and customer conversations usually do not, which is why Chapter 7 studies model-based critics and Chapter 19 studies the reliability of model judges. Even then, the principle stands: an agent's own declaration of success is weak evidence, and systems should be designed to obtain stronger evidence when stakes are high.</p>
+
+<details class="drill">
+<summary>Drill 2.2 — how much do claims of success mean?</summary>
+<p>An agent truly succeeds on 70% of episodes and falsely claims success on 40% of the rest. (a) What fraction of its claimed successes are real? (b) A gate catches 75% of false claims, and half of the caught episodes then succeed. What are the new true success rate and the new precision of claims?</p>
+<p>(a) Claims: \(0.7+0.3\times0.4=0.82\); real fraction \(0.7/0.82=0.854\). (b) False claims caught: \(0.12\times0.75=0.09\), of which half (0.045) become real successes. True success: \(0.7+0.045=0.745\). Remaining false claims: \(0.12-0.09=0.03\), plus false claims among the 0.045 that fail again, which we neglect. Precision \(\approx0.745/(0.745+0.03)=0.961\).</p>
+</details>
+
+<h2 id="s2-8">2.8 The cost and latency of an episode</h2>
+<p>Success is not free, and the decision process gives us the language to say what it costs. The cost of an episode is a functional of its trajectory: a sum over steps of the price of the tokens each model call reads and writes, plus the cost of tool calls. Since the trajectory is random, so is the cost, and a system's economics depend on its distribution, not only its mean: an agent whose median episode costs $1 but whose 1% worst episodes loop for an hour and cost $40 needs a budget cap, and the cap is itself a stopping rule.</p>
+<p>For step \(t\) with context \(n_t\) tokens, of which \(n^{\text{new}}_t\) are new since the last call, and \(n^{\text{out}}_t\) output tokens, the model charge with caching is</p>
+<div class="box formula">
+\[ C=\sum_{t=1}^{H}\Big[\kappa_{\text{in}}\,n^{\text{new}}_t+\kappa_{\text{cache}}\,(n_t-n^{\text{new}}_t)+\kappa_{\text{out}}\,n^{\text{out}}_t\Big],\qquad \ell=\sum_{t=1}^{H}\Big[\frac{n^{\text{new}}_t}{v_{\text{pre}}}+\frac{n^{\text{out}}_t}{v_{\text{dec}}}+\ell_{\text{tool},t}\Big]. \]
+</div>
+<p>The latency formula assumes the steps run one after another, which they must when each depends on the previous observation, and that cached tokens cost no prefill time, a good approximation. The formulas have one structural consequence that §1.10 met in a special case: if the context grows linearly in \(t\), the cached-read term grows quadratically in \(H\) while the fresh-input, output and latency terms grow only linearly. Figure 2.6 plots the expected model charge of the coding agent of §1.10 as the horizon grows.</p>
+
+<figure class="chart" id="fig-2-6">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Model charge of one coding-agent episode versus horizon","height":340,
+ "x":{"label":"Steps H (context 8k + 2.5k per step)","min":0,"max":100,"ticks":[0,10,20,30,40,50,60,70,80,90,100]},
+ "y":{"label":"Cost per episode (dollars)","min":0,"max":40,"fmt":"suffix:"},
+ "vlines":[{"x":78,"text":"200k window full"}],
+ "series":[
+  {"name":"no caching","color":"s2","points":[[10,0.62],[20,2.0],[40,6.99],[60,14.99],[80,25.98],[100,39.98]]},
+  {"name":"with prompt caching","color":"s1","points":[[10,0.185],[20,0.43],[40,1.15],[60,2.16],[80,3.48],[100,5.09]]}
+ ]}
+</script>
+<figcaption><b>Figure 2.6 — Quadratic cost of long episodes.</b> Without caching, cost grows quadratically with the horizon; caching cuts it by a factor of three to eight (more for longer episodes) but keeps the quadratic shape. The dashed line marks the step at which the context would exceed a 200k-token window, so beyond it the context must be compacted anyway.</figcaption></figure>
+
+<p>Figure 2.6 has two lessons for design. The first is the familiar one: caching is not optional for agents. The second is that, even with caching, doubling the horizon from 50 to 100 steps more than triples the cost, and the context window ends the experiment at step 78 regardless. Long-horizon agents must therefore bound the context, either by compacting it (replacing old history with a summary) or by delegating sub-tasks to sub-agents that start fresh. In the POMDP language of §2.4, both are choices of a lossier context map \(f\), trading information for cost, and Chapter 14 studies how to make that trade without losing what matters.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — the cost of a support conversation</div>
+<p>A support conversation runs for \(H=12\) agent turns. The fixed prefix (system prompt, airline policy, tool schemas) is 6,000 tokens. Each turn appends 400 tokens: a 100-token customer message, 150 tokens of tool results and the agent's 150-token reply.</p>
+<p><b>Input.</b> \(\sum_t n_t=12\times6{,}000+400\times\frac{12\times11}{2}=72{,}000+26{,}400=98{,}400\) tokens. Output: \(12\times150=1{,}800\) tokens.</p>
+<p><b>Without caching.</b> \(0.0984\times\$3+0.0018\times\$15=\$0.295+\$0.027=\$0.32\).</p>
+<p><b>With caching.</b> Fresh tokens: \(6{,}000+11\times400=10{,}400\), costing $0.031; cached: \(88{,}000\) tokens, $0.026; output $0.027. Total <b>$0.085</b>, a quarter of the uncached cost. Here the long fixed prefix dominates, so caching it across <em>conversations</em> (the policy and schemas are identical for every customer) saves even more: the first 6,000 tokens are fresh only once per cache lifetime, not once per conversation.</p>
+<p><b>Latency per turn.</b> Prefill of about 400 fresh tokens takes 0.08 s, decoding 150 tokens 2.5 s, and the tools perhaps 0.5 s: about 3 s per reply, dominated by decoding. Shorter replies are the main latency lever.</p>
+</div>
+
+<details class="drill">
+<summary>Drill 2.3 — when should the agent stop checking?</summary>
+<p>A coding agent believes its fix is correct with probability \(q=0.9\). Running the full test suite costs one step at $0.05 and, if the fix is wrong, reveals it with probability 0.95, after which the agent repairs it with probability 0.8. Resolving the issue is worth $50. Should it run the tests?</p>
+<p>The gain in success probability is \((1-q)\times0.95\times0.8=0.1\times0.76=0.076\), worth \(0.076\times\$50=\$3.80\), against a cost of $0.05 (plus a few more steps to repair, perhaps $0.20). Run the tests: the threshold \(c/U=0.001\) is far below the gain. Even at \(q=0.99\) the gain is \(0.0076\times\$50=\$0.38\), still worth it. This is why good harnesses make "run the tests before submitting" mandatory.</p>
+</details>
+
+<h2 id="looking-ahead" class="unnumbered">Looking ahead</h2>
+<p>We now have the mathematical object: an LLM agent is a policy \(\pi_\theta(a\mid f(h_t))\) in a POMDP, where the context map \(f\) stands in for the Bayesian belief and the language model performs the inference implicitly. Its reliability depends on per-step error, on how many errors the environment and harness make visible, and on how well it decides to stop. Its cost depends on how its context grows. Everything rests on one component we have so far treated as a black box: the language model itself. What exactly does a model learn in pre-training that lets it act as a reasonable policy in environments it has never seen? Why does instruction tuning matter, what does temperature do to the policy, how well calibrated are its beliefs, and what does a call actually cost to serve? Chapter 3 opens the box.</p>
+
+<h2 id="summary">Chapter summary</h2>
+<ul>
+<li>An <b>MDP</b> \((\mathcal S,\mathcal A,P,R,\gamma)\) has an optimal deterministic policy given by the Bellman equation; with a 0/1 terminal reward and \(\gamma=1\), value is the probability of success.</li>
+<li>A <b>POMDP</b> adds an observation kernel \(Z(o\mid s)\). The <b>belief</b> \(b_t\), updated by Bayes' rule, is a sufficient statistic of the history, but exact solution is intractable for realistic state spaces.</li>
+<li>An <b>LLM agent</b> is \((p_\theta, f, g)\): the harness's context map \(f\) turns the history into the string the model reads, and the parser \(g\) turns output into actions. The context stands in for the belief; information that \(f\) drops is invisible to the policy. Token-level and step-level views suit training and reliability analysis respectively.</li>
+<li><b>Workflows, routers and agents</b> are nested policy classes. Larger classes have higher ceilings and larger realisation gaps; variability, feedback and cost of error decide which wins.</li>
+<li>With error rate \(\epsilon\), detection probability \(r\) and recovery cost \(\delta\): success \(\approx e^{-H\epsilon(1-r)}\), expected steps \(\approx H(1+\epsilon r\delta)\). Making errors observable is often worth more than making fewer of them.</li>
+<li>Stopping is an action. Stop when no action raises success probability by more than \(c/U\). False success claims make reported success unreliable, with precision \(p/(p+(1-p)\varphi)\); verification gates fix this where goals can be checked.</li>
+<li>Episode cost and latency are trajectory functionals; cached reads grow quadratically in \(H\), so long-horizon agents must bound their context.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ch02-mcq-01" data-topic="§2.2 MDPs">
+<p class="q">The Markov property of an MDP says that:</p>
+<ol class="opts">
+<li>Rewards are always non-negative</li>
+<li data-correct>Given the current state and action, the next state is independent of the earlier history</li>
+<li>The policy must be deterministic</li>
+<li>The state space is finite</li>
+</ol>
+<div class="explain">\(P(s_{t+1}\mid s_{1:t},a_{1:t})=P(s_{t+1}\mid s_t,a_t)\). Finite spaces and deterministic optimal policies are consequences or special cases, not the definition.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-02" data-topic="§2.2 MDPs">
+<p class="q">In an episodic task with reward 1 for success, 0 otherwise, and \(\gamma=1\), the value \(V^\pi(s)\) equals:</p>
+<ol class="opts">
+<li>The expected number of steps to finish</li>
+<li data-correct>The probability of eventually succeeding from \(s\) under \(\pi\)</li>
+<li>The expected cost of the episode</li>
+<li>One, for every state</li>
+</ol>
+<div class="explain">The return is the indicator of success, so its expectation is the success probability.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-03" data-topic="§2.2 Bellman">
+<p class="q">Why does value iteration converge for a discounted MDP with \(\gamma&lt;1\)?</p>
+<ol class="opts">
+<li>Because the state space is finite</li>
+<li data-correct>Because the Bellman optimality operator is a \(\gamma\)-contraction in the sup norm</li>
+<li>Because rewards are bounded by one</li>
+<li>Because the optimal policy is deterministic</li>
+</ol>
+<div class="explain">By Banach's fixed-point theorem, a contraction has a unique fixed point reached by iteration from any start.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-04" data-topic="§2.2 MDPs">
+<p class="q">In a fully observed MDP, an optimal policy can be chosen to depend on:</p>
+<ol class="opts">
+<li>The entire history</li>
+<li data-correct>The current state only</li>
+<li>The time step only</li>
+<li>The previous action only</li>
+</ol>
+<div class="explain">Stationary, deterministic, state-dependent policies suffice (for infinite-horizon discounted or suitable episodic problems). Partial observability breaks this.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-05" data-topic="§2.3 POMDPs">
+<p class="q">In the belief update, the factor \(Z(o\mid s')\) plays the role of:</p>
+<ol class="opts">
+<li>The prior</li>
+<li data-correct>The likelihood of the observation under each candidate state</li>
+<li>The transition kernel</li>
+<li>The normalising constant</li>
+</ol>
+<div class="explain">Predict with \(\sum_s P(s'\mid s,a)b(s)\) (the prior over \(s'\)), then weight by the likelihood \(Z(o\mid s')\) and normalise.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-06" data-topic="§2.3 Belief">
+<p class="q">"The belief is a sufficient statistic" means:</p>
+<ol class="opts">
+<li>The belief is always concentrated on one state</li>
+<li data-correct>An optimal policy may depend on the history only through the belief</li>
+<li>The belief can be computed without the transition kernel</li>
+<li>The belief is the same for all histories</li>
+</ol>
+<div class="explain">The belief MDP is a fully observed MDP on the simplex, so its optimal policies are functions of the belief.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-07" data-topic="§2.3 Belief">
+<p class="q">Why are classical POMDP solvers not used directly for coding agents?</p>
+<ol class="opts">
+<li>Coding environments are fully observable</li>
+<li data-correct>The state space is astronomically large and its transition and observation kernels are unknown</li>
+<li>POMDPs cannot model deterministic transitions</li>
+<li>POMDPs require continuous actions</li>
+</ol>
+<div class="explain">Exact solution is intractable even for modest finite problems, and nobody can write down the kernels of a repository. The POMDP's structure, not its solvers, is what transfers.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-08" data-topic="§2.3 Belief">
+<p class="q">The Kalman filter is the belief update of a POMDP in which:</p>
+<ol class="opts">
+<li>States are discrete</li>
+<li data-correct>Dynamics and observations are linear with Gaussian noise</li>
+<li>Observations are noiseless</li>
+<li>Actions are text</li>
+</ol>
+<div class="explain">With linear-Gaussian models, Gaussian beliefs stay Gaussian and the Bayes update reduces to the Kalman recursions on the mean and covariance.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-09" data-topic="§2.4 LLM agent">
+<p class="q">In the token-level view of an LLM agent, which tokens should be excluded from the policy-gradient loss?</p>
+<ol class="opts">
+<li>The model's reasoning tokens</li>
+<li data-correct>Observation tokens inserted by the environment</li>
+<li>The tool-call tokens</li>
+<li>The final-answer tokens</li>
+</ol>
+<div class="explain">The model did not choose observation tokens, so their log-probabilities are not actions of the policy; they are masked out in RL (Chapter 18).</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-10" data-topic="§2.4 LLM agent">
+<p class="q">In the definition \((p_\theta,f,g)\), the context map \(f\) is:</p>
+<ol class="opts">
+<li>The language model's weights</li>
+<li data-correct>The harness's deterministic map from the history to the token string the model reads</li>
+<li>The environment's transition kernel</li>
+<li>The tokenizer's vocabulary</li>
+</ol>
+<div class="explain">\(f\) covers the system prompt, tool schemas, chat template, truncation and summarisation; \(g\) parses outputs into actions.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-11" data-topic="§2.4 Context">
+<p class="q">If the context map \(f\) is not injective, then:</p>
+<ol class="opts">
+<li>The model's output becomes deterministic</li>
+<li data-correct>The policy cannot distinguish histories that map to the same context</li>
+<li>The belief becomes exact</li>
+<li>Tool calls cannot be parsed</li>
+</ol>
+<div class="explain">Truncation and summarisation map different histories to the same string, so any information distinguishing them is lost to the policy.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-12" data-topic="§2.4 Context">
+<p class="q">Select all reasons an LLM agent's context is in practice a lossy stand-in for the belief.</p>
+<ol class="opts">
+<li data-correct>The context window is finite</li>
+<li data-correct>Models use information in the middle of long contexts less reliably</li>
+<li data-correct>Every context token is paid for at every step, encouraging compression</li>
+<li>Bayes' rule does not apply to text</li>
+</ol>
+<div class="explain">Window limits, position effects and cost all push the harness to drop or compress history. Bayes' rule applies to any random variables; the problem is that the model performs inference only implicitly.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-13" data-topic="§2.4 Context">
+<p class="q">A coding agent summarises its history after 60 steps and the summary omits the original issue text. The most likely consequence is:</p>
+<ol class="opts">
+<li>Lower cost with no effect on behaviour</li>
+<li data-correct>The agent may drift from the goal, because the context is no longer sufficient for the decision</li>
+<li>The agent's per-step error rate falls</li>
+<li>The prompt cache hit rate rises</li>
+</ol>
+<div class="explain">The goal is decision-relevant at every step. Dropping it makes \(f(h_t)\) insufficient. (Summarising also invalidates the cache from the point of change.)</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-14" data-topic="§2.4 Information gathering">
+<p class="q">In the worked example, asking "Do you have a preferred time?" is valuable mainly because:</p>
+<ol class="opts">
+<li>It changes the flights available</li>
+<li data-correct>It sharpens the belief over the customer's intent before an action that cannot satisfy both hypotheses</li>
+<li>It reduces the context length</li>
+<li>It is free</li>
+</ol>
+<div class="explain">It is an information-gathering action. It raised success from 0.70 to about 0.92 because the subsequent booking depends on which hypothesis is true.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-15" data-topic="§2.4 Belief update">
+<p class="q">Prior \(b(s_A)=0.7\); \(\Pr(\text{"no preference"}\mid s_A)=0.9\), \(\Pr(\text{"no preference"}\mid s_B)=0.05\). After hearing "no preference", \(b'(s_A)\) is closest to:</p>
+<ol class="opts">
+<li>0.70</li><li>0.90</li><li data-correct>0.98</li><li>0.63</li>
+</ol>
+<div class="explain">\(0.63/(0.63+0.015)=0.977\).</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-16" data-topic="§2.5 Workflows">
+<p class="q">Which statement about the classes \(\Pi_W\subset\Pi_R\subset\Pi_A\) is correct?</p>
+<ol class="opts">
+<li>The realised value always increases with the class</li>
+<li data-correct>The best attainable value increases with the class, but so, typically, does the gap between the best and the realised policy</li>
+<li>Workflows can represent every policy an agent can</li>
+<li>Routers cannot use language models</li>
+</ol>
+<div class="explain">Larger classes contain better and worse policies; a fallible model realises a policy below the class optimum.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-17" data-topic="§2.5 Workflows">
+<p class="q">Which task most favours a fixed workflow over an autonomous agent?</p>
+<ol class="opts">
+<li>Debugging an unfamiliar code base</li>
+<li>Researching an open question on the web</li>
+<li data-correct>Extracting the same twelve fields from standardised invoices</li>
+<li>Handling arbitrary customer requests</li>
+</ol>
+<div class="explain">Low variability means the workflow's ceiling is high and its predictability, cost and testability win.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-18" data-topic="§2.5 Workflows">
+<p class="q">Select all task properties that favour giving the model more autonomy.</p>
+<ol class="opts">
+<li data-correct>The right sequence of steps varies a lot between inputs</li>
+<li data-correct>The environment gives informative feedback on actions</li>
+<li>Wrong actions are irreversible and costly</li>
+<li data-correct>Errors can be detected and corrected cheaply</li>
+</ol>
+<div class="explain">Variability raises the value of a larger class; feedback and cheap correction shrink the realisation gap. High cost of error favours constrained designs.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-19" data-topic="§2.6 Recovery">
+<p class="q">With error rate \(\epsilon\) per step and detection probability \(r\), the per-step probability of a fatal error is:</p>
+<ol class="opts">
+<li>\(\epsilon r\)</li><li data-correct>\(\epsilon(1-r)\)</li><li>\(1-\epsilon r\)</li><li>\(r(1-\epsilon)\)</li>
+</ol>
+<div class="explain">Only undetected errors lead to the absorbing failure state.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-20" data-topic="§2.6 Recovery">
+<p class="q">With \(\epsilon=0.05\) and \(r=0.8\), a 50-step task succeeds with probability about:</p>
+<ol class="opts">
+<li>8%</li><li>36%</li><li data-correct>61%</li><li>95%</li>
+</ol>
+<div class="explain">\((1-0.01)^{50}=0.99^{50}\approx0.605\), against \(0.95^{50}\approx0.077\) with no detection.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-21" data-topic="§2.6 Recovery">
+<p class="q">The expected number of steps with recovery, \(H(1+\epsilon r\delta)\), shows that the cost of detection is:</p>
+<ol class="opts">
+<li>Exponential in \(H\)</li>
+<li data-correct>A small multiplicative overhead when errors are rare</li>
+<li>Independent of \(\delta\)</li>
+<li>Larger than the cost of failure in all cases</li>
+</ol>
+<div class="explain">Recovery adds \(\epsilon r\delta\) steps per nominal step, e.g. 8% for \(\epsilon=0.05, r=0.8, \delta=2\), while survival improves exponentially.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-22" data-topic="§2.6 Recovery">
+<p class="q">Agent A: \(\epsilon=0.1\), \(r=0.9\). Agent B: \(\epsilon=0.03\), \(r=0\). Over a long task:</p>
+<ol class="opts">
+<li>B is more reliable because it makes fewer errors</li>
+<li data-correct>A is more reliable because its fatal-error rate (0.01) is below B's (0.03)</li>
+<li>They are equally reliable</li>
+<li>It cannot be determined without \(\delta\)</li>
+</ol>
+<div class="explain">Survival depends on \(\epsilon(1-r)\); \(\delta\) affects cost, not survival, in this model.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-23" data-topic="§2.6 Correlated errors">
+<p class="q">Which kind of error is invisible to local checks such as tests the agent itself writes?</p>
+<ol class="opts">
+<li>A syntax error in an edit</li>
+<li>A failed tool call with an error message</li>
+<li data-correct>A misunderstanding of the task that every subsequent step, including the tests, encodes</li>
+<li>A timeout</li>
+</ol>
+<div class="explain">Correlated errors defeat checks derived from the agent's own beliefs; they need checks against the goal (hidden tests, a reviewer, user confirmation).</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-24" data-topic="§2.7 Stopping">
+<p class="q">Under the one-step look-ahead rule, an agent should stop when:</p>
+<ol class="opts">
+<li>Its belief of success exceeds 50%</li>
+<li data-correct>No available action raises the success probability by more than \(c/U\)</li>
+<li>It has used half its budget</li>
+<li>The context window is full</li>
+</ol>
+<div class="explain">Continue while \(U(\mathbb E[q_{t+1}]-q_t)>c\). The rule is myopic but names the right quantities.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-25" data-topic="§2.7 Stopping">
+<p class="q">An agent truly succeeds with \(p=0.6\) and falsely claims success on half its failures. The precision of its success claims is:</p>
+<ol class="opts">
+<li>60%</li><li data-correct>75%</li><li>80%</li><li>50%</li>
+</ol>
+<div class="explain">Claims \(=0.6+0.4\times0.5=0.8\); real fraction \(0.6/0.8=0.75\).</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-26" data-topic="§2.7 Verification gate">
+<p class="q">A verification gate on the stop action helps because:</p>
+<ol class="opts">
+<li>It makes the model more confident</li>
+<li data-correct>It converts false success claims into further steps, with the check's output as a new observation</li>
+<li>It shortens every episode</li>
+<li>It removes the need for tools</li>
+</ol>
+<div class="explain">It is error detection applied to termination: a rejected "done" returns the agent to work with information about what is wrong.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-27" data-topic="§2.8 Cost">
+<p class="q">With a linearly growing context and prompt caching, which cost term grows quadratically with the horizon \(H\)?</p>
+<ol class="opts">
+<li>Fresh input tokens</li>
+<li data-correct>Cached-read tokens</li>
+<li>Output tokens</li>
+<li>Tool-call latency</li>
+</ol>
+<div class="explain">Each step re-reads the whole earlier context from cache; the sum over steps is quadratic. Fresh tokens and outputs are linear.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-28" data-topic="§2.8 Cost">
+<p class="q">In the support-conversation example, what dominates the per-turn latency?</p>
+<ol class="opts">
+<li>Prefill of the fixed prefix</li>
+<li data-correct>Decoding the agent's reply</li>
+<li>Reading cached tokens</li>
+<li>Network latency</li>
+</ol>
+<div class="explain">150 output tokens at 60 tokens/s take 2.5 s of about 3 s. Shorter replies reduce latency most.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-29" data-topic="§2.8 Cost">
+<p class="q">Why should a production agent have a budget cap even if its mean cost is low?</p>
+<ol class="opts">
+<li>Because caching fails above a certain cost</li>
+<li data-correct>Because the cost distribution has a heavy tail of looping episodes, and the cap acts as a stopping rule</li>
+<li>Because the mean cost is always underestimated</li>
+<li>Because providers require it</li>
+</ol>
+<div class="explain">A few runaway episodes can dominate total spend; a cap bounds them and forces termination or escalation.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-30" data-topic="§2.8 Context bounds">
+<p class="q">In POMDP terms, compacting history into a summary is:</p>
+<ol class="opts">
+<li>A change of the model's weights</li>
+<li data-correct>A choice of a lossier context map \(f\), trading information for cost and window space</li>
+<li>A change of the environment's transition kernel</li>
+<li>An information-gathering action</li>
+</ol>
+<div class="explain">Compaction and delegation change what the policy sees; the challenge is to keep \(f(h_t)\) nearly sufficient.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-31" data-topic="§2.4 Levels">
+<p class="q">Chapter 1's horizon \(H\) and per-step reliability \(\rho\) are defined at which level?</p>
+<ol class="opts">
+<li>Token level: one step is one token</li>
+<li data-correct>Step level: one step is one model call (reasoning plus actions)</li>
+<li>Episode level</li>
+<li>Session level</li>
+</ol>
+<div class="explain">Errors, tool calls and charges happen per model call, so reliability and cost analysis use the step level.</div>
+</div>
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer out loud first, then reveal the model answer and rate yourself.</p>
+
+<details class="qa" data-id="ch02-qa-01">
+<summary><span class="lvl warm">Warm-up</span> What is the difference between an MDP and a POMDP? Which one describes an LLM agent?</summary>
+<div class="answer">
+<p>An MDP assumes the agent observes the full state, which is Markov, so optimal policies depend only on the current state. A POMDP adds an observation kernel: the agent sees observations generated from a hidden state, so it must reason about the state from its history; the Bayesian posterior over states (the belief) is a sufficient statistic. An LLM agent is in a POMDP: it observes only the files it opened, the messages it received or the pages it fetched, never the whole repository, the customer's intent or the web. Its context, built by the harness from the history, plays the role of the belief, and the model performs the inference implicitly.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-02">
+<summary><span class="lvl warm">Warm-up</span> What is a workflow, what is an agent, and how do you choose?</summary>
+<div class="answer">
+<p>A workflow orchestrates model and tool calls through code paths fixed by the developer; an agent lets the model choose the next action and the number of steps. Formally, workflows are a restricted policy class contained in the agent class. Choose the smallest class that does the task: workflows when the steps are predictable and errors costly, since they are cheaper, faster, testable and cannot loop; agents when the right steps vary with the input and the environment provides feedback the model can use to correct itself. Common hybrids use a workflow skeleton with an agentic step where variability lives.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-03">
+<summary><span class="lvl warm">Warm-up</span> Write down the Bayes belief update and explain each term.</summary>
+<div class="answer">
+<p>\(b'(s')\propto Z(o\mid s')\sum_s P(s'\mid s,a)b(s)\). The sum pushes the old belief through the dynamics given the action (prediction); \(Z(o\mid s')\) is the likelihood of the new observation under each candidate next state (correction); the proportionality constant is the predictive probability of the observation. In a linear-Gaussian system this is the Kalman filter; with discrete states it is a hidden-Markov-model forward step with actions.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-04">
+<summary><span class="lvl core">Core</span> Your agent succeeds 40% of the time on 30-step tasks. Propose a model of its failures and say what you would change first.</summary>
+<div class="answer">
+<p>Model it as the chain with error rate \(\epsilon\), detection probability \(r\) and recovery cost \(\delta\): success \(\approx e^{-H\epsilon(1-r)}\). 40% at \(H=30\) means \(\epsilon(1-r)\approx-\ln0.4/30\approx0.031\). Logs tell us which: if the agent makes errors and notices them but fails to fix them, recovery tooling matters; if it makes few errors that go unnoticed, detection matters. The highest-leverage change is usually raising \(r\): make tools return explicit errors, add verification steps (run tests, read back state), and a gate on termination. Raising \(r\) from 0.5 to 0.9 at fixed \(\epsilon\approx0.06\) would cut the fatal rate from 0.031 to about 0.006, giving success \(\approx0.83\). Then reduce \(H\) with better tools and raise per-step accuracy with better context. I would also check for correlated errors such as task misunderstanding, which this model misses and which are fixed by clarification or goal-level checks.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-05">
+<summary><span class="lvl core">Core</span> Why can't you just put the whole history in the context forever?</summary>
+<div class="answer">
+<p>Three reasons. The window is finite: long tasks with large observations exceed it. Cost: every token is re-read at every step, so total input grows quadratically with the horizon, and even cached reads become the dominant cost. Quality: models use information in long contexts unevenly, attending less reliably to the middle, and irrelevant material distracts; a longer context is not a better belief. So the harness must design a context map that keeps decision-relevant information (the goal, constraints, current state of edited artefacts, recent observations, key findings) and drops or compresses the rest, while keeping a stable prefix for caching.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-06">
+<summary><span class="lvl core">Core</span> An agent loops, repeating the same failing command. Explain this in decision-process terms and give fixes.</summary>
+<div class="answer">
+<p>The policy maps nearly identical contexts to the same action; since the failure observation does not change the context enough to change the action, the agent revisits the same state. Causes: the observation is uninformative (a terse error), the context has lost the record of previous attempts (truncation), or the model's prior strongly favours the action. Fixes: make observations informative (full error messages, hints), keep a compact record of attempts in context ("tried X, failed because Y"), add loop detection in the harness that injects a note or forces a different action class after k repeats, raise sampling diversity on retries, and cap repeated tool calls. A budget cap makes the worst case bounded.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-07">
+<summary><span class="lvl core">Core</span> How do you decide when an agent should stop? What goes wrong if you let the model decide alone?</summary>
+<div class="answer">
+<p>Stopping is an action: stop when no available action is expected to raise success probability by more than the cost of a step divided by the value of success. In practice models are poorly calibrated about their own success and often claim it falsely, so reported success has precision \(p/(p+(1-p)\varphi)\). Mitigations: verification gates that check the goal independently (hidden or required tests, database end-state checks, a critic model, a human), mandatory checks before submission, budget caps against non-termination, and escalation to a human when uncertain.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-08">
+<summary><span class="lvl core">Core</span> Explain the token-level and step-level views of an LLM agent and when each is appropriate.</summary>
+<div class="answer">
+<p>At the token level, the episode is one sequence; the policy is the model's next-token distribution; most transitions append the chosen token; tool results are tokens written by the environment. It is the natural view for RL training: policy gradients use per-token log-probabilities, and environment tokens must be masked. At the step level, an action is a whole model output (reasoning plus tool calls), one per model call. It is the natural view for reliability, cost and latency, since errors and charges happen per call and the harness acts between calls. Credit assignment differs: token-level methods spread a terminal reward over thousands of tokens; step-level methods can assign value per step.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-09">
+<summary><span class="lvl core">Core</span> Compute the cost of a 12-turn support conversation with a 6k-token prefix and 400 tokens appended per turn, 150 output tokens per turn, with and without caching.</summary>
+<div class="answer">
+<p>Input \(=12\times6000+400\times66=98{,}400\) tokens; output 1,800. Uncached: \(0.0984\times3+0.0018\times15\approx\$0.32\). Cached: fresh \(6000+11\times400=10{,}400\) ($0.031), cached reads 88,000 ($0.026), output $0.027, total about $0.085. Further savings come from caching the shared 6k prefix across conversations. Latency is about 3 s per turn, dominated by decoding the reply.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> Prove that the belief is a sufficient statistic in a POMDP, and explain what this implies for designing an agent's memory.</summary>
+<div class="answer">
+<p>Show that \(\Pr(o_{t+1}, r_t\mid h_t,a_t)\) depends on \(h_t\) only via \(b_t\): \(\Pr(o_{t+1}\mid h_t,a_t)=\sum_{s,s'}Z(o_{t+1}\mid s')P(s'\mid s,a_t)b_t(s)\), and \(\mathbb E[r_t\mid h_t,a_t]=\sum_s b_t(s)R(s,a_t)\). The next belief is a deterministic function of \((b_t,a_t,o_{t+1})\). Hence the belief process is a controlled Markov process with rewards depending only on (belief, action), i.e. an MDP on the simplex, and its Bellman equation has a stationary optimal policy in the belief. For memory design: an ideal memory is not a log but a sufficient summary for future decisions. An agent's notes should therefore record what has been learned about the hidden state (which hypotheses are ruled out, which files matter, what the user wants) rather than the raw sequence of events, and should be updated when observations arrive. The log can be kept outside the context for retrieval.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> Refine the recovery model to include errors made during recovery and detection delays. How do the conclusions change?</summary>
+<div class="answer">
+<p>If recovery takes \(\delta\) steps, each itself erring with probability \(\epsilon\) and detected with probability \(r\), recovery may recurse; the expected number of steps per nominal step solves \(m=1+\epsilon r\delta m\), so \(m=1/(1-\epsilon r\delta)\), finite if \(\epsilon r\delta&lt;1\), and the fatal-error probability per nominal step becomes about \(\epsilon(1-r)m\). With a detection delay \(D\), the steps taken after an undetected-so-far error are wasted and may compound, so \(\delta\) grows roughly linearly in \(D\); if \(D\) can exceed the remaining horizon, some detectable errors become fatal. Conclusions: detection is still the main lever, but it should be early (check after each risky action), recovery should be cheap and itself low-error, and the system is unstable if \(\epsilon r\delta\) approaches 1 (the agent spends all its time recovering), which is a precise description of thrashing.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-12">
+<summary><span class="lvl deep">Deep-dive</span> When is asking the user a clarifying question worth it? Formalise.</summary>
+<div class="answer">
+<p>A question is an information-gathering action with cost \(c_q\) (user time, latency, annoyance) and no direct effect on the world. Its value is the expected value of information: \(\mathbb E_{o}[\max_a Q(b'_o,a)]-\max_a Q(b,a)\), where \(b'_o\) is the posterior after answer \(o\). Ask if this exceeds \(c_q\). It is large when the belief over intent is spread, when the best action differs across hypotheses, and when wrong actions are costly or irreversible; it is zero when one action is optimal under all plausible hypotheses. In the flight example, value of information was 0.215 in success probability. Practically: ask before irreversible actions with ambiguous intent; do not ask when a safe action satisfies all hypotheses or when a cheap observation (a look-up) can resolve the ambiguity instead.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-13">
+<summary><span class="lvl deep">Deep-dive</span> Formalise the bias–variance trade-off between workflows and agents and describe how you would measure it.</summary>
+<div class="answer">
+<p>For nested policy classes \(\Pi_W\subset\Pi_A\), realised value is \(V^*_\Pi-\Delta_\Pi\), where \(\Delta_\Pi\) is the gap between the class optimum and the realised policy. Larger classes raise \(V^*\) and usually \(\Delta\). Measure by building both on the same evaluation set: success rate, pass^k, cost and latency per task, failure taxonomy. To estimate the ceiling, use an oracle (human-guided or best-of-many with a checker) within each class; the realised-vs-oracle difference estimates \(\Delta\). If the workflow's oracle is near the agent's realised performance, keep the workflow. Track per-category results, since often a router to a workflow for common cases plus an agent for the long tail dominates both.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-14">
+<summary><span class="lvl design">Design</span> Design the stopping and verification logic for a coding agent that opens pull requests automatically.</summary>
+<div class="answer">
+<p>The agent proposes termination by calling a "submit" tool. The gate then: runs the full test suite and linters in a clean environment; checks that tests relevant to the issue exist and pass (requiring a reproduction test that failed before the change); rejects changes to test files unless the task demands it; checks diff size and touched files against expectations; optionally runs a critic model to compare the diff with the issue. On failure, the gate's output becomes the next observation, up to a bounded number of rejections. Separately: a step and dollar budget with escalation, loop detection on repeated commands, and a final human review for merge, since hidden-goal errors remain. Metrics: precision of submitted PRs (fraction merged without changes), success rate, cost per merged PR, and gate rejection rate.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-15">
+<summary><span class="lvl design">Design</span> You must cut the cost of a research agent by 4× without losing quality. Where do you look, using this chapter's cost model?</summary>
+<div class="answer">
+<p>Decompose cost per episode into fresh input, cached reads and output, and plot them against steps. Research agents read long pages, so observations dominate: summarise or extract relevant passages before appending (a cheap model can do this), store full pages outside the context for retrieval on demand, and drop stale observations. Ensure caching works: stable prefix, append-only history, calls within the cache's time-to-live. Bound the context by compaction or by delegating each sub-question to a sub-agent whose findings return as a short summary, which turns quadratic growth into roughly linear. Reduce steps with better search tools (fewer, more targeted queries; parallel fetches). Route routine steps to a smaller model. Measure quality with a fixed evaluation set and judge before and after each change, and watch the tail with a budget cap.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-16">
+<summary><span class="lvl design">Design</span> How would you instrument an agent in production so that you can estimate \(\epsilon\), \(r\) and \(\delta\)?</summary>
+<div class="answer">
+<p>Log every step with structured fields: the action, tool results, error flags returned by tools, and the harness's own checks (test outcomes, validation failures). Label a sample of trajectories, by humans or a strong judge model, for where errors occurred and whether the agent noticed and fixed them. Estimate \(\epsilon\) as errors per step, \(r\) as the fraction of errors followed by corrective actions within a window, and \(\delta\) as the mean steps between an error and its correction. Track these by task type and tool. These estimates tell you whether to invest in model quality (\(\epsilon\)), observability (\(r\)) or recovery tooling (\(\delta\)), and the model predicts the effect of a change on success before you ship it.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="ref-bellman">R. Bellman. <em>Dynamic Programming</em>. Princeton University Press, 1957.</li>
+<li id="ref-astrom">K. J. Åström. Optimal control of Markov processes with incomplete state information. <em>Journal of Mathematical Analysis and Applications</em>, 10, 1965.</li>
+<li id="ref-klc">L. P. Kaelbling, M. L. Littman, A. R. Cassandra. Planning and acting in partially observable stochastic domains. <em>Artificial Intelligence</em>, 101(1–2), 1998.</li>
+<li id="ref-papa">C. H. Papadimitriou and J. N. Tsitsiklis. The Complexity of Markov Decision Processes. <em>Mathematics of Operations Research</em>, 12(3), 1987.</li>
+<li id="ref-sutton">R. S. Sutton and A. G. Barto. <em>Reinforcement Learning: An Introduction</em>, 2nd ed. MIT Press, 2018.</li>
+<li id="ref-lost">N. F. Liu et al. Lost in the Middle: How Language Models Use Long Contexts. <em>TACL</em>, 2024. <a href="https://arxiv.org/abs/2307.03172">arXiv:2307.03172</a>.</li>
+<li id="ref-bea">E. Schluntz and B. Zhang. Building Effective Agents. Anthropic, December 2024. <a href="https://www.anthropic.com/research/building-effective-agents">anthropic.com</a>.</li>
+<li id="ref-kadavath">S. Kadavath et al. Language Models (Mostly) Know What They Know. 2022. <a href="https://arxiv.org/abs/2207.05221">arXiv:2207.05221</a>.</li>
+<li>Further reading: M. L. Puterman, <em>Markov Decision Processes</em>, Wiley, 1994; T. Sumers et al., Cognitive Architectures for Language Agents, <a href="https://arxiv.org/abs/2309.02427">arXiv:2309.02427</a>; S. Yao et al., τ-bench, <a href="https://arxiv.org/abs/2406.12045">arXiv:2406.12045</a>.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

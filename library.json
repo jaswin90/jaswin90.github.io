@@ -1,0 +1,29 @@
+{
+  "fields": [
+    {
+      "slug": "AI_Engineering",
+      "title": "AI Engineering",
+      "blurb": "How large language models are served, and how they become agents that reason, act and learn.",
+      "books": [
+        {
+          "slug": "LLM-Engineering",
+          "title": "Introduction to LLM Engineering",
+          "blurb": "Transformers, GPUs and the economics of inference: derive the cost of serving any model on any hardware.",
+          "repo": "jaswin90/LLM-Engineering",
+          "branch": "claude/funny-hopper-lcw8ww",
+          "src": "docs",
+          "progress_field": null
+        },
+        {
+          "slug": "Foundations-Agentic-AI",
+          "title": "Foundations of Agentic AI",
+          "blurb": "Agents as decision processes: reasoning, tools, memory, multi-agent systems, training, evaluation and safety.",
+          "repo": "jaswin90/Foundations-Agentic-AI",
+          "branch": "claude/fervent-maxwell-e8syvz",
+          "src": "docs",
+          "progress_field": "agenticAI"
+        }
+      ]
+    }
+  ]
+}

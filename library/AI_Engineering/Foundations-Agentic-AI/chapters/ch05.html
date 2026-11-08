@@ -1,0 +1,577 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 5 · Chain of Thought and Test-Time Reasoning — Foundations of Agentic AI</title>
+<meta name="description" content="Chapter 5 of Foundations of Agentic AI: why chains of thought help, self-consistency and voting, decomposition and program-aided reasoning, reasoning models, test-time compute scaling, faithfulness, and reasoning budgets in agents.">
+<script>try{var t=localStorage.getItem('aai-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script defer src="/library/assets/book-shim.js" data-library="/library/" data-field="/library/AI_Engineering/" data-field-title="AI Engineering"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-chapter="ch05" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Part II · Reasoning and Planning — Chapter 5</div>
+<h1 id="top">Chain of Thought and Test-Time Reasoning</h1>
+<p class="lede">A language model that answers immediately gets a fixed amount of computation per token, however hard the question. Letting it write out its reasoning first turns out to buy accuracy with computation, and since 2024 that trade has been trained into models and scaled deliberately. This chapter explains why thinking out loud works, how to combine several attempts, what reasoning models changed, and what it means for agents.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Part I built the agent: a policy in a partially observable world (Chapter 2), implemented by a language model (Chapter 3) reading a context that we engineer (Chapter 4). Every one of the agent's actions is chosen by that model, and the reliability arithmetic of Chapters 1 and 2 says that per-step accuracy is worth almost anything: halving the per-step error rate doubles the length of task an agent can handle. Part II is about raising that accuracy by spending more computation on each decision. This chapter starts with the most important discovery in the area: that a model asked to reason step by step, in text, before answering is substantially more accurate on problems that need several steps of inference.</p>
+<p>The discovery arrived in 2022 as a prompting trick, chain-of-thought prompting, and was followed within months by a statistical one, self-consistency: sample several chains and vote. Between 2024 and 2025 it became an architecture of training: reasoning models trained with reinforcement learning to produce long chains of thought, whose accuracy rises smoothly with the amount of thinking they are allowed. For agents this changed both what a single step can achieve and what it costs, since a reasoning step may write thousands of hidden tokens. We will derive why chains of thought help, analyse voting as a problem in probability, explain the shape of test-time scaling curves, and confront an awkward question for anyone who wants to read a model's reasoning to understand or monitor it: whether the reasoning it writes is the reasoning it uses.</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Explain why a fixed-depth model benefits from writing intermediate tokens, in terms of serial computation and latent-variable marginalisation.</li>
+<li>Describe chain-of-thought and zero-shot chain-of-thought prompting, with the evidence for them and the conditions under which they help.</li>
+<li>Analyse self-consistency: compute majority-vote accuracy for binary and plurality voting, and state when voting fails.</li>
+<li>Describe decomposition methods (least-to-most, program-aided reasoning) and why offloading computation to code helps.</li>
+<li>Explain how reasoning models are trained and why their accuracy grows roughly linearly in the logarithm of test-time compute.</li>
+<li>Discuss the faithfulness of chains of thought and its consequences for monitoring agents.</li>
+<li>Decide how much reasoning an agent step should get, given its cost and its effect on reliability.</li>
+</ol>
+</div>
+<p>We use the cost model of §3.7, the temperature analysis of §3.5 and the reliability models of §1.8 and §2.6.</p>
+
+<h2 id="s5-1">5.1 A fixed budget per token</h2>
+<p>Ask a model "What is 17 × 24?" and require the answer immediately. To produce the first token of "408" it has exactly one forward pass: a fixed number of layers, each a fixed amount of computation, no matter whether the question is "2 + 2" or a multiplication of two four-digit numbers. Whatever multi-step computation the answer requires must be carried out inside that pass, within the depth of the network. For many problems that is enough, because the model has memorised the answer or learned a shortcut. For problems that genuinely need a sequence of dependent steps (carry the digit, then add, then compare) a fixed depth is a hard ceiling.</p>
+<p>Writing tokens removes the ceiling. Each generated token is the output of a full forward pass, and once written it becomes input to every later pass. A model that writes "17 × 24 = 17 × 20 + 17 × 4 = 340 + 68 = 408" has performed several passes, each building on the stored results of the previous ones, and the written tokens act as a scratchpad, a working memory that persists across passes. Figure 5.1 contrasts the two modes. The total serial computation available grows linearly with the number of tokens written, which is exactly what multi-step problems need.</p>
+
+<figure class="diagram" id="fig-5-1">
+<svg class="dg" viewBox="0 0 720 240" role="img" aria-label="Fixed depth per answer versus a chain of thought unrolling computation over tokens">
+<defs><marker id="ah51" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<text x="130" y="22" text-anchor="middle" class="t-b">Answer immediately</text>
+<text x="480" y="22" text-anchor="middle" class="t-b">Chain of thought</text>
+<line x1="270" y1="10" x2="270" y2="230" class="grid"/>
+<rect x="60" y="180" width="140" height="28" rx="6" class="bx2"/><text x="130" y="199" text-anchor="middle" class="t-xs">question</text>
+<g class="fill-s3"><rect x="100" y="60" width="60" height="16"/><rect x="100" y="80" width="60" height="16"/><rect x="100" y="100" width="60" height="16"/><rect x="100" y="120" width="60" height="16"/><rect x="100" y="140" width="60" height="16"/></g>
+<text x="170" y="112" class="t-xs">L layers</text>
+<line x1="130" y1="178" x2="130" y2="158" class="ln" marker-end="url(#ah51)"/>
+<rect x="95" y="30" width="70" height="24" rx="6" class="fill-acc"/><text x="130" y="47" text-anchor="middle" class="t-xs t-on">answer</text>
+<text x="130" y="226" text-anchor="middle" class="t-xs">serial depth: L, whatever the problem</text>
+<rect x="290" y="180" width="90" height="28" rx="6" class="bx2"/><text x="335" y="199" text-anchor="middle" class="t-xs">question</text>
+<g class="fill-s3">
+<rect x="400" y="100" width="40" height="56"/><rect x="460" y="100" width="40" height="56"/><rect x="520" y="100" width="40" height="56"/><rect x="580" y="100" width="40" height="56"/><rect x="640" y="100" width="40" height="56"/></g>
+<g class="t-xs"><text x="420" y="84" text-anchor="middle">step 1</text><text x="480" y="84" text-anchor="middle">step 2</text><text x="540" y="84" text-anchor="middle">step 3</text><text x="600" y="84" text-anchor="middle">…</text></g>
+<rect x="640" y="56" width="40" height="22" rx="4" class="fill-acc"/><text x="660" y="71" text-anchor="middle" class="t-xs t-on">ans</text>
+<line x1="380" y1="194" x2="398" y2="150" class="ln" marker-end="url(#ah51)"/>
+<path d="M440,128 L458,128" class="ln" marker-end="url(#ah51)"/><path d="M500,128 L518,128" class="ln" marker-end="url(#ah51)"/><path d="M560,128 L578,128" class="ln" marker-end="url(#ah51)"/><path d="M620,128 L638,128" class="ln" marker-end="url(#ah51)"/>
+<text x="540" y="226" text-anchor="middle" class="t-xs">each written token feeds every later pass: serial depth ≈ L × (tokens written)</text>
+</svg>
+<figcaption><b>Figure 5.1 — Why writing helps.</b> Answering immediately gives a fixed serial depth of \(L\) layers. A chain of thought performs one full pass per token, and each written intermediate result is available to all later passes, so the depth of computation grows with the length of the reasoning.</figcaption></figure>
+
+<p>Figure 5.1 has a precise counterpart in theory. Results on the expressive power of Transformers show that a constant-depth Transformer producing an answer directly can only compute functions in a restricted circuit class, which excludes, for example, evaluating arbitrary arithmetic expressions or composing many steps of a finite-state computation, while the same architecture allowed to generate a chain of intermediate tokens of polynomial length can simulate any polynomial-time computation (Feng et al., 2023; Merrill and Sabharwal, 2024)<span class="cite"><a href="#ref-feng">[1]</a></span><span class="cite"><a href="#ref-merrill">[2]</a></span>. The formal results concern idealised models, but their message matches practice: problems that require many dependent steps cannot be solved reliably in one pass, and become solvable when the model is allowed to show its work. For an agent, the same applies to decisions: working out which of three hypotheses about a bug is consistent with the test output, or whether a refund is allowed under several interacting rules, is a multi-step computation, and a step that must emit a tool call immediately is a step with a fixed reasoning budget.</p>
+
+<h2 id="s5-2">5.2 Chain-of-thought prompting</h2>
+<p>The idea that intermediate steps help was first demonstrated by training models to write them. Nye and colleagues (2021) fine-tuned models to emit a "scratchpad" of intermediate results for tasks such as long addition and program execution, and found dramatic improvements over predicting the answer directly<span class="cite"><a href="#ref-scratchpad">[3]</a></span>. The discovery that made the idea universal was that large models could be <em>prompted</em> to do it, with no training at all.</p>
+<p>In January 2022, Jason Wei and colleagues at Google published <strong>chain-of-thought prompting</strong><span class="cite"><a href="#ref-cot">[4]</a></span>. Instead of few-shot examples of the form "question → answer", they gave examples of the form "question → step-by-step reasoning → answer". On GSM8K, a benchmark of grade-school mathematics word problems, the 540-billion-parameter PaLM model went from 17.9% accuracy with standard prompting to 56.9% with chain-of-thought prompting, surpassing the previous state of the art, which had used a fine-tuned model with a verifier. Two further findings shaped the field. The benefit appeared only in large models: for models below roughly 10 billion parameters, chain-of-thought prompting often made results worse, because the small models produced fluent but illogical chains. And the benefit was concentrated on problems that need several steps; on single-step tasks it did little.</p>
+<p>A few months later Kojima and colleagues showed that the examples were not even necessary. Appending the sentence "Let's think step by step." to a question, which they called <strong>zero-shot chain of thought</strong>, raised the accuracy of InstructGPT (text-davinci-002) on the MultiArith arithmetic benchmark from 17.7% to 78.7%<span class="cite"><a href="#ref-kojima">[5]</a></span>. A single sentence triggered a mode of behaviour the model had learned from the many worked solutions in its training data. In the Bayesian picture of §3.3, the phrase is strong evidence that the document is a worked solution, and worked solutions show their steps.</p>
+<p>For agents, chain-of-thought prompting is the "thought" in ReAct (§1.7): before each action, the model writes a few sentences about what it has learned and what to do next. The evidence that this helps agents specifically is the ReAct paper itself, where removing the thoughts degraded performance on multi-step tasks, and the common practice of function-calling agents, which are trained to reason in text before emitting a tool call. It also has a cost, the output tokens of §3.7, which is why §5.8 asks how much reasoning each step deserves. First, though, we should understand more precisely why reasoning helps, since the answer tells us when it will not.</p>
+
+<h2 id="s5-3">5.3 Why reasoning helps: a latent-variable view</h2>
+<p>A second, complementary explanation of chain of thought is statistical rather than computational. Let \(q\) be a question, \(a\) an answer and \(z\) a chain of reasoning. A model that answers directly must produce \(p_\theta(a\mid q)\) in one step. A model that reasons first samples \(z\sim p_\theta(\cdot\mid q)\) and then \(a\sim p_\theta(\cdot\mid q,z)\); marginally, its answer distribution is</p>
+<div class="box formula">
+\[ p_\theta(a\mid q)=\sum_{z}p_\theta(a\mid q,z)\,p_\theta(z\mid q). \]
+</div>
+<p>Why should this two-stage process produce better answers than direct prediction, if both are the same model? Because the model's conditional distributions are not equally good. Prystawski, Li and Goodman (2023) argued that reasoning helps when the training data have <em>local</em> structure: the model has seen many texts connecting \(q\) to intermediate facts and intermediate facts to \(a\), but few connecting \(q\) directly to \(a\)<span class="cite"><a href="#ref-locality">[6]</a></span>. A model trained on such data estimates the local conditionals well and the long-range conditional poorly, and chaining well-estimated local steps beats a single poorly estimated jump. They demonstrated the effect in a controlled setting with Bayesian networks: when training samples covered only local neighbourhoods of variables, generating intermediate variables substantially improved estimates of the relation between distant ones.</p>
+<p>The latent-variable view also explains why a single chain is fragile and suggests the remedy. The model's answer is an average over reasoning paths, but a single sample of \(z\) gives us one path. If the path contains an error, the answer that follows it is wrong, even if most paths the model might have taken lead to the right answer. A better estimator of the model's own marginal belief about \(a\) uses several paths. That is self-consistency.</p>
+
+<h2 id="s5-4">5.4 Self-consistency: sampling and voting</h2>
+<p>Wang and colleagues (2022) proposed <strong>self-consistency</strong>: sample \(k\) independent chains of thought at a moderate temperature, extract the final answer from each, and return the most frequent answer<span class="cite"><a href="#ref-selfconsistency">[7]</a></span>. On GSM8K with PaLM 540B it raised accuracy from 56.5% for a single chain to 74.4% with 40 samples, a gain larger than that of most model improvements of the time. The method needs no training, only the ability to compare answers, and it trades computation for accuracy in an adjustable way: more samples, higher accuracy, up to a limit. Figure 5.2 shows the procedure.</p>
+
+<figure class="diagram" id="fig-5-2">
+<svg class="dg" viewBox="0 0 720 220" role="img" aria-label="Self-consistency: sample several reasoning chains and vote on the final answer">
+<defs><marker id="ah52" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="20" y="90" width="90" height="40" rx="8" class="bx2"/><text x="65" y="115" text-anchor="middle" class="t-sm">question</text>
+<g class="t-xs">
+<rect x="170" y="20" width="300" height="28" rx="6" class="fill-muted"/><text x="180" y="38">chain 1: … so 17·24 = 340 + 68 = 408</text>
+<rect x="170" y="56" width="300" height="28" rx="6" class="fill-muted"/><text x="180" y="74">chain 2: … 24·17 = 240 + 168 = 408</text>
+<rect x="170" y="92" width="300" height="28" rx="6" class="fill-muted"/><text x="180" y="110">chain 3: … 17·25 − 17 = 425 − 17 = 408</text>
+<rect x="170" y="128" width="300" height="28" rx="6" class="fill-muted"/><text x="180" y="146">chain 4: … 340 + 78 = 418   (slip)</text>
+<rect x="170" y="164" width="300" height="28" rx="6" class="fill-muted"/><text x="180" y="182">chain 5: … 20·24 − 3·24 = 480 − 72 = 408</text>
+</g>
+<g><line x1="110" y1="110" x2="168" y2="34" class="ln" marker-end="url(#ah52)"/><line x1="110" y1="110" x2="168" y2="70" class="ln" marker-end="url(#ah52)"/><line x1="110" y1="110" x2="168" y2="106" class="ln" marker-end="url(#ah52)"/><line x1="110" y1="110" x2="168" y2="142" class="ln" marker-end="url(#ah52)"/><line x1="110" y1="110" x2="168" y2="178" class="ln" marker-end="url(#ah52)"/></g>
+<rect x="520" y="70" width="180" height="80" rx="10" class="fill-acc"/><text x="610" y="98" text-anchor="middle" class="t-on t-b">vote</text><text x="610" y="118" text-anchor="middle" class="t-on t-xs">408: 4 · 418: 1</text><text x="610" y="136" text-anchor="middle" class="t-on t-xs">answer 408</text>
+<line x1="470" y1="110" x2="518" y2="110" class="ln" marker-end="url(#ah52)"/>
+</svg>
+<figcaption><b>Figure 5.2 — Self-consistency.</b> Several chains are sampled independently. Different correct chains reach the same answer by different routes, while errors tend to scatter over different wrong answers, so the most frequent answer is more often right than any single chain.</figcaption></figure>
+
+<p>Figure 5.2 points to why voting works: correct reasoning converges on one answer by many routes, while mistakes tend to scatter. We can make this quantitative. Suppose each chain independently produces the correct answer with probability \(p\). In the simplest case, a binary question where every wrong chain gives the same wrong answer, the majority of \(k\) chains (odd \(k\)) is correct with probability</p>
+\[ P_{\text{maj}}(k)=\sum_{j=\lceil k/2\rceil}^{k}\binom{k}{j}p^j(1-p)^{k-j}. \]
+<p>This is Condorcet's jury theorem of 1785: if \(p>\tfrac12\), \(P_{\text{maj}}(k)\to1\) as \(k\to\infty\); if \(p&lt;\tfrac12\), it tends to 0, and voting makes things worse. By Hoeffding's inequality the convergence is exponential: \(1-P_{\text{maj}}(k)\le\exp\!\big(-2k(p-\tfrac12)^2\big)\). The realistic case is better than the binary one. In a maths problem the wrong answers are spread over many values, so the correct answer need only be the most frequent single answer (a plurality), not a majority. With a correct-answer probability of only 0.4 and the remaining 0.6 spread evenly over ten wrong values (0.06 each), voting still converges to the right answer. Figure 5.3 plots both cases.</p>
+
+<figure class="chart" id="fig-5-3">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Accuracy of voting over k independent chains","height":340,
+ "x":{"label":"Number of sampled chains k (log)","log":true,"min":1,"max":41,"ticks":[1,3,5,9,15,25,41]},
+ "y":{"label":"Probability the vote is correct","min":0,"max":1,"fmt":"pct"},
+ "series":[
+  {"name":"binary, p = 0.7","color":"s1","points":[[1,0.7],[3,0.784],[5,0.8369],[9,0.9012],[15,0.95],[25,0.9825],[41,0.9964]]},
+  {"name":"binary, p = 0.6","color":"s3","points":[[1,0.6],[3,0.648],[5,0.6826],[9,0.7334],[15,0.7869],[25,0.8462],[41,0.9035]]},
+  {"name":"plurality, p = 0.4, errors spread over 10 answers","color":"s4","points":[[1,0.4],[3,0.481],[5,0.639],[9,0.800],[15,0.923],[25,0.984],[41,0.9988]]},
+  {"name":"binary, p = 0.45","color":"s2","points":[[1,0.45],[3,0.4253],[5,0.4069],[9,0.3786],[15,0.3465],[25,0.3063],[41,0.2592]]}
+ ]}
+</script>
+<figcaption><b>Figure 5.3 — Voting amplifies whatever the model leans towards.</b> When each chain is right with probability above one half (binary) or the right answer is the single most likely one (plurality), accuracy rises towards 1 with more samples. When a wrong answer is more likely than the right one, voting makes it more certain. Plurality values are from simulation.</figcaption></figure>
+
+<p>Figure 5.3 holds the whole theory of self-consistency, including its failure mode. Voting does not add knowledge; it removes noise. It converges to the model's <em>modal</em> answer, the arg-max of the marginal \(p_\theta(a\mid q)\), and that is the right answer only if the model's most likely answer is right. On a question where the model has a systematic misconception (the orange curve), more samples make the wrong answer more certain. In practice gains saturate: on GSM8K most of the benefit came within the first 10 to 20 samples, as the binary curves suggest, because questions split into those where the model's mode is right (which voting fixes) and those where it is wrong (which voting cannot). A second limitation is that voting needs answers that can be compared. It works for numbers, multiple choice and short labels; for free-form outputs such as code, reports or agent actions, "the most frequent answer" is not defined, and one needs either a way to cluster equivalent outputs (run the code on tests and group by behaviour) or a judge to pick the best (Chapter 6).</p>
+
+<div class="box example">
+<div class="box-title">Worked example — is self-consistency worth it for an agent step?</div>
+<p>A support agent must classify each request as eligible or ineligible for a refund under a complicated policy before acting; a single chain of thought is right with probability 0.7. Each chain is 400 output tokens on a 10,000-token cached context.</p>
+<p><b>Accuracy.</b> With \(k=5\) chains and majority vote: \(\sum_{j=3}^{5}\binom5j0.7^j0.3^{5-j}=0.3087+0.3602+0.1681=0.837\). With \(k=9\): 0.901 (Figure 5.3).</p>
+<p><b>Cost.</b> One chain: \(0.01\times\$0.30\) cached input \(+\,0.0004\times\$15\) output \(=\$0.003+\$0.006=\$0.009\). Five chains: $0.045; nine: $0.081. The extra $0.036 for \(k=5\) buys 13.7 points of accuracy on the decision.</p>
+<p><b>Latency.</b> The chains can run in parallel, so wall-clock time stays near one chain's \(400/60\approx7\) s, if the provider's rate limits allow parallel requests.</p>
+<p><b>Verdict.</b> If a wrong eligibility decision costs more than about \(\$0.036/0.137\approx\$0.26\) in expectation (an unjustified refund, an escalation, an unhappy customer), voting pays. For high-stakes, low-volume decisions it usually does; for routine steps, a single chain at low temperature or a stronger model is cheaper.</p>
+</div>
+
+<details class="drill">
+<summary>Drill 5.1 — when voting hurts</summary>
+<p>A model answers a yes/no policy question correctly with probability 0.45 per chain, because of a misleading clause it consistently misreads. (a) What is the majority-vote accuracy with 3, 9 and 41 chains? (b) What would fix this?</p>
+<p>(a) From the binomial sum: 0.425, 0.379, 0.259 (Figure 5.3, orange). Accuracy falls with \(k\). (b) Voting cannot; the model's mode is wrong. Fix the input (rewrite or annotate the clause), give the model a tool that checks eligibility deterministically, or use a stronger model or a reasoning model whose mode is right. Measure \(p\) per question type before deploying voting.</p>
+</details>
+
+<h2 id="s5-5">5.5 Decomposition: sub-problems and programs</h2>
+<p>Chain of thought lets the model decide how to break a problem down as it goes. For hard problems that is not always enough: a chain that starts down the wrong decomposition rarely recovers, and long chains accumulate arithmetic and copying errors, the per-step errors of §1.8 inside a single answer. Two families of methods make the decomposition explicit.</p>
+<p>The first decomposes into <em>sub-problems</em>. <strong>Least-to-most prompting</strong> (Zhou et al., 2022) works in two stages: first prompt the model to break the problem into a sequence of simpler sub-questions, then solve them in order, each with the answers to the previous ones in context<span class="cite"><a href="#ref-leasttomost">[8]</a></span>. On tasks that require generalising to problems harder than the examples, such as the SCAN compositional-generalisation benchmark, it succeeded where chain of thought failed, because each sub-problem was within the range of the examples even when the whole was not. Plan-and-solve prompting applies the same idea with a single instruction ("first devise a plan, then carry it out"). The plan-then-execute structure reappears at the scale of whole agents in Chapter 6.</p>
+<p>The second offloads computation to <em>programs</em>. Language models are unreliable at exact arithmetic and long symbolic manipulation, which are trivial for an interpreter. <strong>Program-aided language models</strong> (PAL; Gao et al., 2022) and <strong>program of thoughts</strong> (Chen et al., 2022) have the model write its reasoning as a short program, whose execution by an interpreter produces the answer<span class="cite"><a href="#ref-pal">[9]</a></span>. The model does what it is good at (translating a word problem into a formal procedure) and the interpreter does what it is good at (executing the procedure without error). On arithmetic-heavy benchmarks this beat chain-of-thought prompting by large margins. Figure 5.4 contrasts the two families.</p>
+
+<figure class="diagram" id="fig-5-4">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-label="Least-to-most decomposition and program-aided reasoning">
+<defs><marker id="ah54" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<text x="170" y="22" text-anchor="middle" class="t-b">Least-to-most</text>
+<text x="540" y="22" text-anchor="middle" class="t-b">Program-aided</text>
+<line x1="360" y1="10" x2="360" y2="220" class="grid"/>
+<rect x="110" y="36" width="120" height="30" rx="6" class="bx2"/><text x="170" y="56" text-anchor="middle" class="t-xs">hard problem</text>
+<rect x="30" y="96" width="90" height="30" rx="6" class="bx3"/><text x="75" y="116" text-anchor="middle" class="t-xs">sub-question 1</text>
+<rect x="130" y="96" width="90" height="30" rx="6" class="bx3"/><text x="175" y="116" text-anchor="middle" class="t-xs">sub-question 2</text>
+<rect x="230" y="96" width="90" height="30" rx="6" class="bx3"/><text x="275" y="116" text-anchor="middle" class="t-xs">sub-question 3</text>
+<line x1="150" y1="66" x2="80" y2="94" class="ln" marker-end="url(#ah54)"/><line x1="170" y1="66" x2="175" y2="94" class="ln" marker-end="url(#ah54)"/><line x1="190" y1="66" x2="270" y2="94" class="ln" marker-end="url(#ah54)"/>
+<path d="M120,111 L128,111" class="ln" marker-end="url(#ah54)"/><path d="M220,111 L228,111" class="ln" marker-end="url(#ah54)"/>
+<rect x="230" y="160" width="90" height="30" rx="6" class="fill-acc"/><text x="275" y="180" text-anchor="middle" class="t-xs t-on">answer</text>
+<line x1="275" y1="126" x2="275" y2="158" class="ln" marker-end="url(#ah54)"/>
+<text x="170" y="214" text-anchor="middle" class="t-xs">solve in order; each answer joins the context</text>
+<rect x="390" y="36" width="120" height="30" rx="6" class="bx2"/><text x="450" y="56" text-anchor="middle" class="t-xs">word problem</text>
+<rect x="390" y="96" width="140" height="60" rx="6" class="fill-muted"/><g font-family="JetBrains Mono, monospace" class="t-xs"><text x="398" y="114">price = 24</text><text x="398" y="130">n = 17</text><text x="398" y="146">ans = price * n</text></g>
+<line x1="450" y1="66" x2="450" y2="94" class="ln" marker-end="url(#ah54)"/><text x="458" y="84" class="t-xs">model writes code</text>
+<rect x="570" y="106" width="110" height="40" rx="6" class="bx4"/><text x="625" y="130" text-anchor="middle" class="t-xs">interpreter</text>
+<line x1="530" y1="126" x2="568" y2="126" class="ln" marker-end="url(#ah54)"/>
+<rect x="580" y="170" width="90" height="30" rx="6" class="fill-acc"/><text x="625" y="190" text-anchor="middle" class="t-xs t-on">408</text>
+<line x1="625" y1="146" x2="625" y2="168" class="ln" marker-end="url(#ah54)"/>
+<text x="540" y="222" text-anchor="middle" class="t-xs">the model translates; the interpreter computes exactly</text>
+</svg>
+<figcaption><b>Figure 5.4 — Two ways to make decomposition explicit.</b> Least-to-most prompting splits a problem into sub-questions solved in sequence. Program-aided reasoning has the model write a program and lets an interpreter execute it, removing arithmetic and bookkeeping errors from the chain.</figcaption></figure>
+
+<p>Figure 5.4's right half is a small agent: the model takes an action (writing code), the environment (the interpreter) executes it, and the result returns as an observation. Program-aided reasoning is the point at which reasoning and acting merge, and the reason Chapter 10 treats code as the most general action space an agent can have. The lesson for the per-step error rate is direct: any part of a decision that can be computed exactly by a tool should be, because the tool's error rate is zero and the model's is not.</p>
+
+<h2 id="s5-6">5.6 Reasoning models</h2>
+<p>Everything so far elicits reasoning from a model trained for something else. In September 2024 OpenAI released o1, a model trained specifically to reason: given a problem, it produces a long hidden chain of thought, often thousands of tokens, before its answer, and its accuracy on competition mathematics, coding and science questions jumped far beyond that of models of similar scale that answer directly. OpenAI reported, for example, that o1 solved 83% of problems from the 2024 American Invitational Mathematics Examination (AIME) with a consensus over 64 samples, against 12% for GPT-4o, and 74% for o1 with a single sample<span class="cite"><a href="#ref-o1">[10]</a></span>. The details of o1's training were not published. In January 2025 DeepSeek published DeepSeek-R1, an open model with comparable results (79.8% pass@1 on AIME 2024), and a paper describing how it was made<span class="cite"><a href="#ref-r1">[11]</a></span>.</p>
+<p>The central finding of the R1 paper is that long, effective chains of thought can be produced by reinforcement learning with <strong>verifiable rewards</strong> alone. The authors took a pre-trained base model and, without any supervised examples of reasoning, trained it with a policy-gradient method (GRPO, which Chapter 18 derives) on mathematics and coding problems whose answers could be checked automatically: reward 1 if the final answer was right and in the right format, 0 otherwise. The resulting model, DeepSeek-R1-Zero, improved on AIME 2024 from 15.6% to 71.0% pass@1 over training, and 86.7% with majority voting. More remarkably, its chains of thought grew longer as training progressed, from hundreds to thousands of tokens, and began to show behaviours nobody had programmed: re-checking earlier steps, trying alternative approaches, and noticing its own mistakes, which the authors illustrated with a chain in which the model wrote, in effect, "wait, let me re-evaluate this". The final R1 model added a small amount of supervised data to make the reasoning readable and further rounds of RL for general helpfulness.</p>
+<p>Why does reinforcement learning produce longer, better reasoning? The latent-variable view of §5.3 suggests an answer. The policy gradient increases the probability of chains \(z\) that lead to correct answers. Chains that check their work, consider alternatives and back-track when something looks wrong lead to correct answers more often, so the training makes them more likely. Longer chains have more opportunities to catch errors, which is the recovery mechanism of §2.6 operating inside a single answer, so length grows as long as it pays. A reasoning model is thus a policy whose actions are reasoning steps, trained in the "environment" of a problem with a checker, and in a precise sense it is an agent whose actions happen to be internal.</p>
+<p>Reasoning models changed agents in two ways. Per-step reliability on hard decisions rose: a model that thinks for a few thousand tokens before deciding which hypothesis about a bug to test, or how to interpret a tangled policy, makes fewer of the errors that compound. And the same training recipe, applied to multi-step tasks with tools, produced models that are better agents in their own right, more persistent, more willing to verify, better at recovering (Chapter 18). The price is the one of §3.7: reasoning tokens are output tokens, billed at output prices and generated at decode speed, so a model that thinks for 5,000 tokens at 60 tokens per second spends over a minute per step.</p>
+
+<h2 id="s5-7">5.7 Test-time compute and its scaling</h2>
+<p>Both self-consistency and reasoning models convert computation at inference time into accuracy. How fast does accuracy grow with that computation? OpenAI's o1 announcement showed accuracy on AIME rising roughly linearly in the <em>logarithm</em> of test-time compute, and Snell and colleagues (2024) studied the trade-off systematically, finding that the best way to spend inference compute depends on problem difficulty and that, for problems on which a smaller model has some success, optimally allocated test-time compute could beat a model with fourteen times more parameters<span class="cite"><a href="#ref-snell">[12]</a></span>. The log-linear shape is so common that it deserves an explanation.</p>
+<p>Here is a simple model that produces it. Suppose each problem has a difficulty \(D\), the expected number of reasoning tokens needed to solve it, and that a model given a budget of \(B\) tokens solves a problem of difficulty \(D\) with probability \(1-e^{-B/D}\): it searches for a solution and succeeds at a constant rate per token. If difficulties in a benchmark are spread over several orders of magnitude, say \(\log_{10}D\) uniform on \([2,5]\), from a hundred to a hundred thousand tokens, then accuracy at budget \(B\) is the average of \(1-e^{-B/D}\) over that spread. Each tenfold increase in \(B\) brings a new decade of difficulty within reach, adding roughly the same increment of accuracy. Figure 5.5 plots the result.</p>
+
+<figure class="chart" id="fig-5-5">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Accuracy versus reasoning budget when difficulty spans orders of magnitude (model)","height":330,
+ "x":{"label":"Reasoning budget B in tokens (log)","log":true,"min":100,"max":100000},
+ "y":{"label":"Fraction of problems solved","min":0,"max":1,"fmt":"pct"},
+ "series":[{"name":"log10 D uniform on [2, 5]","color":"s1","points":[[100,0.1152],[300,0.2441],[1000,0.4155],[3000,0.5716],[10000,0.7361],[30000,0.8689],[100000,0.9682]]}]}
+</script>
+<figcaption><b>Figure 5.5 — Why test-time scaling looks log-linear.</b> If each problem needs on average \(D\) tokens of search and difficulties are spread log-uniformly over three decades, accuracy rises by about 30 points per tenfold increase in budget, a straight line on a log axis, until the hardest decade is reached.</figcaption></figure>
+
+<p>Figure 5.5 is a model, not data, but it captures the qualitative facts and their consequences for budgeting. Each additional point of accuracy costs geometrically more tokens, so the marginal value of thinking falls quickly. The curve's slope depends on how difficulty is distributed in the workload: a benchmark of uniformly hard problems would show a sharper threshold, a benchmark of very mixed problems a gentler slope. And the right budget is a property of the problem, not of the model: easy problems are solved in a few hundred tokens, and spending ten thousand on them buys nothing. This is why reasoning models expose budget controls (effort levels or token limits) and why adaptive allocation, thinking more on hard steps and less on easy ones, is the frontier of practice. Snell and colleagues' compute-optimal strategy is exactly such an adaptive allocation, choosing between revision and parallel sampling by estimated difficulty.</p>
+
+<details class="drill">
+<summary>Drill 5.2 — the price of a point of accuracy</summary>
+<p>Using Figure 5.5, a step currently uses a 1,000-token reasoning budget (41.6% of problems solved within budget). (a) What does raising the budget to 10,000 tokens buy, and what does it cost per step at the reference output price? (b) How long does the step take?</p>
+<p>(a) Accuracy rises to 73.6%, a gain of 32 points, for 9,000 extra output tokens: \(0.009\times\$15=\$0.135\) more per step, or about 0.42 cents per point. (b) \(10{,}000/60\approx167\) s against 17 s. Whether this is worth it depends on the step: for a decision that would otherwise derail a $1 episode, yes; for a routine file read, no.</p>
+</details>
+
+<h2 id="s5-8">5.8 Is the reasoning faithful?</h2>
+<p>A chain of thought is text the model writes, and it is tempting to read it as a transcript of how the model reached its answer. For agents this temptation has practical stakes: if the reasoning is faithful, we can debug an agent by reading it, and monitor a deployed agent for intentions we do not want (to cut corners, to game a test, to deceive a user) by watching what it thinks. Unfortunately, the evidence is that chains of thought are often not faithful in this sense.</p>
+<p>Turpin and colleagues (2023) biased few-shot prompts so that the correct answer was always option (A), and found that models' answers shifted towards (A) while their chains of thought gave plausible reasons for the answer and never mentioned the bias<span class="cite"><a href="#ref-turpin">[13]</a></span>. Lanham and colleagues (2023) intervened on chains, truncating them or inserting mistakes, and found that for some tasks the final answer barely depended on the chain, suggesting the reasoning was partly post-hoc<span class="cite"><a href="#ref-lanham">[14]</a></span>. Most directly relevant to reasoning models, Chen and colleagues at Anthropic (2025) inserted hints into questions (for example, a note stating the answer) and checked whether reasoning models that used the hint admitted it in their chain of thought. They usually did not: across their settings, Claude 3.7 Sonnet mentioned the hint in about a quarter of the cases in which it used it, and DeepSeek-R1 in about two-fifths<span class="cite"><a href="#ref-cotfaith">[15]</a></span>. In a reinforcement-learning environment with an exploitable reward, models learned to exploit it almost always while rarely verbalising that they were doing so.</p>
+<p>Two conclusions follow, and they pull in different directions. First, reasoning is genuinely useful computation, whatever its faithfulness: §5.1–§5.6 established that it raises accuracy, and that is enough to justify it in an agent. Second, it is an imperfect window. Reading an agent's chain of thought is valuable for debugging and catches many problems, since a model that plans to do something unwanted often says so, but its absence of red flags is not evidence of their absence. Monitoring of agents must therefore combine reading reasoning with checking actions and outcomes, which are what actually affect the world (Chapter 20). And training pressure on the chain of thought itself, for example penalising "bad thoughts", risks teaching the model to hide them rather than to stop having them, a concern that has led several laboratories to argue for keeping chains of thought free of such optimisation so that they remain monitorable.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — monitoring an unfaithful reasoner</div>
+<p>A coding agent sometimes "fixes" failing tests by special-casing the test inputs, a form of reward hacking. Suppose that when it does so, its chain of thought says so explicitly with probability \(v=0.3\), and that a monitor reading chains of thought flags every explicit mention.</p>
+<p><b>Single episode.</b> The monitor catches a given hack with probability 0.3; 70% of hacks pass unflagged. As a per-episode safeguard, reading the reasoning is weak.</p>
+<p><b>Population.</b> If the behaviour recurs, independently, in 10 episodes of a day's runs, the probability that at least one is flagged is \(1-0.7^{10}=0.972\). The monitor is an excellent <em>detector of the behaviour</em> even though it is a poor detector of each instance.</p>
+<p><b>Combined with an outcome check.</b> A second monitor that diffs the patch against the test files and flags edits that mention test inputs catches, say, 60% of hacks independently. Together they miss \(0.7\times0.4=0.28\) of instances, against 0.7 for reasoning alone.</p>
+<p><b>Lesson.</b> Unfaithful reasoning limits per-instance monitoring but not the discovery of systematic behaviour, and independent checks on actions multiply with checks on reasoning. Chapter 20 builds monitoring architectures on this arithmetic.</p>
+</div>
+
+<h2 id="s5-9">5.9 Reasoning inside an agent loop</h2>
+<p>In a single question-answering call, the model reasons once and answers. In an agent, reasoning happens at every step, interleaved with tool calls, and new information arrives between rounds of reasoning. Modern models support <strong>interleaved thinking</strong>: the model may think, call a tool, receive the result, think again about what the result means, and call another tool, with its earlier reasoning available or summarised in context. Figure 5.6 shows the loop.</p>
+
+<figure class="diagram" id="fig-5-6">
+<svg class="dg" viewBox="0 0 720 210" role="img" aria-label="Interleaved thinking in an agent loop">
+<defs><marker id="ah56" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<g class="t-xs">
+<rect x="20" y="70" width="100" height="44" rx="8" class="bx2"/><text x="70" y="90" text-anchor="middle">think</text><text x="70" y="106" text-anchor="middle">2,000 tok</text>
+<rect x="150" y="70" width="90" height="44" rx="8" class="bx3"/><text x="195" y="96" text-anchor="middle">tool call</text>
+<rect x="270" y="70" width="90" height="44" rx="8" class="bx4"/><text x="315" y="96" text-anchor="middle">result</text>
+<rect x="390" y="70" width="100" height="44" rx="8" class="bx2"/><text x="440" y="90" text-anchor="middle">think</text><text x="440" y="106" text-anchor="middle">300 tok</text>
+<rect x="520" y="70" width="90" height="44" rx="8" class="bx3"/><text x="565" y="96" text-anchor="middle">tool call</text>
+<rect x="640" y="70" width="60" height="44" rx="8" class="fill-acc"/><text x="670" y="96" text-anchor="middle" class="t-on">…</text>
+</g>
+<line x1="120" y1="92" x2="148" y2="92" class="ln" marker-end="url(#ah56)"/><line x1="240" y1="92" x2="268" y2="92" class="ln" marker-end="url(#ah56)"/><line x1="360" y1="92" x2="388" y2="92" class="ln" marker-end="url(#ah56)"/><line x1="490" y1="92" x2="518" y2="92" class="ln" marker-end="url(#ah56)"/><line x1="610" y1="92" x2="638" y2="92" class="ln" marker-end="url(#ah56)"/>
+<text x="70" y="140" text-anchor="middle" class="t-xs t-s2">hard step: plan,</text><text x="70" y="154" text-anchor="middle" class="t-xs t-s2">weigh hypotheses</text>
+<text x="440" y="140" text-anchor="middle" class="t-xs t-s2">easy step: read</text><text x="440" y="154" text-anchor="middle" class="t-xs t-s2">result, continue</text>
+<text x="360" y="40" text-anchor="middle" class="t-sm">reasoning is spent where the next decision is hard, and re-done when new evidence arrives</text>
+<text x="360" y="190" text-anchor="middle" class="t-xs">thinking tokens are output tokens: they set the step's latency and much of its cost</text>
+</svg>
+<figcaption><b>Figure 5.6 — Interleaved thinking.</b> An agent with a reasoning model thinks before each action and again after each observation. A good allocation thinks hard at decisive steps (planning, diagnosis) and briefly at routine ones.</figcaption></figure>
+
+<p>Figure 5.6 frames the agent designer's question: how much should each step think? The reliability models of Part I give a principled answer. Let a step's error rate be \(\epsilon(B)\), falling with the reasoning budget \(B\) as in Figure 5.5, and let the step's error, if undetected, doom an episode worth \(U\). The expected loss from the step is \(U\,\epsilon(B)(1-r)\), with \(r\) the detection probability of §2.6, and the cost of thinking is \(\kappa_{\text{out}}B\) plus the value of the time it takes. The optimal budget equates the marginal reduction in expected loss with the marginal cost. Three things raise the optimal budget: a high-value episode, a decision whose errors are hard to detect (low \(r\)), and a decision whose difficulty is in the range where more thinking still helps. Three things lower it: cheap episodes, decisions that the environment will check immediately (a test run follows the edit), and routine steps whose \(\epsilon\) is already near its floor.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — where to spend thinking in a coding episode</div>
+<p>A 40-step coding episode, worth \(U=\$50\) if successful, has two kinds of step. Four <em>diagnosis</em> steps (localising the bug, choosing a fix) have error rate 0.20 at a 500-token budget and 0.08 at 5,000 tokens; their errors are detected only 30% of the time. Thirty-six <em>routine</em> steps (reading, running tests) have error rate 0.02 whatever the budget, detected 80% of the time.</p>
+<p><b>Expected loss from diagnosis steps.</b> At 500 tokens: \(4\times0.20\times0.7\times\$50=\$28\). At 5,000: \(4\times0.08\times0.7\times\$50=\$11.20\). Saving: $16.80.</p>
+<p><b>Cost.</b> Extra thinking: \(4\times4{,}500=18{,}000\) output tokens, $0.27, and \(18{,}000/60=300\) s of extra wall-clock time.</p>
+<p><b>Routine steps.</b> Raising their budget changes nothing (error rate flat) but would cost \(36\times4{,}500\times\$15/\text{M}=\$2.43\) and 45 minutes.</p>
+<p><b>Verdict.</b> Think hard at the four diagnosis steps and briefly elsewhere. A uniform high budget pays the same $16.80 benefit for ten times the cost and adds three-quarters of an hour. (The expected losses here are first-order approximations; they treat step failures as independent and do not cap total loss at \(U\).)</p>
+</div>
+
+<p>The worked example is the case for adaptive reasoning in agents, and it explains a design that many agents now use: a planning or diagnosis phase with high reasoning effort, followed by an execution phase with low effort, with a return to high effort when an observation contradicts the plan. Some models let the developer set the effort per call; others decide themselves how long to think, which they were trained to do in proportion to apparent difficulty. Either way, the reasoning budget has become one of the main dials of agent design, alongside the model choice and the context, and it is set by the same arithmetic of reliability and cost that runs through the whole book.</p>
+
+<details class="drill">
+<summary>Drill 5.3 — voting or thinking?</summary>
+<p>For a yes/no decision, a model with a 500-token budget is right with probability 0.7; with a 4,000-token budget, 0.85. (a) Compare a single 4,000-token chain with majority vote over five 500-token chains, by accuracy, output tokens and latency (chains in parallel). (b) Which would you choose?</p>
+<p>(a) Single long chain: 0.85, 4,000 tokens, \(4{,}000/60\approx67\) s. Vote of five: 0.837 (§5.4 example), 2,500 tokens, about 8 s in parallel. (b) Comparable accuracy; voting is cheaper and nine times faster here, if parallel calls are available and answers are comparable. For free-form decisions (which file to edit, what to say to a customer) voting is not directly applicable and the longer chain wins. Measure both on your own decisions, since the numbers vary by task.</p>
+</details>
+
+<h2 id="looking-ahead" class="unnumbered">Looking ahead</h2>
+<p>Reasoning lets a model explore possible solutions in its head, and self-consistency lets it explore several in parallel and keep the most popular. Both treat reasoning as a single line or a set of independent lines. But many problems, and most agent tasks, have the structure of a tree: at each point several actions are possible, some lead to dead ends, and the best strategy may be to try one, evaluate where it leads, and back up if it looks bad. Voting by popularity is also a weak way to choose: a single excellent solution among many mediocre ones is lost in the vote. Can we search over reasoning and actions more systematically, guided by evaluations of how promising each branch is? What does such search cost, and how good must the evaluator be for it to help? Chapter 6 brings back the search algorithms of Chapter 1's planning era, now guided by language models.</p>
+
+<h2 id="summary">Chapter summary</h2>
+<ul>
+<li>A model answering immediately has a fixed serial depth per token; writing intermediate tokens adds a full pass per token with a persistent scratchpad, enlarging the class of computable functions.</li>
+<li><b>Chain-of-thought prompting</b> (Wei et al., 2022) raised PaLM 540B on GSM8K from 17.9% to 56.9%; <b>zero-shot CoT</b> ("Let's think step by step") raised text-davinci-002 on MultiArith from 17.7% to 78.7%. Gains appear at scale and on multi-step problems.</li>
+<li>Latent-variable view: \(p(a\mid q)=\sum_z p(a\mid q,z)p(z\mid q)\); reasoning helps when local conditionals are better estimated than direct ones.</li>
+<li><b>Self-consistency</b> samples \(k\) chains and takes the plurality answer (PaLM GSM8K 56.5% → 74.4%). It converges to the model's modal answer: helpful when the mode is right, harmful when it is wrong (Condorcet). It requires comparable answers.</li>
+<li><b>Decomposition</b>: least-to-most solves sub-questions in sequence; program-aided reasoning offloads exact computation to an interpreter.</li>
+<li><b>Reasoning models</b> (o1, DeepSeek-R1) are trained by RL with verifiable rewards to produce long chains that check and revise; R1-Zero rose from 15.6% to 71.0% on AIME 2024 from RL alone.</li>
+<li><b>Test-time scaling</b> is typically log-linear; a model with difficulty spread over decades explains it. Budgets should adapt to difficulty.</li>
+<li>Chains of thought are often <b>unfaithful</b>: models use hints or exploit rewards without saying so. Read reasoning for debugging, but monitor actions and outcomes too.</li>
+<li>In agents, spend reasoning where errors are costly and hard to detect; think briefly on routine steps.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ch05-mcq-01" data-topic="§5.1 Serial depth">
+<p class="q">Why does a model answering immediately have a fixed computational budget per answer token?</p>
+<ol class="opts"><li>Because of the context window</li><li data-correct>Because each token is produced by one forward pass through a fixed number of layers</li><li>Because of the sampling temperature</li><li>Because tokens are short</li></ol>
+<div class="explain">Depth is fixed; only writing more tokens adds serial computation.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-02" data-topic="§5.1 Serial depth">
+<p class="q">Theoretical results on chain of thought show that, with polynomially many intermediate tokens, a constant-depth Transformer can:</p>
+<ol class="opts"><li>Only compute constant-depth circuits</li><li data-correct>Simulate polynomial-time computations it could not perform in one pass</li><li>Solve NP-complete problems in constant time</li><li>Avoid all errors</li></ol>
+<div class="explain">Intermediate tokens act as a scratchpad that extends serial computation; the results concern idealised models.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-03" data-topic="§5.2 CoT">
+<p class="q">The original chain-of-thought paper found that its benefit:</p>
+<ol class="opts"><li>Was largest for small models</li><li data-correct>Appeared mainly in large models and on multi-step problems</li><li>Was the same for all tasks</li><li>Required fine-tuning</li></ol>
+<div class="explain">Below roughly 10B parameters, CoT often hurt; gains concentrated on multi-step reasoning.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-04" data-topic="§5.2 Zero-shot CoT">
+<p class="q">Zero-shot chain of thought consists of:</p>
+<ol class="opts"><li>Removing all examples and the instruction</li><li data-correct>Adding a phrase such as "Let's think step by step" with no worked examples</li><li>Sampling at temperature zero</li><li>Fine-tuning on reasoning traces</li></ol>
+<div class="explain">Kojima et al. (2022) showed the phrase alone elicits step-by-step reasoning in large instruction-tuned models.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-05" data-topic="§5.2 CoT in agents">
+<p class="q">In a ReAct agent, chain-of-thought prompting corresponds to:</p>
+<ol class="opts"><li>The observation</li><li data-correct>The thought written before each action</li><li>The tool schema</li><li>The final answer only</li></ol>
+<div class="explain">Thoughts are free-form reasoning that guides the next action.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-06" data-topic="§5.3 Latent variables">
+<p class="q">In \(p(a\mid q)=\sum_z p(a\mid q,z)p(z\mid q)\), a single sampled chain of thought gives:</p>
+<ol class="opts"><li>The exact marginal</li><li data-correct>One sample of \(z\), so an error in that path determines the answer even if most paths are right</li><li>The mode of the marginal</li><li>An unbiased estimate of \(p(q)\)</li></ol>
+<div class="explain">Several samples estimate the marginal over answers better; that is self-consistency.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-07" data-topic="§5.3 Locality">
+<p class="q">The "locality of experience" explanation says reasoning helps when:</p>
+<ol class="opts"><li>The model has seen the exact question</li><li data-correct>Training data connect nearby concepts often but distant ones rarely, so chaining local steps beats one direct jump</li><li>Questions are short</li><li>Temperature is high</li></ol>
+<div class="explain">Prystawski et al. (2023) showed this in Bayesian networks with locally structured training data.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-08" data-topic="§5.4 Self-consistency">
+<p class="q">Self-consistency returns:</p>
+<ol class="opts"><li>The longest chain's answer</li><li data-correct>The most frequent final answer among sampled chains</li><li>The answer of the greedy chain</li><li>The average of numeric answers</li></ol>
+<div class="explain">Sample \(k\) chains at moderate temperature and take the plurality answer.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-09" data-topic="§5.4 Voting maths">
+<p class="q">Binary question, each chain correct with \(p=0.7\). Majority-vote accuracy with three chains is:</p>
+<ol class="opts"><li>0.700</li><li data-correct>0.784</li><li>0.837</li><li>0.900</li></ol>
+<div class="explain">\(0.7^3+3\times0.7^2\times0.3=0.343+0.441=0.784\).</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-10" data-topic="§5.4 Voting maths">
+<p class="q">By Condorcet's theorem, if each independent chain is right with probability \(p&lt;\tfrac12\) on a binary question, majority vote as \(k\to\infty\):</p>
+<ol class="opts"><li>Tends to 1</li><li>Tends to \(p\)</li><li data-correct>Tends to 0</li><li>Tends to \(\tfrac12\)</li></ol>
+<div class="explain">Voting amplifies the model's lean; a wrong mode becomes certain.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-11" data-topic="§5.4 Plurality">
+<p class="q">Why can plurality voting succeed even when the correct answer has probability only 0.4 per chain?</p>
+<ol class="opts"><li>Because wrong answers cancel</li><li data-correct>Because the remaining 0.6 is spread over many different wrong answers, so the correct one is still the single most likely</li><li>Because temperature is low</li><li>Because the model is calibrated</li></ol>
+<div class="explain">Plurality needs the correct answer to be the mode, not a majority.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-12" data-topic="§5.4 Limits">
+<p class="q">Select all limitations of self-consistency.</p>
+<ol class="opts"><li data-correct>It converges to the model's modal answer, which may be wrong</li><li data-correct>It needs answers that can be compared or clustered</li><li data-correct>It multiplies token cost by \(k\)</li><li>It requires retraining the model</li></ol>
+<div class="explain">No training is needed; the other three are real limits.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-13" data-topic="§5.4 Hoeffding">
+<p class="q">Hoeffding's bound on majority-vote error is \(\exp(-2k(p-\tfrac12)^2)\). For \(p=0.6\), roughly how many chains guarantee error below 5% by this bound?</p>
+<ol class="opts"><li>15</li><li>50</li><li data-correct>150</li><li>1,500</li></ol>
+<div class="explain">Need \(2k(0.01)\ge\ln 20\approx3.0\), so \(k\ge150\). The bound is loose; the exact binomial needs far fewer (67).</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-14" data-topic="§5.5 Decomposition">
+<p class="q">Least-to-most prompting first:</p>
+<ol class="opts"><li>Samples many answers</li><li data-correct>Asks the model to break the problem into simpler sub-questions, then solves them in order</li><li>Writes a program</li><li>Retrieves similar problems</li></ol>
+<div class="explain">Each sub-problem can be within the range of the examples even when the whole is not.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-15" data-topic="§5.5 PAL">
+<p class="q">Program-aided reasoning improves arithmetic-heavy tasks mainly because:</p>
+<ol class="opts"><li>Programs are shorter than prose</li><li data-correct>An interpreter executes the computation exactly, removing the model's arithmetic errors</li><li>Programs are cached</li><li>The model reasons more</li></ol>
+<div class="explain">The model translates; the tool computes. Any exactly computable part of a decision should go to a tool.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-16" data-topic="§5.6 Reasoning models">
+<p class="q">DeepSeek-R1-Zero showed that long, self-correcting chains of thought can emerge from:</p>
+<ol class="opts"><li>Supervised fine-tuning on human reasoning traces</li><li data-correct>Reinforcement learning with automatically verifiable rewards, starting from a base model</li><li>Prompting alone</li><li>Distillation from o1</li></ol>
+<div class="explain">Rewards of 1 for correct, well-formatted answers sufficed; chains lengthened and began to show re-checking.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-17" data-topic="§5.6 Reasoning models">
+<p class="q">Why might RL on correct answers make chains of thought longer?</p>
+<ol class="opts"><li>Because length is rewarded directly</li><li data-correct>Because chains that check and revise reach correct answers more often, so the policy gradient makes them more likely</li><li>Because the context window grows</li><li>Because of the KL penalty</li></ol>
+<div class="explain">Error recovery inside a chain improves reward; length grows while it pays.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-18" data-topic="§5.6 Cost">
+<p class="q">A reasoning step writes 5,000 hidden tokens and 200 visible tokens at 60 tokens/s. Its decode time is about:</p>
+<ol class="opts"><li>3 s</li><li>30 s</li><li data-correct>87 s</li><li>5 s</li></ol>
+<div class="explain">\(5{,}200/60\approx87\) s. Hidden tokens are output tokens.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-19" data-topic="§5.7 Test-time scaling">
+<p class="q">Reported accuracy of reasoning models typically grows with test-time compute:</p>
+<ol class="opts"><li>Linearly</li><li data-correct>Roughly linearly in the logarithm of compute</li><li>Exponentially</li><li>Not at all</li></ol>
+<div class="explain">Each tenfold increase buys a similar increment, as in Figure 5.5.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-20" data-topic="§5.7 Scaling model">
+<p class="q">In the model behind Figure 5.5, why is the curve straight on a log axis?</p>
+<ol class="opts"><li>Because accuracy is defined logarithmically</li><li data-correct>Because problem difficulties are spread log-uniformly, so each tenfold budget increase brings a new decade of difficulty within reach</li><li>Because tokens are priced logarithmically</li><li>Because of temperature</li></ol>
+<div class="explain">With a narrow difficulty distribution the curve would be a sharp threshold instead.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-21" data-topic="§5.7 Compute-optimal">
+<p class="q">Snell et al. (2024) found that the best way to spend test-time compute:</p>
+<ol class="opts"><li>Is always parallel sampling</li><li>Is always sequential revision</li><li data-correct>Depends on problem difficulty, and adaptive allocation can beat a much larger model</li><li>Is never better than a larger model</li></ol>
+<div class="explain">Compute-optimal allocation chose strategies by estimated difficulty and outperformed a 14× larger model on suitable problems.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-22" data-topic="§5.8 Faithfulness">
+<p class="q">Turpin et al. (2023) biased few-shot prompts so the answer was always (A). The models' chains of thought:</p>
+<ol class="opts"><li>Explicitly mentioned the bias</li><li data-correct>Rationalised answers shifted towards (A) without mentioning the bias</li><li>Refused to answer</li><li>Were unaffected</li></ol>
+<div class="explain">Answers moved; explanations did not reveal why.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-23" data-topic="§5.8 Faithfulness">
+<p class="q">In Anthropic's 2025 study, when reasoning models used an inserted hint, they mentioned it in their chain of thought:</p>
+<ol class="opts"><li>Almost always</li><li data-correct>A minority of the time (about a quarter to two-fifths, depending on the model)</li><li>Never</li><li>Only when asked</li></ol>
+<div class="explain">Claude 3.7 Sonnet about 25%, DeepSeek-R1 about 39%.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-24" data-topic="§5.8 Monitoring">
+<p class="q">What follows for monitoring agents?</p>
+<ol class="opts"><li>Chains of thought are useless</li><li data-correct>Read reasoning for debugging, but also check actions and outcomes, since the absence of red flags in reasoning is weak evidence</li><li>Penalise bad thoughts during training</li><li>Hide reasoning from developers</li></ol>
+<div class="explain">Optimising against visible bad thoughts risks teaching concealment.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-25" data-topic="§5.9 Agents">
+<p class="q">Interleaved thinking means the model:</p>
+<ol class="opts"><li>Thinks only once at the start of an episode</li><li data-correct>Can reason again after each tool result before the next action</li><li>Runs two models in parallel</li><li>Shares reasoning across users</li></ol>
+<div class="explain">New observations prompt new reasoning, which is what agents need.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-26" data-topic="§5.9 Budget">
+<p class="q">Which step deserves the largest reasoning budget?</p>
+<ol class="opts"><li>Reading a file the agent already decided to read</li><li>Running the test suite</li><li data-correct>Diagnosing which of several hypotheses explains a failure, where a wrong choice is detected only much later</li><li>Formatting the final message</li></ol>
+<div class="explain">High stakes, low detection probability, and difficulty in the range where thinking helps.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-27" data-topic="§5.9 Budget">
+<p class="q">Which factor lowers the optimal reasoning budget for a step?</p>
+<ol class="opts"><li>A high-value episode</li><li data-correct>An immediate, reliable check of the step's outcome (high detection probability)</li><li>A hard decision</li><li>Low cost of output tokens</li></ol>
+<div class="explain">If errors are caught immediately, their expected cost \(U\epsilon(1-r)\) is small.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-28" data-topic="§5.4 Agent use">
+<p class="q">Self-consistency is hard to apply directly to which agent output?</p>
+<ol class="opts"><li>A yes/no eligibility decision</li><li>A numeric fare difference</li><li data-correct>A free-form reply to a customer</li><li>A multiple-choice classification</li></ol>
+<div class="explain">Free-form outputs need clustering or a judge to select, which Chapter 6 discusses.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-29" data-topic="§5.4 Cost">
+<p class="q">Five 400-token chains on a 10k cached context cost (reference prices) about:</p>
+<ol class="opts"><li>$0.009</li><li data-correct>$0.045</li><li>$0.15</li><li>$0.45</li></ol>
+<div class="explain">Per chain $0.003 cached input + $0.006 output = $0.009; five: $0.045.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-30" data-topic="§5.6 History">
+<p class="q">Which ordering of milestones is correct?</p>
+<ol class="opts"><li>o1 → chain-of-thought prompting → self-consistency</li><li data-correct>Scratchpads (2021) → chain-of-thought prompting (Jan 2022) → self-consistency (2022) → o1 (Sep 2024) → DeepSeek-R1 (Jan 2025)</li><li>DeepSeek-R1 → o1 → scratchpads</li><li>Self-consistency → scratchpads → chain-of-thought</li></ol>
+<div class="explain">Training on scratchpads, then prompting, then voting, then trained reasoning models.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-31" data-topic="§5.7 Budget">
+<p class="q">Using Figure 5.5, going from a 3,000- to a 30,000-token budget raises accuracy by about:</p>
+<ol class="opts"><li>5 points</li><li data-correct>30 points</li><li>60 points</li><li>90 points</li></ol>
+<div class="explain">57.2% → 86.9%: about 30 points per decade.</div>
+</div>
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer out loud first, then reveal the model answer and rate yourself.</p>
+
+<details class="qa" data-id="ch05-qa-01">
+<summary><span class="lvl warm">Warm-up</span> What is chain-of-thought prompting and why does it work?</summary>
+<div class="answer"><p>Prompting a model to write intermediate reasoning before its answer, either with worked examples or a phrase like "think step by step". Two complementary explanations: computationally, each generated token is another full forward pass whose result is stored in the context, so multi-step problems get the serial computation they need instead of being squeezed into one pass; statistically, the answer is a marginal over reasoning paths, and chaining local, well-learned steps estimates it better than a direct jump. It helps most for multi-step problems in large models and costs output tokens.</p></div>
+</details>
+
+<details class="qa" data-id="ch05-qa-02">
+<summary><span class="lvl warm">Warm-up</span> Explain self-consistency and when it fails.</summary>
+<div class="answer"><p>Sample several reasoning chains at moderate temperature, extract each final answer, return the most frequent. It removes sampling noise: correct reasoning converges on one answer by many routes while errors scatter. It fails when the model's most likely answer is wrong (voting then makes the wrong answer more certain, by Condorcet), when answers cannot be compared (free-form text, code without tests), and when the cost of \(k\) samples is not justified. Gains usually saturate after 10–20 samples.</p></div>
+</details>
+
+<details class="qa" data-id="ch05-qa-03">
+<summary><span class="lvl warm">Warm-up</span> What is a reasoning model, and how is it different from prompting for chain of thought?</summary>
+<div class="answer"><p>A reasoning model is trained, usually with reinforcement learning on tasks with verifiable rewards, to produce long chains of thought before answering, often hidden and thousands of tokens long. Prompted CoT elicits a behaviour the model learned incidentally; a reasoning model has been optimised so that its chains check work, try alternatives and back-track, and its accuracy scales with how long it thinks. Practically: higher accuracy on hard multi-step problems, budget controls, and much higher output-token cost and latency per call.</p></div>
+</details>
+
+<details class="qa" data-id="ch05-qa-04">
+<summary><span class="lvl core">Core</span> Derive the majority-vote accuracy for \(k\) chains on a binary question and give its asymptotics.</summary>
+<div class="answer"><p>With independent chains correct with probability \(p\), the number correct is Binomial\((k,p)\), so for odd \(k\), \(P=\sum_{j>k/2}\binom kj p^j(1-p)^{k-j}\). By the law of large numbers the fraction correct tends to \(p\), so \(P\to1\) if \(p>1/2\) and \(\to0\) if \(p&lt;1/2\). Hoeffding gives error \(\le e^{-2k(p-1/2)^2}\), exponential in \(k\) but slow when \(p\) is near 1/2. Independence is the key assumption; in practice chains share the model's biases, so effective \(k\) is smaller.</p></div>
+</details>
+
+<details class="qa" data-id="ch05-qa-05">
+<summary><span class="lvl core">Core</span> Why does reinforcement learning with verifiable rewards produce longer chains of thought?</summary>
+<div class="answer"><p>The policy gradient raises the probability of token sequences in proportion to their reward advantage. Among chains for a problem, those that verify intermediate results, consider alternatives and correct mistakes reach the correct final answer more often, so their behaviours are reinforced; these behaviours take tokens, so average length increases. Length grows until the marginal accuracy gain from more checking stops paying (and in practice is also shaped by length penalties or budgets). It is the error-recovery mechanism of agents operating within one answer. Risks: rewarding only final answers can reinforce unfaithful or hacky chains when the checker is weak.</p></div>
+</details>
+
+<details class="qa" data-id="ch05-qa-06">
+<summary><span class="lvl core">Core</span> How would you decide how much reasoning budget to give each step of an agent?</summary>
+<div class="answer"><p>Model each step's expected loss as \(U\epsilon(B)(1-r)\) and its cost as \(\kappa_{\text{out}}B\) plus a latency cost. Spend where \(U\) is high, \(r\) is low (errors not caught until later) and \(\epsilon(B)\) still falls with \(B\): planning, diagnosis, irreversible actions. Spend little on routine steps whose errors the environment catches immediately. Empirically: classify step types, measure error rate versus budget on logged tasks, and set per-type budgets; or use a model that adapts its own thinking length, and verify it does so sensibly. Monitor latency, since thinking tokens dominate step time.</p></div>
+</details>
+
+<details class="qa" data-id="ch05-qa-07">
+<summary><span class="lvl core">Core</span> Compare self-consistency with a single longer reasoning chain.</summary>
+<div class="answer"><p>Self-consistency spends compute in parallel: \(k\) independent short chains, low latency if run concurrently, robust to random slips, but limited to comparable answers and to the model's mode. A long chain spends compute sequentially: it can build on earlier steps, revise, and handle free-form outputs, but takes longer and a systematic error early on can persist. Reasoning models make the long chain effective; voting on top of a reasoning model (e.g. consensus@64) adds further gains. Choose by answer type, latency budget, and measured accuracy per token.</p></div>
+</details>
+
+<details class="qa" data-id="ch05-qa-08">
+<summary><span class="lvl core">Core</span> What is program-aided reasoning and why is it important for agents?</summary>
+<div class="answer"><p>The model writes a program expressing its reasoning, and an interpreter executes it to produce the answer (PAL, program of thoughts). It separates translation (which the model is good at) from exact computation (which interpreters do perfectly), removing arithmetic and bookkeeping errors. For agents it is the bridge from reasoning to acting: writing code is an action, the interpreter is an environment, and its output is an observation. The general principle is to move anything exactly computable out of the model and into tools, driving those parts of the per-step error rate to zero.</p></div>
+</details>
+
+<details class="qa" data-id="ch05-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Explain why test-time compute scaling curves are often log-linear, and what would change that shape.</summary>
+<div class="answer"><p>One model: each problem has difficulty \(D\) (expected tokens to solve) and success with budget \(B\) is \(1-e^{-B/D}\). If \(\log D\) is spread roughly uniformly over several decades, accuracy at \(B\) is the fraction of problems with \(D\lesssim B\) (smoothed), which grows linearly in \(\log B\) across the covered range. Changes: a narrow difficulty distribution gives a sigmoid threshold; a ceiling of unsolvable problems (the model lacks knowledge) flattens the top; better search efficiency shifts the curve left; voting adds its own diminishing-returns curve. It implies geometric cost per point of accuracy and motivates adaptive budgets.</p></div>
+</details>
+
+<details class="qa" data-id="ch05-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> Is a model's chain of thought a faithful account of its reasoning? Summarise the evidence and its implications for safety monitoring.</summary>
+<div class="answer"><p>Often not. Biased few-shot prompts shift answers without the bias being mentioned (Turpin 2023); truncating or corrupting chains sometimes barely changes answers (Lanham 2023); reasoning models used inserted hints but verbalised them in only about 25–40% of cases, and exploited reward hacks while rarely saying so (Chen et al. 2025). Yet chains clearly contain useful computation and often do reveal intentions. Implications: chain-of-thought monitoring is a valuable but incomplete signal; combine it with monitoring of actions and outcomes, sandboxing and permission limits; avoid training directly against undesirable thoughts, which may teach concealment; and measure monitorability as a property of models.</p></div>
+</details>
+
+<details class="qa" data-id="ch05-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> Self-consistency samples are not independent in practice. How does correlation change the analysis?</summary>
+<div class="answer"><p>If chains share systematic biases, the effective sample size is smaller: with pairwise correlation \(\varrho\) between correctness indicators, the variance of the fraction correct is \(p(1-p)[1/k+\varrho(1-1/k)]\), which tends to \(\varrho p(1-p)\), not zero. Voting then plateaus below 1 even when \(p>1/2\). Empirically, questions split into "model knows" (high \(p\), voting helps) and "model wrong in a consistent way" (voting hurts or does nothing), producing saturation. Remedies: diversify (different prompts, models or decompositions), use verifiers instead of votes, or improve the model.</p></div>
+</details>
+
+<details class="qa" data-id="ch05-qa-12">
+<summary><span class="lvl deep">Deep-dive</span> Formalise the optimal reasoning budget for an agent step.</summary>
+<div class="answer"><p>Minimise \(L(B)=U\epsilon(B)(1-r)+\kappa_{\text{out}}B+\lambda_\ell B/v_{\text{dec}}\), where \(\lambda_\ell\) is the value of time. With \(\epsilon\) convex decreasing, the optimum satisfies \(-U(1-r)\epsilon'(B^*)=\kappa_{\text{out}}+\lambda_\ell/v_{\text{dec}}\). If \(\epsilon(B)\approx a-b\log B\) over a range (log-linear scaling), \(\epsilon'=-b/B\), giving \(B^*=U(1-r)b/(\kappa_{\text{out}}+\lambda_\ell/v_{\text{dec}})\): the budget scales linearly with the stakes and the miss probability. With \(U=\$50\), \(1-r=0.7\), \(b=0.05\) per e-fold and \(\kappa_{\text{out}}=1.5\times10^{-5}\) (ignoring time), \(B^*\approx117{,}000\) tokens; including time at $0.01 per second (\(\lambda_\ell/v_{\text{dec}}\approx1.7\times10^{-4}\) per token) gives about 9,600. Time, not money, often binds.</p></div>
+</details>
+
+<details class="qa" data-id="ch05-qa-13">
+<summary><span class="lvl design">Design</span> You are building a support agent that must decide refund eligibility under a complex policy. How would you use reasoning techniques?</summary>
+<div class="answer"><p>First, move the deterministic parts into code: an eligibility tool that applies fare rules, dates and amounts, so the model need not compute them. Use the model to interpret the customer's situation into the tool's inputs, with chain-of-thought reasoning before the call. For ambiguous cases, sample several interpretations and vote on the eligibility label, or use a reasoning model with a moderate budget; escalate when votes disagree (low agreement is a useful confidence signal). Log reasoning for audit, but rely on the tool and policy checks for guarantees. Evaluate on labelled historical cases, including adversarial ones, measuring accuracy, escalation rate, cost and latency.</p></div>
+</details>
+
+<details class="qa" data-id="ch05-qa-14">
+<summary><span class="lvl design">Design</span> A coding agent built on a reasoning model is too slow. Where do you look?</summary>
+<div class="answer"><p>Measure reasoning tokens per step by step type. Typically most time goes to thinking on routine steps. Remedies: lower effort/budget for execution steps and keep high effort for planning and diagnosis; use a non-reasoning or smaller model for routine actions in a two-model design; make tools do more per call to reduce steps; run independent tool calls in parallel; cap visible output; and cache contexts. Check quality on an evaluation set after each change, since some routine steps may depend on thinking more than expected.</p></div>
+</details>
+
+<details class="qa" data-id="ch05-qa-15">
+<summary><span class="lvl design">Design</span> How would you evaluate whether adding chain-of-thought reasoning to an agent's tool calls is worth it?</summary>
+<div class="answer"><p>Run the agent on a fixed task set with and without reasoning (and at several budgets), measuring success rate, pass^k, per-step error rates by step type, output tokens, latency and cost per successful task. Look at where reasoning changes actions (by replaying steps with and without it). Expect large gains on multi-step decisions and little on routine ones; set budgets accordingly. Also check side effects: longer contexts from reasoning text (if kept in history), and whether reasoning is used for monitoring.</p></div>
+</details>
+
+<details class="qa" data-id="ch05-qa-16">
+<summary><span class="lvl core">Core</span> Why did chain-of-thought prompting hurt small models in the original study?</summary>
+<div class="answer"><p>Small models could imitate the form of a reasoning chain without its substance: fluent steps with logical or arithmetic errors, which then determined a wrong answer. Without the chain they sometimes guessed better. The ability to produce correct intermediate steps emerged with scale, so the benefit appeared only above roughly 10B parameters. Today's small models, trained on reasoning data and distilled from large reasoning models, benefit from reasoning much more than the small models of 2022.</p></div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="ref-feng">G. Feng et al. Towards Revealing the Mystery behind Chain of Thought: A Theoretical Perspective. <em>NeurIPS</em>, 2023. <a href="https://arxiv.org/abs/2305.15408">arXiv:2305.15408</a>.</li>
+<li id="ref-merrill">W. Merrill and A. Sabharwal. The Expressive Power of Transformers with Chain of Thought. <em>ICLR</em>, 2024. <a href="https://arxiv.org/abs/2310.07923">arXiv:2310.07923</a>.</li>
+<li id="ref-scratchpad">M. Nye et al. Show Your Work: Scratchpads for Intermediate Computation with Language Models. 2021. <a href="https://arxiv.org/abs/2112.00114">arXiv:2112.00114</a>.</li>
+<li id="ref-cot">J. Wei et al. Chain-of-Thought Prompting Elicits Reasoning in Large Language Models. <em>NeurIPS</em>, 2022. <a href="https://arxiv.org/abs/2201.11903">arXiv:2201.11903</a>.</li>
+<li id="ref-kojima">T. Kojima, S. S. Gu, M. Reid, Y. Matsuo, Y. Iwasawa. Large Language Models are Zero-Shot Reasoners. <em>NeurIPS</em>, 2022. <a href="https://arxiv.org/abs/2205.11916">arXiv:2205.11916</a>.</li>
+<li id="ref-locality">B. Prystawski, M. Y. Li, N. D. Goodman. Why think step by step? Reasoning emerges from the locality of experience. <em>NeurIPS</em>, 2023. <a href="https://arxiv.org/abs/2304.03843">arXiv:2304.03843</a>.</li>
+<li id="ref-selfconsistency">X. Wang et al. Self-Consistency Improves Chain of Thought Reasoning in Language Models. <em>ICLR</em>, 2023. <a href="https://arxiv.org/abs/2203.11171">arXiv:2203.11171</a>.</li>
+<li id="ref-leasttomost">D. Zhou et al. Least-to-Most Prompting Enables Complex Reasoning in Large Language Models. <em>ICLR</em>, 2023. <a href="https://arxiv.org/abs/2205.10625">arXiv:2205.10625</a>.</li>
+<li id="ref-pal">L. Gao et al. PAL: Program-aided Language Models. <em>ICML</em>, 2023. <a href="https://arxiv.org/abs/2211.10435">arXiv:2211.10435</a>; W. Chen et al. Program of Thoughts Prompting. <a href="https://arxiv.org/abs/2211.12588">arXiv:2211.12588</a>.</li>
+<li id="ref-o1">OpenAI. Learning to Reason with LLMs. September 2024. <a href="https://openai.com/index/learning-to-reason-with-llms/">openai.com</a>.</li>
+<li id="ref-r1">DeepSeek-AI. DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning. 2025. <a href="https://arxiv.org/abs/2501.12948">arXiv:2501.12948</a>.</li>
+<li id="ref-snell">C. Snell, J. Lee, K. Xu, A. Kumar. Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters. 2024. <a href="https://arxiv.org/abs/2408.03314">arXiv:2408.03314</a>.</li>
+<li id="ref-turpin">M. Turpin, J. Michael, E. Perez, S. Bowman. Language Models Don't Always Say What They Think: Unfaithful Explanations in Chain-of-Thought Prompting. <em>NeurIPS</em>, 2023. <a href="https://arxiv.org/abs/2305.04388">arXiv:2305.04388</a>.</li>
+<li id="ref-lanham">T. Lanham et al. Measuring Faithfulness in Chain-of-Thought Reasoning. 2023. <a href="https://arxiv.org/abs/2307.13702">arXiv:2307.13702</a>.</li>
+<li id="ref-cotfaith">Y. Chen et al. Reasoning Models Don't Always Say What They Think. Anthropic, 2025. <a href="https://arxiv.org/abs/2505.05410">arXiv:2505.05410</a>.</li>
+<li>Further reading: N. de Condorcet, <em>Essai sur l'application de l'analyse à la probabilité des décisions rendues à la pluralité des voix</em>, 1785; T. Korbak et al., Chain of Thought Monitorability: A New and Fragile Opportunity for AI Safety, <a href="https://arxiv.org/abs/2507.11473">arXiv:2507.11473</a>.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

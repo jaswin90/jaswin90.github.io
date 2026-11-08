@@ -1,0 +1,926 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 1 · From Cybernetics to Language Agents — Foundations of Agentic AI</title>
+<meta name="description" content="Chapter 1 of Foundations of Agentic AI: the history of agents from cybernetics, symbolic planning and reinforcement learning to language-model agents, the reliability arithmetic of long tasks, and how agents are measured.">
+<script>try{var t=localStorage.getItem('aai-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script defer src="/library/assets/book-shim.js" data-library="/library/" data-field="/library/AI_Engineering/" data-field-title="AI Engineering"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-chapter="ch01" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Part I · What Is an Agent? — Chapter 1</div>
+<h1 id="top">From Cybernetics to Language Agents</h1>
+<p class="lede">The idea of a machine that perceives, decides and acts is as old as computing. For seventy years it kept running into the same wall: nobody could tell the machine enough about the world. This chapter tells how that wall came down, and what new walls stood behind it.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Ask a modern coding assistant to fix a failing test and watch what it does. It does not simply print an answer. It lists the files in the repository, opens the test, reads the function under test, forms a hypothesis, edits a line, runs the test suite, reads the error message it gets back, and tries again. Five minutes and forty model calls later it reports that the test passes and explains the change. Nothing in that sequence was scripted in advance. At every step a language model looked at everything that had happened so far and chose what to do next. That is what we mean by an <strong>agent</strong>, and since about 2023 such systems have moved from research demonstrations to products used by millions of people.</p>
+<p>The word "agent" is older than the products, and it carries baggage. It has meant a thermostat, a theorem-proving planner, a robot that avoids obstacles, a software process that negotiates with other processes, and a neural network that plays Go. Each of these traditions solved part of the problem and left a precise, nameable part unsolved. Understanding those traditions is not antiquarianism. The questions an interviewer asks about a language agent (how does it recover from errors, how do you know when it is done, why does it loop, how do you keep it safe, why not just train it with reinforcement learning) were all asked before, about other kinds of agents, and the answers then shape the answers now.</p>
+<p>This chapter therefore tells the history of agents as a chain of bottlenecks, in the same style as the companion book <em>Introduction to LLM Engineering</em>. We start with feedback control, move through symbolic planning, situated robotics and the agent-oriented software of the 1990s, then through reinforcement learning's triumphs and its appetite for experience. We then see how large language models supplied the missing ingredient, a broad prior over the world and an interface to it written in natural language, and how the first language agents of 2021–2023 worked and failed. Along the way we derive the single most important formula for anyone building agents, the compounding of per-step errors over a long task, and we define the measurements that the rest of the book uses.</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Define an agent as a closed perception–decision–action loop, and identify the policy, environment, observations and actions in any concrete system.</li>
+<li>For each era (cybernetics, symbolic planning, situated and BDI agents, reinforcement learning, language agents), name the bottleneck it removed and the one it exposed.</li>
+<li>Explain why a pre-trained language model changes the economics of building an agent, and describe the ReAct loop of thought, action and observation.</li>
+<li>Derive the success probability \(\rho^H\) of an \(H\)-step task, and use it to reason about why long tasks fail and what kinds of fixes help.</li>
+<li>Distinguish pass@\(k\) from pass^\(k\), and compute both, including for a population of tasks of varying difficulty.</li>
+<li>Estimate the token cost and wall-clock time of an agent episode with and without prompt caching.</li>
+</ol>
+</div>
+
+<div class="box bridge">
+<div class="box-title">How to read this book</div>
+<p>Each chapter interleaves theory with worked examples, short <em>drills</em> (numerical problems with hidden solutions: do them with pen and paper first), multiple-choice questions and graded interview questions. Click an MCQ option to see whether you were right and why; reveal an interview answer only after answering out loud, then rate yourself. Your answers are saved in your browser, or across devices if you sign in or use a sync link. Symbols are fixed across the book; the <a href="../notation.html">notation page</a> lists them. Three <strong>running examples</strong> recur: the <em>coding agent</em>, which fixes an issue in a Python repository; the <em>support agent</em>, which serves airline customers under a written policy; and the <em>research agent</em>, which searches the web and writes a cited report. Cost arithmetic uses illustrative prices of $3 per million input tokens, $15 per million output tokens and $0.30 per million cached input tokens.</p>
+</div>
+
+<h2 id="s1-1">1.1 What is an agent?</h2>
+<p>Before telling a history we need to know what it is a history of. The most useful definition is also the oldest and the plainest: an <strong>agent</strong> is anything that perceives its environment through sensors and acts on that environment through actuators, and does so repeatedly, so that what it perceives next depends partly on what it did. Russell and Norvig built their textbook around exactly this definition<span class="cite"><a href="#ref-aima">[1]</a></span>. The definition is deliberately broad. A thermostat is an agent: it senses temperature and switches a heater. So is a chess program, a self-driving car and the coding assistant of the opening paragraph. What distinguishes them is not whether they are agents but how good their decisions are, how rich their actions are, and how much of the world they must cope with.</p>
+<p>The essential feature is the <em>loop</em>. A function that maps an input to an output, once, is not an agent; a classifier that labels an image does not see the consequences of its label. An agent's output changes the world, and the changed world becomes its next input. This closure is what makes agents both powerful and difficult. It is powerful because the agent can gather information it did not have at the start, try something, observe the result and adjust. It is difficult because errors are no longer independent: a wrong action at step three changes every observation from step four onwards, and an agent that misreads the situation can dig itself deeper with every step.</p>
+<p>Figure 1.1 draws the loop in the form we will use throughout the book. At step \(t\) the environment is in some state \(s_t\), which the agent usually cannot see directly. It receives an observation \(o_t\): a file's contents, a web page, a customer's message, the output of a test. The agent's decision rule, its <strong>policy</strong> \(\pi\), maps what it knows to an action \(a_t\): open a file, click a link, issue a refund, run a command. The environment responds by moving to a new state and emitting a new observation, and the loop repeats until the task is done, abandoned or out of budget. Chapter 2 makes this precise as a partially observable Markov decision process; for now the picture is enough.</p>
+
+<figure class="diagram" id="fig-1-1">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-label="The agent–environment loop: observation, policy, action, environment">
+<defs><marker id="ah1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker>
+<marker id="ah1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead-acc"/></marker></defs>
+<rect x="60" y="40" width="250" height="150" rx="12" class="bx"/>
+<text x="185" y="66" text-anchor="middle" class="t-b">Agent</text>
+<rect x="85" y="82" width="200" height="40" rx="8" class="bx2"/>
+<text x="185" y="107" text-anchor="middle">what it knows: history hₜ</text>
+<rect x="85" y="134" width="200" height="40" rx="8" class="bx3"/>
+<text x="185" y="159" text-anchor="middle">policy π: hₜ ↦ aₜ</text>
+<line x1="185" y1="122" x2="185" y2="132" class="ln" marker-end="url(#ah1)"/>
+<rect x="420" y="40" width="250" height="150" rx="12" class="bx4"/>
+<text x="545" y="66" text-anchor="middle" class="t-b">Environment</text>
+<text x="545" y="98" text-anchor="middle" class="t-sm">hidden state sₜ</text>
+<text x="545" y="120" text-anchor="middle" class="t-sm">repository · website · database</text>
+<text x="545" y="142" text-anchor="middle" class="t-sm">customer · operating system</text>
+<text x="545" y="170" text-anchor="middle" class="t-xs">sₜ₊₁ ~ P(· | sₜ, aₜ)</text>
+<path d="M310,150 C365,150 365,150 418,150" class="ln-acc" marker-end="url(#ah1a)"/>
+<text x="364" y="140" text-anchor="middle" class="t-acc t-sm">action aₜ</text>
+<path d="M420,80 C365,80 365,80 312,80" class="ln" marker-end="url(#ah1)"/>
+<text x="364" y="72" text-anchor="middle" class="t-sm">observation oₜ</text>
+<rect x="160" y="222" width="400" height="56" rx="8" class="fill-muted"/>
+<text x="360" y="244" text-anchor="middle" class="t-sm">The loop closes: the action changes the world, and the changed world</text>
+<text x="360" y="264" text-anchor="middle" class="t-sm">is what the agent observes next. Errors are therefore not independent.</text>
+</svg>
+<figcaption><b>Figure 1.1 — The agent–environment loop.</b> The agent keeps a history of what it has seen and done; its policy maps that history to an action; the environment changes state and returns an observation. Everything in this book is a refinement of one of these four boxes and arrows.</figcaption></figure>
+
+<p>Look at where the difficulty sits in Figure 1.1. The arrows are easy to draw and, for software environments, easy to build: an observation is a string, an action is a function call. All the intelligence lives in the box labelled "policy". For seventy years the central problem of building agents was how to fill that box. One can write the policy by hand, as a table of rules or a program; one can derive it by searching a model of the world, as planners do; or one can learn it from experience, as reinforcement learning does. Each approach demanded something that was in short supply. Hand-written policies needed programmers to anticipate every situation. Planners needed a complete, correct model of the world written in logic. Learned policies needed millions of trials. The history that follows is the history of those three shortages, and of the moment in 2022 when a fourth approach (borrow a policy from a model that has read most of the internet) briefly seemed to remove all three at once.</p>
+<p>It is worth fixing the running examples in the vocabulary of Figure 1.1 now, since we will lean on them throughout. For the <em>coding agent</em>, the environment is a repository plus a shell; observations are file contents, command outputs and test results; actions are commands such as "open this file", "replace these lines", "run pytest"; the hidden state is everything about the code base the agent has not yet read. For the <em>support agent</em>, the environment is a booking database plus a human customer; observations are the customer's messages and the results of database queries; actions are messages to the customer and tool calls such as "look up reservation" or "issue refund"; the hidden state includes the customer's true intent. For the <em>research agent</em>, the environment is the web; observations are search results and page contents; actions are searches, page fetches and, finally, the written report. Three very different worlds, one loop.</p>
+
+<div class="box def">
+<div class="box-title">Definition — agent, policy, episode</div>
+<p>An <strong>agent</strong> interacts with an environment in discrete steps \(t=1,2,\dots\). At each step it receives an observation \(o_t\in\mathcal O\) and emits an action \(a_t\in\mathcal A\). Its <strong>history</strong> is \(h_t=(o_1,a_1,\dots,a_{t-1},o_t)\). A <strong>policy</strong> is a rule, possibly random, that maps histories to distributions over actions, \(a_t\sim\pi(\cdot\mid h_t)\). An <strong>episode</strong> is one run of the loop from an initial observation to termination, at most \(H\) steps later; the sequence of observations and actions it produces is a <strong>trajectory</strong> \(\tau\).</p>
+</div>
+
+<p>The definition leaves out one thing on purpose: a goal. A thermostat has one (a set temperature) and so does the coding agent (make the test pass), but the goal is not part of the loop; it is part of how we <em>judge</em> the loop. In reinforcement learning the goal is encoded as a reward signal; in classical planning, as a logical formula that the final state must satisfy; in a language agent, usually as a sentence in the first message. How the goal is communicated, and whether the agent's behaviour actually serves it, will turn out to be one of the deepest questions in the book, the subject of the alignment discussion in Chapter 20. With the loop defined, we can ask how the earliest engineers filled the policy box.</p>
+
+<h2 id="s1-2">1.2 Feedback: the cybernetic agent (1943–1960)</h2>
+<p>The first scientific theory of agents came not from computer science, which barely existed, but from wartime control engineering. In 1943 Arturo Rosenblueth, Norbert Wiener and Julian Bigelow published a short paper, "Behavior, Purpose and Teleology", arguing that purposeful behaviour, in animals or machines, could be explained by <em>negative feedback</em>: the system measures the gap between where it is and where it wants to be, and acts to reduce the gap<span class="cite"><a href="#ref-rosenblueth">[2]</a></span>. Wiener had been working on anti-aircraft fire control, where a gun must aim at the predicted position of a manoeuvring aircraft, and he saw the same structure in a hand reaching for a glass. His 1948 book <em>Cybernetics</em> named the field and made "feedback" a household word<span class="cite"><a href="#ref-wiener">[3]</a></span>.</p>
+<p>The cybernetic agent is the thermostat, generalised. It has a set point, a sensor, a comparator and an actuator. Its policy is a fixed mathematical function of the error, often linear, and its intelligence lies entirely in the choice of that function and its gains. Mathematically it is a dynamical system with a control input, and the theory of such systems (stability, overshoot, the trade-off between responsiveness and oscillation) became one of the great successes of twentieth-century applied mathematics. Autopilots, industrial process control and the guidance computers of the Apollo programme were all cybernetic agents in this sense.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — a controller is a policy</div>
+<p>Consider the discrete-time linear system \(s_{t+1}=As_t+Ba_t+w_t\) with noise \(w_t\), and a quadratic cost \(\sum_t (s_t^\top Q_c s_t + a_t^\top R_c a_t)\). The optimal policy is linear, \(a_t=-Ks_t\), where \(K\) is obtained from the discrete algebraic Riccati equation: this is the linear–quadratic regulator. When \(s_t\) is observed only through noisy measurements, the optimal policy feeds a Kalman-filter estimate of \(s_t\) into the same gain (the separation principle). Every element of a modern agent is already here: a state, an observation model, a belief (the Kalman estimate), a policy and a cost. What the linear–quadratic world lacks is everything that makes language agents hard: discrete, combinatorial actions, an environment with no known equations, and goals that cannot be written as a quadratic form.</p>
+</div>
+
+<p>The cybernetic tradition left two permanent contributions. The first is the loop itself, and the insight that robust behaviour comes from <em>correcting</em> errors rather than from never making them. A language agent that runs the tests after every edit, and fixes what the tests report, is a feedback controller in exactly Wiener's sense; Chapter 7 is about this idea. The second is the vocabulary of state, observation and estimation that reinforcement learning later inherited. Its limitation was equally clear. A feedback controller works when we can write down the dynamics and the goal as equations of a few variables. It has nothing to say about how to fix a bug, book a flight or write a report, tasks whose "state" is a code base, a database or the web. For those, the pioneers of the next generation turned from differential equations to symbols and search.</p>
+
+<h2 id="s1-3">1.3 Search and symbols: the planning agent (1956–1985)</h2>
+<p>In 1956, at the Dartmouth workshop that named artificial intelligence, Allen Newell and Herbert Simon demonstrated the Logic Theorist, a program that proved theorems from <em>Principia Mathematica</em> by searching through sequences of inference steps. Their next program, the General Problem Solver (GPS, 1959), generalised the idea into what they called <em>means–ends analysis</em>: compare the current state with the goal, find an operator that reduces the difference, and if that operator cannot yet be applied, make satisfying its preconditions a sub-goal<span class="cite"><a href="#ref-gps">[4]</a></span>. This was the first explicit theory of how an agent could act <em>purposefully in a symbolic world</em>, and its recursive structure (achieve a goal by achieving sub-goals) reappears, almost unchanged, in the "plan-and-execute" agents of Chapter 6.</p>
+<p>The planning tradition reached its classic form at the Stanford Research Institute between 1966 and 1972, with Shakey, the first mobile robot to reason about its own actions. Shakey's planner, STRIPS<span class="cite"><a href="#ref-strips">[5]</a></span>, represented the world as a set of logical facts, such as <code>At(Robot, Room1)</code> and <code>Closed(Door2)</code>, and each action as an <em>operator</em> with preconditions, facts it adds and facts it deletes. A plan is a sequence of operators that transforms the initial set of facts into one satisfying the goal. Finding a plan is a search problem in the space of fact sets, and the same project produced the A* algorithm (Hart, Nilsson and Raphael, 1968)<span class="cite"><a href="#ref-astar">[6]</a></span>, which finds a shortest path in a graph when given an admissible heuristic: an estimate of the remaining distance that never overestimates it.</p>
+
+<div class="box def">
+<div class="box-title">Definition — a STRIPS planning problem</div>
+<p>Let \(F\) be a finite set of propositions. A state is a subset \(s\subseteq F\). An operator is a triple \((\mathrm{pre},\mathrm{add},\mathrm{del})\) of subsets of \(F\); it is applicable in \(s\) if \(\mathrm{pre}\subseteq s\), and then yields \(s'=(s\setminus\mathrm{del})\cup\mathrm{add}\). Given an initial state \(s_0\) and a goal \(\mathcal G\subseteq F\), a <strong>plan</strong> is a sequence of operators whose successive application is defined and produces a state containing \(\mathcal G\). Deciding whether a plan exists is PSPACE-complete in general (Bylander, 1994), because the state space has \(2^{\lvert F\rvert}\) elements and plans can be exponentially long.</p>
+</div>
+
+<p>The planning agent fills the policy box of Figure 1.1 in a principled way: the policy is "search a model of the world for a plan, then execute it". When the model is right, this is enormously powerful. A planner can solve problems it has never seen, guarantee optimality with A*, and explain its decisions by pointing to the plan. Its descendants run logistics, schedule spacecraft and control factory robots to this day, and in Chapter 6 we will see language models used to <em>write</em> planning problems in the PDDL language that grew out of STRIPS, so that a classical planner can solve them.</p>
+<p>Three problems stopped symbolic planning from producing general agents, and each will reappear in modern form. The first is the <strong>frame problem</strong>, posed by McCarthy and Hayes in 1969<span class="cite"><a href="#ref-frame">[7]</a></span>: describing what an action changes is easy, but describing everything it does <em>not</em> change (moving a box does not change the colour of the walls, the time zone, or the price of bread) requires either a vast number of axioms or a closed-world assumption that breaks as soon as the world surprises you. The second is <strong>combinatorial explosion</strong>: realistic problems have so many facts that unguided search is hopeless, and good heuristics must be hand-crafted for each domain. The third, and decisive, is the <strong>knowledge-acquisition bottleneck</strong>. Someone had to write the facts and the operators, by hand, in logic, and keep them consistent with a world that changes. The expert systems of the late 1970s and 1980s, such as MYCIN for diagnosing infections and XCON for configuring computers, ran into the same wall at commercial scale: they worked impressively inside their narrow domains and failed abruptly at the edges, and maintaining their rule bases became more expensive than the value they produced.</p>
+<p>The planning agent's lesson for us is therefore double-edged. Search over a model is a superb way to choose actions, and modern agents that plan, back-track and verify are drawing on it. But a policy is only as good as the model it searches, and nobody can write by hand a model of a code base, a customer or the web. The next generation of researchers drew the conclusion that perhaps agents should not need a model at all.</p>
+
+<h2 id="s1-4">1.4 Situated, rational and software agents (1986–2000)</h2>
+<p>In 1986 Rodney Brooks, building robots at MIT, argued that the planning tradition had the problem backwards<span class="cite"><a href="#ref-brooks">[8]</a></span>. Shakey spent minutes thinking between movements because it maintained a symbolic model of the world and replanned whenever the model changed. Brooks's robots had no central model at all. Their <em>subsumption architecture</em> stacked simple reactive behaviours ("avoid obstacles", "wander", "follow walls") in layers, each mapping sensor readings directly to motor commands, with higher layers able to suppress lower ones. "The world is its own best model," he wrote: rather than represent the world, look at it again. His insect-like robots walked over rough terrain that would have paralysed a planner, and the approach later reached millions of homes in the Roomba vacuum cleaner.</p>
+<p>Reactive agents traded deliberation for robustness. They respond quickly and degrade gracefully, but they cannot pursue a goal that requires a long sequence of non-obvious steps, because nothing in them looks ahead. The 1990s spent much of their effort reconciling the two traditions. The most influential synthesis was the <strong>belief–desire–intention</strong> (BDI) model, grounded in Michael Bratman's philosophy of practical reasoning and turned into an architecture by Anand Rao and Michael Georgeff<span class="cite"><a href="#ref-bdi">[9]</a></span>. A BDI agent maintains <em>beliefs</em> about the world, a set of <em>desires</em> (goals it might pursue), and <em>intentions</em>: the goals and partial plans it has committed to. The crucial idea is commitment. A BDI agent does not replan from scratch at every step, which would be slow and erratic; it sticks with its intentions until they succeed, become impossible, or are overtaken by something more important, and it fills in the details of its plans only as it goes.</p>
+<p>BDI agents were deployed in air-traffic management and telecommunications, and the decade also produced the idea of <strong>multi-agent systems</strong>: populations of software agents with their own goals, communicating through agent communication languages and negotiating with protocols borrowed from economics. Wooldridge and Jennings's 1995 survey<span class="cite"><a href="#ref-wooldridge">[10]</a></span> listed the properties such agents should have, and the list reads like a product brief for 2025: <em>autonomy</em> (operating without direct human intervention), <em>social ability</em> (interacting with other agents and humans), <em>reactivity</em> (responding to changes in a timely way) and <em>pro-activeness</em> (taking the initiative in pursuit of goals). Russell and Norvig's 1995 textbook<span class="cite"><a href="#ref-aima">[1]</a></span> reorganised the whole of AI around the <em>rational agent</em>, one that acts to maximise its expected performance measure given what it has perceived, and that framing is the one this book adopts.</p>
+<p>What the 1990s did not solve was the knowledge problem. A BDI agent's plans came from a hand-written plan library; a multi-agent marketplace needed hand-written ontologies so that agents could understand each other's messages. The vision was right and the architecture was sensible, but filling the policy box still required people to write down, in advance, what to do in every circumstance that mattered. The obvious alternative, which had been developing quietly alongside, was to let the agent learn what to do from experience.</p>
+
+<h2 id="s1-5">1.5 Learning to act: reinforcement learning (1989–2019)</h2>
+<p>Reinforcement learning (RL) replaces the hand-written policy with a learned one. The agent is given a scalar <strong>reward</strong> \(r_t\) after each step and must learn a policy that maximises the expected sum of rewards, without being told which actions are good. The mathematical foundation is Bellman's dynamic programming of the 1950s; the learning algorithms came later. Sutton's temporal-difference learning (1988) and Watkins's Q-learning (1989) showed how to learn the value of states and actions from sampled experience alone, by nudging each estimate towards the reward just received plus the estimated value of where the agent ended up<span class="cite"><a href="#ref-sutton">[11]</a></span>. For the first time an agent could improve itself without anyone writing a model of the world or a rule for each situation.</p>
+<p>The first spectacular success was Gerald Tesauro's TD-Gammon (1992–1995), a small neural network that learned backgammon by playing against itself and reached the level of the best human players<span class="cite"><a href="#ref-tdgammon">[12]</a></span>. Then, for almost two decades, progress was steady but unspectacular, because the tabular and linear methods of the time could not handle large observation spaces. The breakthrough came when RL was combined with deep networks. DeepMind's Deep Q-Network (DQN), announced in 2013 and published in <em>Nature</em> in 2015, learned to play 49 Atari games from raw pixels and the score alone, reaching at least three-quarters of a professional human tester's score on 29 of them, with one architecture and one set of hyperparameters<span class="cite"><a href="#ref-dqn">[13]</a></span>. AlphaGo defeated Lee Sedol at Go in March 2016<span class="cite"><a href="#ref-alphago">[14]</a></span>, combining a learned policy and value network with Monte Carlo tree search (the planning tradition again, now guided by learned heuristics). AlphaGo Zero (2017) learned Go with no human games at all, and OpenAI Five and AlphaStar reached professional level in the team video games Dota 2 and StarCraft II by 2019.</p>
+<p>These systems were agents in the full sense of Figure 1.1, and they were superhuman. Why did they not lead directly to agents that could fix bugs or book flights? Three walls stood in the way, and each one is a precise statement about what a policy needs.</p>
+<p>The first wall is <strong>sample efficiency</strong>. DQN was trained on 50 million frames for each game, which its authors equate to about 38 days of continuous play, to reach a level a human reaches in a couple of hours. OpenAI Five played the equivalent of about 45,000 years of Dota 2 over ten months of training. Such numbers are affordable in a simulator that runs thousands of times faster than real time; they are unthinkable for an agent whose every action costs real money, touches a real customer or modifies a real code base. The second wall is <strong>reward specification</strong>. A game comes with a score. Most useful tasks do not, and an agent that maximises a carelessly written reward will find and exploit every loophole in it, a phenomenon known as <em>reward hacking</em> that we will meet again in Chapter 18. The third wall, and the deepest, is the <strong>absence of priors</strong>. A deep RL agent starts as a randomly initialised network. It does not know that doors open, that text on a screen means something, or that a failing test suggests a bug in the function it tests. Everything must be learned from the reward signal, in each new environment, from scratch.</p>
+<p>Put the three walls together and the problem of the policy box looks like this. Symbolic AI could not write down enough knowledge about the world; reinforcement learning could not gather enough experience of it. What was needed was a source of broad, general knowledge about the world (what things are, how they work, what people usually do next) that an agent could start from, so that learning or search would only have to fill in the details. Between 2018 and 2020 such a source appeared, from a direction almost nobody in the agents community was watching.</p>
+
+<h2 id="s1-6">1.6 Language models as priors (2018–2022)</h2>
+<p>A language model is trained to predict the next token of text, and nothing more. The companion book tells the story of how that objective, applied with the Transformer architecture to ever larger corpora, produced models of startling generality; here we need only the consequence. To predict the next word of a recipe, a stack-overflow answer, a legal contract, a bug report and its fix, a model must represent, implicitly, an enormous amount about the world those texts describe: that ovens are preheated before baking, that a <code>KeyError</code> means a dictionary lacks a key, that a refund usually requires a booking reference. Pre-training on trillions of tokens is, among other things, a way of compressing the accumulated written experience of humanity into a conditional distribution \(p_\theta(x_i\mid x_{&lt;i})\).</p>
+<p>The moment this mattered for agents was GPT-3 in 2020<span class="cite"><a href="#ref-gpt3">[15]</a></span>. Brown and colleagues showed that a 175-billion-parameter model could perform tasks it was never trained on, given only a description and a few examples in its prompt: translate, answer questions, unscramble words, write simple code. They called this <strong>in-context learning</strong>. For anyone thinking about policies the implication was immediate. Here was a function that, given a description of a situation in words, produced a plausible next step in words, with no task-specific training at all. If the situation could be described as text and the action expressed as text, the language model <em>was</em> a policy, and it came with the broad prior that reinforcement learning lacked. It knew roughly what doors, files, flights and functions are.</p>
+<p>Two further developments made the prior usable. The first was <strong>instruction tuning and reinforcement learning from human feedback</strong>. InstructGPT (Ouyang et al., 2022)<span class="cite"><a href="#ref-instructgpt">[16]</a></span> fine-tuned GPT-3 on demonstrations of following instructions and then optimised it against a reward model trained on human preferences, and a 1.3-billion-parameter InstructGPT was preferred by human raters over the 175-billion-parameter GPT-3. A raw pre-trained model continues text; an instruction-tuned model does what it is asked, which is what a policy must do. Chapter 3 explains both stages, and Chapter 17 derives the mathematics. The second development was <strong>chain-of-thought prompting</strong> (Wei et al., January 2022)<span class="cite"><a href="#ref-cot">[17]</a></span>: asking the model to write out intermediate reasoning before its answer substantially improved accuracy on multi-step problems. A policy that can deliberate in words before choosing an action is far more capable than one that must answer in a single step, and Chapter 5 is devoted to why.</p>
+<p>It is important to be precise about what the language model did and did not supply. It supplied a <em>prior over behaviour</em>: given a description of a situation, a distribution over sensible things to do next, drawn from everything humans have written about similar situations. It did not supply <em>grounding</em>. A model trained on text has never run a command or seen the result; it can only guess what a file contains, and when it guesses wrong it does so fluently. It did not supply <em>memory</em> beyond its context window, nor <em>reliability</em>: a model that is right 90% of the time on each step is, as §1.8 shows, nearly useless over a long task. The first language agents were attempts to supply grounding by closing the loop of Figure 1.1, letting the model act, and writing the results back into its context.</p>
+
+<h2 id="s1-7">1.7 The first language agents (2021–2023)</h2>
+<p>The earliest systems that used a language model as the policy of an agent all appeared within about eighteen months, from several laboratories at once, which is usually the sign that an idea's time has come. Each solved the grounding problem for one kind of environment.</p>
+<p><strong>WebGPT</strong> (OpenAI, December 2021)<span class="cite"><a href="#ref-webgpt">[18]</a></span> fine-tuned GPT-3 to answer questions by operating a text-based web browser. The model's actions were commands such as <code>Search</code>, <code>Click on link</code>, <code>Quote</code> and <code>Scroll</code>, emitted as text; the browser's responses were written back into the prompt. It was trained first by imitating human demonstrations and then with rejection sampling against a learned reward model, and its answers, which cited the pages they quoted, were preferred to human-written answers more than half the time. It is the direct ancestor of the research agent in this book. <strong>SayCan</strong> (Google, April 2022)<span class="cite"><a href="#ref-saycan">[19]</a></span> grounded a language model in a robot: the model scored how useful each of the robot's pre-trained skills would be for an instruction such as "I spilled my drink, can you help?", and a learned value function scored how likely each skill was to succeed from the robot's current state. Multiplying the two, "say" times "can", chose the action. <strong>MRKL</strong> (AI21, May 2022)<span class="cite"><a href="#ref-mrkl">[20]</a></span> proposed a modular architecture in which a language model routes sub-problems to external "experts" such as a calculator, a database or a weather API, the conceptual seed of tool calling.</p>
+<p>The design that unified these threads and became the template for nearly everything since was <strong>ReAct</strong>, by Shunyu Yao and colleagues at Princeton and Google, released in October 2022<span class="cite"><a href="#ref-react">[21]</a></span>. ReAct's insight is to interleave two kinds of output in a single text stream: <em>thoughts</em>, free-form reasoning that does not affect the environment, and <em>actions</em>, structured commands that do. After each action the environment's response is appended as an <em>observation</em>, and the model continues. Reasoning helps the model decide what to do and keep track of what it has learned; acting lets it gather the information that reasoning alone would have to hallucinate. On the question-answering benchmark HotpotQA, chain-of-thought alone often invented facts, and acting alone often wandered; the combination, with a simple Wikipedia search tool, did markedly better on fact verification and was far more interpretable. Figure 1.2 shows the shape of a ReAct trajectory for the research agent.</p>
+
+<figure class="diagram" id="fig-1-2">
+<svg class="dg" viewBox="0 0 720 340" role="img" aria-label="A ReAct trajectory interleaving thoughts, actions and observations">
+<defs><marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<text x="20" y="24" class="t-b">Task: "In what year was the lab that built Shakey founded?"</text>
+<rect x="20" y="40" width="80" height="34" rx="6" class="bx2"/><text x="60" y="62" text-anchor="middle" class="t-sm">Thought</text>
+<text x="112" y="62" class="t-sm">Shakey was built at SRI. I need SRI's founding year.</text>
+<rect x="20" y="84" width="80" height="34" rx="6" class="bx3"/><text x="60" y="106" text-anchor="middle" class="t-sm">Action</text>
+<text x="112" y="106" class="t-sm" font-family="JetBrains Mono, monospace">search("SRI International founded")</text>
+<rect x="20" y="128" width="80" height="34" rx="6" class="bx4"/><text x="60" y="150" text-anchor="middle" class="t-sm">Observation</text>
+<text x="112" y="150" class="t-sm">"SRI International … established in 1946 as Stanford Research Institute …"</text>
+<rect x="20" y="172" width="80" height="34" rx="6" class="bx2"/><text x="60" y="194" text-anchor="middle" class="t-sm">Thought</text>
+<text x="112" y="194" class="t-sm">Confirm Shakey was built there, not at Stanford University.</text>
+<rect x="20" y="216" width="80" height="34" rx="6" class="bx3"/><text x="60" y="238" text-anchor="middle" class="t-sm">Action</text>
+<text x="112" y="238" class="t-sm" font-family="JetBrains Mono, monospace">search("Shakey robot")</text>
+<rect x="20" y="260" width="80" height="34" rx="6" class="bx4"/><text x="60" y="282" text-anchor="middle" class="t-sm">Observation</text>
+<text x="112" y="282" class="t-sm">"Shakey … developed at the SRI Artificial Intelligence Center, 1966–1972"</text>
+<rect x="20" y="304" width="80" height="30" rx="6" class="fill-acc"/><text x="60" y="324" text-anchor="middle" class="t-sm t-on">Answer</text>
+<text x="112" y="324" class="t-sm">1946 (as Stanford Research Institute).</text>
+<line x1="690" y1="50" x2="690" y2="320" class="ln" marker-end="url(#ah2)"/>
+<text x="680" y="190" text-anchor="end" class="t-xs" transform="rotate(-90 680 190)">context cₜ grows with every step</text>
+</svg>
+<figcaption><b>Figure 1.2 — A ReAct trajectory.</b> The model writes thoughts (reasoning that does not touch the world) and actions (commands that do); the harness executes each action and appends the result as an observation. The whole history stays in the context, so each step is conditioned on everything before it.</figcaption></figure>
+
+<p>Figure 1.2 repays a careful reading, because three features of every modern agent are already visible in it. First, the policy is the language model conditioned on the whole history: the second thought ("confirm Shakey was built there") is only possible because the first observation is in the context. The context is the agent's entire working memory, a point Chapter 2 formalises and Chapter 4 turns into an engineering discipline. Second, the program around the model, which we will call the <strong>harness</strong> (or <em>scaffold</em>), does real work: it parses the action out of the text, executes it, formats the result and decides when to stop. Third, the context grows with every step, and every later model call must read all of it. In Figure 1.2 this is harmless; in a coding episode of forty steps that reads large files, it dominates the cost, as §1.10 computes.</p>
+<p>Within months the remaining pieces arrived. <strong>Toolformer</strong> (Meta, February 2023)<span class="cite"><a href="#ref-toolformer">[22]</a></span> showed that a model could teach itself when to call APIs (a calculator, a search engine, a calendar) by inserting candidate calls into text and keeping those that made the following tokens more predictable, the beginning of training models to use tools rather than prompting them to. <strong>Reflexion</strong> (March 2023)<span class="cite"><a href="#ref-reflexion">[23]</a></span> had the agent write a verbal post-mortem after a failed attempt and condition its next attempt on it, a form of learning that changes the context rather than the weights (Chapter 7). <strong>Generative Agents</strong> (Park et al., April 2023)<span class="cite"><a href="#ref-genagents">[24]</a></span> populated a simulated village with 25 language agents that remembered, reflected and planned their days, and introduced a memory architecture that Chapter 13 dissects. <strong>Voyager</strong> (May 2023)<span class="cite"><a href="#ref-voyager">[25]</a></span> played Minecraft by writing code for new skills, testing them, and storing the working ones in a growing library, an agent that accumulated competence. By mid-2023 the basic vocabulary of the field (reasoning, tools, observations, reflection, memory, skills) was in place.</p>
+
+<h2 id="s1-8">1.8 The 2023 moment, and the arithmetic of long tasks</h2>
+<p>In late March 2023, days after GPT-4's release, an open-source project called <strong>Auto-GPT</strong> appeared on GitHub. It wrapped GPT-4 in a loop: given a high-level goal such as "grow my business", the model would write itself a task list, choose a task, execute it with tools (web search, file writing, code execution), record the result in a memory, and continue indefinitely. A similar project, BabyAGI, appeared the same week. Auto-GPT became one of the fastest-growing repositories in GitHub's history, and for a few weeks "autonomous agents" were the most discussed topic in technology. The demonstrations were exciting. The results, for almost everyone who tried to use them for real work, were disappointing. The agents looped, repeating the same search; they lost track of the goal; they declared success on tasks they had not done; and they consumed a great deal of money in API calls doing so.</p>
+<p>Why did a system built from the most capable model of its day fail so reliably? The simplest model of the answer is also the most important formula in this book. Suppose a task requires \(H\) steps, each step must be done correctly for the task to succeed, and the agent gets each step right with probability \(\rho\), independently of the others. Then</p>
+<div class="box formula">
+\[ \Pr[\text{task succeeds}] \;=\; \rho^{H} \;=\; e^{H\ln\rho} \;\approx\; e^{-H(1-\rho)} \quad\text{for } \rho \text{ near } 1. \]
+</div>
+<p>The approximation uses \(\ln\rho\approx-(1-\rho)\) and shows what really matters: success decays exponentially in the product of the horizon and the per-step <em>error</em> rate \(1-\rho\). An agent that is right 95% of the time on each step, a figure that sounds excellent, succeeds on a 10-step task with probability \(0.95^{10}\approx0.60\) and on a 50-step task with probability \(0.95^{50}\approx0.077\). The horizon at which success falls to one half is \(H_{1/2}=\ln 2/(-\ln\rho)\approx 0.69/(1-\rho)\): about 14 steps at \(\rho=0.95\), 69 steps at \(\rho=0.99\) and 693 steps at \(\rho=0.999\). Every factor of ten in reliability buys a factor of ten in the length of task the agent can complete. Figure 1.3 plots the curves.</p>
+
+<figure class="chart" id="fig-1-3">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Task success ρ^H versus horizon H","height":340,
+ "x":{"label":"Number of steps H","min":0,"max":100,"ticks":[0,10,20,30,40,50,60,70,80,90,100]},
+ "y":{"label":"Probability the whole task succeeds","min":0,"max":1,"fmt":"pct"},
+ "hlines":[{"y":0.5,"text":"50%"}],
+ "series":[
+  {"name":"ρ = 0.90","color":"s2","markers":false,"points":[[0,1],[5,0.5905],[10,0.3487],[15,0.2059],[20,0.1216],[25,0.0718],[30,0.0424],[40,0.0148],[50,0.0052],[60,0.0018],[80,0.0002],[100,0.00003]]},
+  {"name":"ρ = 0.95","color":"s1","markers":false,"points":[[0,1],[5,0.7738],[10,0.5987],[15,0.4633],[20,0.3585],[25,0.2774],[30,0.2146],[40,0.1285],[50,0.0769],[60,0.0461],[80,0.0165],[100,0.0059]]},
+  {"name":"ρ = 0.99","color":"s3","markers":false,"points":[[0,1],[10,0.9044],[20,0.8179],[30,0.7397],[40,0.6690],[50,0.6050],[60,0.5472],[70,0.4948],[80,0.4475],[90,0.4047],[100,0.3660]]}
+ ]}
+</script>
+<figcaption><b>Figure 1.3 — Compounding error.</b> If each of \(H\) steps succeeds independently with probability \(\rho\), the task succeeds with probability \(\rho^H\). The dashed line marks 50%, reached at about 7, 14 and 69 steps for \(\rho=0.90, 0.95, 0.99\).</figcaption></figure>
+
+<p>Figure 1.3 explains the Auto-GPT experience. A goal such as "research the market and write a business plan" requires dozens of steps, and the GPT-4 of early 2023, operating through an untested harness with no recovery mechanism, was perhaps 90% reliable per step on such work. The blue curve (\(\rho=0.95\)) is already below 10% by fifty steps; the orange curve (\(\rho=0.90\)) is below 1%. No amount of cleverness in the task list could rescue an exponential.</p>
+<p>The model is crude, and Chapter 2 refines it, but its crudeness is instructive because each of its assumptions points to a remedy. The model assumes every step must be right, so a single error is fatal; real agents can <strong>detect and recover</strong> from errors (run the test again, notice the search returned nothing useful), which converts some failures into a few extra steps rather than a failed task, and Chapter 2 shows that recovery changes the exponential decay into something much gentler. It assumes \(\rho\) is fixed; better models, better tools and better context <strong>raise \(\rho\)</strong>, and since \(H_{1/2}\) scales as \(1/(1-\rho)\), improving per-step reliability from 95% to 99% multiplies the feasible horizon by five. It assumes the task needs \(H\) steps; good tool design and decomposition <strong>shorten \(H\)</strong>, for example a single "run the test suite and summarise failures" tool in place of five separate commands. And it assumes independence; in reality errors are correlated (an agent that misunderstood the task gets every step wrong), which is why <strong>verification against the goal</strong>, by tests, by checkers or by a human, matters so much. Almost every technique in Parts II–IV of this book can be classified by which of these four levers it pulls.</p>
+
+<details class="drill">
+<summary>Drill 1.1 — How reliable must each step be?</summary>
+<p>You want the coding agent to complete a 50-step task with probability at least 90%, with no error recovery. What per-step reliability is needed? Solve \(\rho^{50}\ge0.9\): \(\rho\ge0.9^{1/50}=e^{\ln 0.9/50}=e^{-0.10536/50}=e^{-0.002107}\approx0.99789\). Each step must succeed 99.79% of the time: about one error in 475 steps. If instead the agent can detect and fix any error at the cost of two extra steps, the requirement is completely different; Chapter 2 computes it. The lesson: without recovery, long-horizon reliability demands per-step accuracy far beyond what any 2023 model offered.</p>
+</details>
+
+<h2 id="s1-9">1.9 Making agents work (2023–2026)</h2>
+<p>The years after Auto-GPT were spent pulling the four levers of §1.8, and the result was a sequence of genuinely useful agents. It is easiest to understand as a chain of bottlenecks.</p>
+<p><em>Bottleneck: parsing.</em> Early agents asked the model to write actions in an ad-hoc text format and parsed them with regular expressions; a misplaced bracket was a failed step. In June 2023 OpenAI added <strong>function calling</strong> to its API: the developer declares tools as JSON schemas, and the model, fine-tuned for the purpose, emits a structured call that the harness can execute directly. Anthropic, Google and the open-model ecosystem followed, and constrained decoding later made schema-valid output guaranteed rather than merely likely (Chapter 8). A whole class of per-step errors disappeared, raising \(\rho\).</p>
+<p><em>Bottleneck: measurement.</em> In October 2023 Jimenez and colleagues released <strong>SWE-bench</strong><span class="cite"><a href="#ref-swebench">[26]</a></span>: 2,294 real GitHub issues from twelve popular Python repositories, each paired with the tests that the human fix made pass. A system is given the repository and the issue text and must produce a patch; it succeeds if the hidden tests pass. At release the best system resolved under 2% of issues. The benchmark gave the field what Atari had given deep RL, a hard, realistic, automatically scored target, and its curated 500-task subset, <strong>SWE-bench Verified</strong> (August 2024), became the standard yardstick for coding agents. Figure 1.4 below tracks it.</p>
+<p><em>Bottleneck: the interface.</em> In May 2024 the SWE-agent paper<span class="cite"><a href="#ref-sweagent">[27]</a></span> showed that the design of the tools themselves, which it called the <strong>agent–computer interface</strong>, mattered as much as the model: a file viewer that shows a hundred lines with line numbers, an editor that rejects edits that break the syntax, and a search command with concise output raised GPT-4's resolution rate several-fold compared with a raw shell. Tools designed for models, not for humans, shorten \(H\) and raise \(\rho\) at once (Chapter 10).</p>
+<p><em>Bottleneck: reasoning per step.</em> In September 2024 OpenAI released o1, the first widely available <strong>reasoning model</strong>, trained with reinforcement learning to think at length before answering; DeepSeek-R1 (January 2025)<span class="cite"><a href="#ref-r1">[28]</a></span> showed openly how such training works with rewards that can be checked automatically. Spending more computation on each decision raises per-step reliability on hard steps (Chapter 5), and training on whole agentic tasks with verifiable rewards (Chapter 18) teaches recovery behaviours that prompting never produced.</p>
+<p><em>Bottleneck: reach.</em> In October 2024 Anthropic released <strong>computer use</strong>, letting a model operate a desktop through screenshots, mouse and keyboard, and benchmarks such as OSWorld measured how far such agents had to go (Chapter 11). In November 2024 it published the <strong>Model Context Protocol</strong> (MCP)<span class="cite"><a href="#ref-mcp">[29]</a></span>, an open standard for connecting models to tools and data sources, which was adopted across the industry within months (Chapter 12). Agents could now act on almost any software a person could.</p>
+<p><em>Bottleneck: horizon.</em> Through 2025, coding agents that run in a terminal or a cloud sandbox for minutes to hours (Claude Code, OpenAI's Codex, Cursor's agent mode, Devin and others) and <strong>deep research</strong> agents that read hundreds of pages before writing a report became everyday tools. Making them work required managing a context that overflows (compaction, notes, sub-agents; Chapter 14) and keeping them safe while they act with real permissions (Chapter 20).</p>
+
+<figure class="chart" id="fig-1-4">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Best reported resolution rate on SWE-bench Verified (approximate)","height":330,
+ "x":{"label":"Date","min":2024.5,"max":2026,"fmt":"year","ticks":[2025,2026]},
+ "y":{"label":"Issues resolved","min":0,"max":1,"fmt":"pct"},
+ "series":[{"name":"Frontier systems","color":"s1","labels":true,"points":[
+  [2024.6,0.332,"GPT-4o (Aug 2024)",{"dx":7,"dy":14}],[2024.81,0.49,"Claude 3.5 Sonnet (Oct 2024)",{"dx":7,"dy":14}],[2025.15,0.623,"Claude 3.7 Sonnet",{"dx":7,"dy":14}],[2025.39,0.727,"Claude Sonnet 4",{"dx":7,"dy":14}],[2025.74,0.772,"Claude Sonnet 4.5",{"dx":-8,"dy":-10,"a":"end"}]]}]}
+</script>
+<figcaption><b>Figure 1.4 — Coding agents on SWE-bench Verified.</b> Best single-attempt resolution rates as reported by developers at release (scaffolds differ, so treat the points as approximate). For comparison, the best system on the original SWE-bench resolved under 2% of issues in October 2023.</figcaption></figure>
+
+<p>Figure 1.4 shows the outcome of pulling all the levers together on a single benchmark: from about a third of real issues resolved in mid-2024 to more than three-quarters a year later. Two cautions are needed when reading such a chart, and an interviewer will expect you to give them. First, the points are developer-reported numbers with different scaffolds, sampling settings and occasionally different task subsets; they show the trend, not a controlled comparison (Chapter 19 discusses how to compare agents properly). Second, a benchmark that is heavily optimised against saturates, and its remaining failures are often ambiguous or under-specified tasks rather than hard ones; SWE-bench Verified was itself created because human annotators found that a large fraction of the original tasks had under-specified issue texts or tests that rejected valid fixes.</p>
+<p>A more general measure was proposed in March 2025 by Kwa and colleagues at METR<span class="cite"><a href="#ref-metr">[30]</a></span>. They timed skilled humans on a suite of software and research tasks ranging from seconds to many hours, ran AI agents on the same tasks, and for each model computed its <strong>50% time horizon</strong>: the length of task, measured in human time, that the model completes with probability one half. Figure 1.5 plots their estimates on a logarithmic axis. The striking finding is how straight the line is: the time horizon of frontier models doubled roughly every seven months between 2019 and 2025, from a few seconds for GPT-2 to around an hour for the best models of early 2025 and over two hours by the second half of the year.</p>
+
+<figure class="chart" id="fig-1-5">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"50% time horizon of frontier models (METR, approximate)","height":360,
+ "x":{"label":"Model release date","min":2019,"max":2026,"fmt":"year","ticks":[2019,2020,2021,2022,2023,2024,2025,2026]},
+ "y":{"label":"Human task length (minutes, log)","log":true,"min":0.01,"max":1000},
+ "hlines":[{"y":60}],
+ "series":[{"name":"50% time horizon","color":"s3","labels":true,"points":[
+  [2019.1,0.033,"GPT-2",{"dx":7,"dy":4}],[2020.45,0.15,"GPT-3",{"dx":7,"dy":4}],[2022.2,0.6,"GPT-3.5",{"dx":7,"dy":4}],[2023.2,5,"GPT-4",{"dx":-8,"dy":-6,"a":"end"}],[2024.37,8,"GPT-4o",{"dx":7,"dy":12}],[2024.8,28,"Claude 3.5 Sonnet",{"dx":-8,"dy":4,"a":"end"}],[2024.96,39,"o1",{"dx":4,"dy":18}],[2025.15,59,"Claude 3.7 Sonnet",{"dx":-8,"dy":-12,"a":"end"}],[2025.3,91,"o3",{"dx":8,"dy":14}],[2025.6,137,"GPT-5",{"dx":0,"dy":-10,"a":"middle"}]]}]}
+</script>
+<figcaption><b>Figure 1.5 — The length of tasks agents can do.</b> For each model, the human time needed for tasks the model completes half of the time, as estimated by METR on a suite of software and research tasks. The dashed line marks one hour. The points lie close to a straight line on the log scale, a doubling roughly every seven months. Values are read approximately from the published estimates and carry wide error bars.</figcaption></figure>
+
+<p>How should a mathematician read Figure 1.5? A straight line on a log scale is exponential growth, and seven-month doubling is a growth factor of about \(2^{12/7}\approx3.3\) per year. Extrapolations of such curves are dangerous (the measurement is noisy, the task suite is specific, and the 50% threshold says nothing about the 99% reliability a production system needs), but the figure makes one point unarguable: the horizon over which agents are useful has been growing fast and steadily, and it is the horizon, through \(\rho^H\), that decides whether an agent is a toy or a tool. Note also that the time horizon at 80% success, which METR also reports, is several times shorter than at 50%. The gap between "sometimes works" and "reliably works" is exactly the gap between the curves of Figure 1.3.</p>
+<p>By 2025 the typical language agent had settled into a recognisable anatomy, drawn in Figure 1.6. Its policy is a language model; the harness builds the context for each call from a system prompt, the task, tool definitions, memory and the history; the model's output is parsed into tool calls that act on the environment; results return as observations; and an outer layer decides when to stop, when to ask a human, and what to remember. Every chapter of this book zooms into one part of this picture.</p>
+
+<figure class="diagram" id="fig-1-6">
+<svg class="dg" viewBox="0 0 720 350" role="img" aria-label="Anatomy of a language agent: harness, context, model, tools, memory, environment">
+<defs><marker id="ah6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker>
+<marker id="ah6a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead-acc"/></marker></defs>
+<rect x="14" y="14" width="470" height="300" rx="12" class="bx" />
+<text x="30" y="38" class="t-b">Harness (scaffold)</text>
+<rect x="30" y="52" width="200" height="172" rx="8" class="bx2"/>
+<text x="130" y="72" text-anchor="middle" class="t-b">Context cₜ</text>
+<text x="44" y="96" class="t-sm">system prompt · policy</text>
+<text x="44" y="118" class="t-sm">tool definitions</text>
+<text x="44" y="140" class="t-sm">task / goal 𝒢</text>
+<text x="44" y="162" class="t-sm">retrieved memory</text>
+<text x="44" y="184" class="t-sm">history: actions and</text>
+<text x="44" y="204" class="t-sm">observations so far</text>
+<rect x="280" y="80" width="180" height="70" rx="8" class="fill-acc"/>
+<text x="370" y="110" text-anchor="middle" class="t-on t-b">Language model</text>
+<text x="370" y="132" text-anchor="middle" class="t-on t-sm">aₜ ~ π_θ(· | cₜ)</text>
+<line x1="230" y1="115" x2="278" y2="115" class="ln" marker-end="url(#ah6)"/>
+<rect x="280" y="180" width="180" height="44" rx="8" class="bx3"/>
+<text x="370" y="207" text-anchor="middle" class="t-sm">parse → validate → execute</text>
+<line x1="370" y1="150" x2="370" y2="178" class="ln" marker-end="url(#ah6)"/>
+<rect x="30" y="244" width="200" height="54" rx="8" class="bx5"/>
+<text x="130" y="267" text-anchor="middle" class="t-sm">memory store</text>
+<text x="130" y="286" text-anchor="middle" class="t-xs">notes · files · vector index</text>
+<line x1="130" y1="244" x2="130" y2="226" class="ln" marker-end="url(#ah6)"/>
+<rect x="280" y="244" width="180" height="54" rx="8" class="bx4"/>
+<text x="370" y="267" text-anchor="middle" class="t-sm">stop · ask human ·</text>
+<text x="370" y="286" text-anchor="middle" class="t-sm">budget · permissions</text>
+<rect x="530" y="40" width="176" height="250" rx="12" class="bx4"/>
+<text x="618" y="64" text-anchor="middle" class="t-b">Environment</text>
+<text x="618" y="96" text-anchor="middle" class="t-sm">shell, files, tests</text>
+<text x="618" y="122" text-anchor="middle" class="t-sm">web, search</text>
+<text x="618" y="148" text-anchor="middle" class="t-sm">APIs, databases</text>
+<text x="618" y="174" text-anchor="middle" class="t-sm">desktop, browser</text>
+<text x="618" y="200" text-anchor="middle" class="t-sm">people, other agents</text>
+<path d="M460,202 C495,202 495,170 528,170" class="ln-acc" marker-end="url(#ah6a)"/>
+<text x="494" y="160" text-anchor="middle" class="t-acc t-xs">tool call</text>
+<path d="M618,290 C618,344 260,344 230,318" class="ln dash" marker-end="url(#ah6)"/>
+<text x="470" y="344" text-anchor="middle" class="t-xs">observation appended to the context</text>
+</svg>
+<figcaption><b>Figure 1.6 — Anatomy of a language agent.</b> The model is only the policy. The harness assembles its context, executes its tool calls, writes observations back, consults memory, and enforces stopping rules, budgets and permissions. Parts II–IV of this book study the model's reasoning, the tools and environment, and the context and memory, in that order.</figcaption></figure>
+
+<p>Figure 1.6 deserves one more observation: only the orange box is the model. The rest is ordinary software, and a large part of the progress described in this section came from improving that software rather than the model. This is good news for an engineer. When an agent fails, the cause is as often a badly assembled context, an ambiguous tool, a missing check or an absent stopping rule as it is a lack of model capability, and those causes are within the engineer's control. Anthropic's widely read 2024 guide <em>Building Effective Agents</em><span class="cite"><a href="#ref-bea">[31]</a></span> made the same point from practice: the most successful deployments it saw used simple, composable patterns, not elaborate frameworks, and added autonomy only where it measurably helped.</p>
+
+<h2 id="s1-10">1.10 Measuring an agent</h2>
+<p>Every claim in the history above was a claim about measurement: a success rate on a benchmark, a time horizon, a cost. Before we can improve agents we need to say precisely what we measure, and the measures for agents differ in important ways from those for models that answer a single question. Four quantities matter, and every design decision in this book trades among them: how often the agent succeeds, how consistently it succeeds, what an episode costs, and how long it takes.</p>
+
+<h3 id="success">Success, once and repeatedly</h3>
+<p>The basic measure is the <strong>success rate</strong>: the fraction of tasks in an evaluation set on which the agent's final state satisfies the goal, as judged by a test suite, a database check or a grader. For a single task, let \(p\) be the probability that one attempt succeeds. Two derived quantities answer two different questions, and confusing them is a common interview mistake.</p>
+<p>The first question is: if I may try \(k\) times and keep the best, how likely am I to succeed? This is <strong>pass@\(k\)</strong>, introduced for code generation by Chen et al. (2021)<span class="cite"><a href="#ref-codex">[32]</a></span>. With independent attempts, \(\text{pass@}k = 1-(1-p)^k\), which rises towards one as \(k\) grows. It is the right measure when a cheap, reliable check can pick out a successful attempt, for example a hidden test suite at development time, or a human reviewing several candidate patches. The second question is: if the agent faces this task \(k\) times, as a deployed system serving \(k\) customers would, how likely is it to succeed <em>every</em> time? This is <strong>pass^\(k\)</strong> ("pass hat \(k\)"), introduced by the τ-bench paper (Yao et al., 2024)<span class="cite"><a href="#ref-taubench">[33]</a></span> for exactly that reason: \(\text{pass}^k = p^k\), which <em>falls</em> as \(k\) grows. A customer-service agent that resolves a request 60% of the time is not "60% good"; across eight customers with the same request, all eight are served correctly with probability \(0.6^8\approx1.7\%\).</p>
+
+<div class="box def">
+<div class="box-title">Definition — pass@k and pass^k over a task set</div>
+<p>Let an evaluation set have \(m\) tasks, and let \(p_j\) be the per-attempt success probability on task \(j\). Then</p>
+\[ \text{pass@}k=\frac1m\sum_{j=1}^m\Big(1-(1-p_j)^k\Big),\qquad \text{pass}^k=\frac1m\sum_{j=1}^m p_j^{\,k}. \]
+<p>Both equal the mean success rate \(\bar p=\frac1m\sum_j p_j\) at \(k=1\). They are estimated from \(n\ge k\) attempts per task, of which \(c_j\) succeed, by the unbiased estimators \(1-\binom{n-c_j}{k}\big/\binom{n}{k}\) and \(\binom{c_j}{k}\big/\binom{n}{k}\) respectively, averaged over tasks.</p>
+</div>
+
+<p>The averaging over tasks has a consequence that is easy to miss and important in practice: pass^\(k\) depends on how success is <em>distributed</em> across tasks, not just on its mean. By Jensen's inequality, since \(x\mapsto x^k\) is convex, \(\frac1m\sum_j p_j^k\ge\bar p^{\,k}\), with equality only when every task has the same difficulty. An agent whose successes are concentrated on tasks it solves reliably is far more consistent than one whose successes are spread thinly across many tasks it solves by luck, even at the same average success rate. The worked example makes this concrete.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — consistency depends on the spread of difficulty</div>
+<p>Two support agents each have an average success rate of 60% on an evaluation set of airline requests. Agent A succeeds with probability 0.6 on every task. Agent B succeeds with probability 0.95 on half the tasks (routine changes) and 0.25 on the other half (complicated refunds): its mean is \(\tfrac12(0.95+0.25)=0.6\).</p>
+<p><b>pass^8.</b> Agent A: \(0.6^8=0.0168\). Agent B: \(\tfrac12(0.95^8+0.25^8)=\tfrac12(0.6634+0.0000153)=0.332\). Agent B is twenty times more likely to handle eight repetitions of a task correctly.</p>
+<p><b>pass@8.</b> Agent A: \(1-0.4^8=0.99934\). Agent B: \(\tfrac12\big[(1-0.05^8)+(1-0.75^8)\big]=\tfrac12(1.0000+0.8999)=0.950\). With eight tries and a perfect checker, A is better.</p>
+<p><b>Interpretation.</b> Same average, opposite rankings. Agent B is the better product: it is reliable on half of the traffic, which can be routed to it with confidence, while the other half can be escalated to a human. Agent A is never reliable on anything. When someone quotes a single success rate for an agent, ask for pass^\(k\) or for the distribution of per-task success.</p>
+</div>
+
+<h3 id="cost">Cost and time</h3>
+<p>A model that answers a question makes one call. An agent makes many, and each call reads the whole context, which grows with every step. This makes the cost of an agent episode grow faster than its length, and it is why a technique that is a minor optimisation for chat, <strong>prompt caching</strong>, is essential for agents. When consecutive calls share a long common prefix (the system prompt, the tool definitions and the history so far), a serving system can keep the internal state computed for that prefix and charge much less for re-reading it; at our reference prices, cached input costs $0.30 per million tokens against $3 for fresh input. The companion book explains the mechanism (the KV cache and prefix caching); Chapter 4 explains how to arrange a context so that caching works. Here we only compute what it is worth.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — the cost of one coding-agent episode</div>
+<p>The coding agent runs for \(H=40\) steps. The first call's context holds 8,000 tokens (system prompt, tool definitions and the issue). Each step appends about 2,500 tokens: roughly 300 tokens of model output (reasoning and a tool call) plus 2,200 tokens of observation (file contents, test output). So the context at step \(t\) is \(n_t=8{,}000+2{,}500(t-1)\) tokens.</p>
+<p><b>Input tokens.</b> \(\sum_{t=1}^{40}n_t=40\times8{,}000+2{,}500\sum_{t=1}^{40}(t-1)=320{,}000+2{,}500\times780=2{,}270{,}000\). The agent reads 2.27 million tokens to produce \(40\times300=12{,}000\) output tokens: a ratio of almost 190 to 1.</p>
+<p><b>Without caching.</b> \(2.27\,\text{M}\times\$3/\text{M}=\$6.81\) for input plus \(0.012\,\text{M}\times\$15/\text{M}=\$0.18\) for output: <b>$6.99</b> per episode.</p>
+<p><b>With caching.</b> Only the newly appended tokens are fresh: \(8{,}000+39\times2{,}500=105{,}500\) tokens at $3/M, or $0.32. The remaining \(2{,}164{,}500\) tokens are cache reads at $0.30/M, or $0.65. With output, the total is <b>$1.15</b>, six times cheaper. (Real providers may also charge a premium for writing to the cache; Chapter 4 includes it.)</p>
+<p><b>Time.</b> Per step, prefilling the 2,500 fresh tokens takes \(2{,}500/5{,}000=0.5\) s, decoding 300 tokens takes \(300/60=5\) s, and suppose the tool (often running tests) takes 3 s on average. That is 8.5 s per step and \(40\times8.5=340\) s, about <b>6 minutes</b> per episode, of which 59% is the model writing. Decode speed, not reading, dominates the wall clock.</p>
+</div>
+
+<p>The example generalises into a rule worth remembering. If the context grows by \(\Delta\) tokens per step from an initial \(n_1\), the total input over \(H\) steps is \(Hn_1+\Delta H(H-1)/2\): <em>quadratic</em> in the horizon. Doubling the length of a task roughly quadruples its uncached input cost when the history dominates. Caching reduces the constant by an order of magnitude but not the quadratic shape, and so long-horizon agents must also stop the context from growing without bound, by summarising, discarding stale observations or delegating to sub-agents with fresh contexts. Those are the techniques of Chapter 14. The time computation teaches the complementary lesson: for latency, what matters is the number of sequential steps and the number of tokens the model writes, so the levers are fewer steps, shorter outputs and parallel tool calls (Chapter 21).</p>
+
+<details class="drill">
+<summary>Drill 1.2 — pass@k for a coding agent</summary>
+<p>A coding agent resolves a particular issue on 30% of attempts. (a) With five independent attempts and the hidden tests as a checker, what is pass@5? (b) What is pass^5? (c) How many attempts are needed for pass@\(k\ge0.95\)?</p>
+<p>(a) \(1-0.7^5=1-0.16807=0.832\). (b) \(0.3^5=0.00243\). (c) Solve \(0.7^k\le0.05\): \(k\ge\ln0.05/\ln0.7=2.996/0.3567=8.4\), so \(k=9\). Note the cost: nine full episodes, at the $1.15 of the worked example, is about $10 to be 95% sure of one fix, and only if a reliable checker exists. Chapter 6 develops this into the theory of best-of-\(n\) search with imperfect verifiers.</p>
+</details>
+
+<details class="drill">
+<summary>Drill 1.3 — the quadratic context</summary>
+<p>A research agent starts with a 3,000-token context and adds 6,000 tokens per step (each fetched page is long). (a) How many input tokens does a 30-step episode read? (b) At what step does the context exceed a 200,000-token window? (c) What does the episode cost without and with caching, ignoring output?</p>
+<p>(a) \(30\times3{,}000+6{,}000\times\frac{30\times29}{2}=90{,}000+2{,}610{,}000=2{,}700{,}000\). (b) \(3{,}000+6{,}000(t-1)>200{,}000\) gives \(t-1>32.8\), so at step 34; a 30-step episode just fits. (c) Uncached: \(2.7\times\$3=\$8.10\). Cached: fresh tokens \(3{,}000+29\times6{,}000=177{,}000\) cost $0.53, and the remaining \(2{,}523{,}000\) cached tokens cost $0.76, so about $1.29. Long observations make research agents expensive; Chapter 9 shows how retrieval and summarisation keep only the relevant parts of each page.</p>
+</details>
+
+<h2 id="s1-11">1.11 Why now, and what remains hard</h2>
+<p>We can now answer the question this chapter began with. Agents became practical in 2023–2025 because, for the first time, all three of the historical shortages were relieved at once. The <strong>knowledge</strong> that symbolic AI could not write down, and that reinforcement learning could not gather, arrived as a prior: a pre-trained, instruction-tuned language model already knows roughly how files, browsers, airlines and programming languages work. The <strong>interface</strong> that robotics struggled with became trivial for software environments: an observation is text, an action is a structured function call, and protocols like MCP make any software reachable. And the <strong>learning</strong> that RL demanded at enormous scale became affordable in a new form: starting from the prior, reinforcement learning on verifiable tasks needs comparatively few samples to teach a model to reason longer, recover from errors and use tools well, because it is shaping an already-competent policy rather than creating one from nothing.</p>
+<p>Figure 1.7 summarises the chain of bottlenecks as a timeline, and the table below states it in words. Read the table as a sequence of answers, each exposing a new question, which is how the rest of the book is organised.</p>
+
+<figure class="diagram" id="fig-1-7">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-label="Timeline of agent paradigms from 1948 to 2025">
+<line x1="30" y1="120" x2="700" y2="120" class="ln"/>
+<g class="t-xs">
+<circle cx="40" cy="120" r="5" class="fill-s2"/><text x="40" y="142" text-anchor="middle">1948</text>
+<circle cx="140" cy="120" r="5" class="fill-s2"/><text x="140" y="142" text-anchor="middle">1959–72</text>
+<circle cx="250" cy="120" r="5" class="fill-s2"/><text x="250" y="142" text-anchor="middle">1986–95</text>
+<circle cx="360" cy="120" r="5" class="fill-s2"/><text x="360" y="142" text-anchor="middle">1992–2019</text>
+<circle cx="470" cy="120" r="5" class="fill-acc"/><text x="470" y="142" text-anchor="middle">2020–22</text>
+<circle cx="580" cy="120" r="5" class="fill-acc"/><text x="580" y="142" text-anchor="middle">2022–23</text>
+<circle cx="680" cy="120" r="5" class="fill-acc"/><text x="680" y="142" text-anchor="middle">2023–26</text>
+</g>
+<text x="40" y="70" text-anchor="middle" class="t-sm t-b">Feedback</text><text x="40" y="88" text-anchor="middle" class="t-xs">Wiener</text>
+<text x="140" y="70" text-anchor="middle" class="t-sm t-b">Planning</text><text x="140" y="88" text-anchor="middle" class="t-xs">GPS, STRIPS</text>
+<text x="250" y="70" text-anchor="middle" class="t-sm t-b">Situated, BDI</text><text x="250" y="88" text-anchor="middle" class="t-xs">Brooks, Rao</text>
+<text x="360" y="70" text-anchor="middle" class="t-sm t-b">Deep RL</text><text x="360" y="88" text-anchor="middle" class="t-xs">TD-Gammon → AlphaGo</text>
+<text x="470" y="70" text-anchor="middle" class="t-sm t-b">LM priors</text><text x="470" y="88" text-anchor="middle" class="t-xs">GPT-3, InstructGPT</text>
+<text x="580" y="70" text-anchor="middle" class="t-sm t-b">LM agents</text><text x="580" y="88" text-anchor="middle" class="t-xs">WebGPT, ReAct</text>
+<text x="680" y="70" text-anchor="middle" class="t-sm t-b">Useful agents</text><text x="680" y="88" text-anchor="middle" class="t-xs">tools, RL, MCP</text>
+<text x="40" y="178" text-anchor="middle" class="t-xs t-s2">needs equations</text>
+<text x="140" y="178" text-anchor="middle" class="t-xs t-s2">needs a world model</text>
+<text x="250" y="178" text-anchor="middle" class="t-xs t-s2">needs plan libraries</text>
+<text x="360" y="178" text-anchor="middle" class="t-xs t-s2">needs 10⁷+ trials</text>
+<text x="470" y="178" text-anchor="middle" class="t-xs t-s2">not grounded</text>
+<text x="580" y="178" text-anchor="middle" class="t-xs t-s2">unreliable: ρᴴ</text>
+<text x="680" y="178" text-anchor="middle" class="t-xs t-s2">horizon, safety</text>
+<text x="360" y="214" text-anchor="middle" class="t-xs">top: what each era contributed · bottom: the bottleneck it exposed</text>
+</svg>
+<figcaption><b>Figure 1.7 — Seventy years of agents.</b> Each paradigm filled the policy box of Figure 1.1 in a new way and exposed a new shortage (bottom row). The three blue points are the language-agent era that this book is about.</figcaption></figure>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Era</th><th>How the policy is obtained</th><th>What it solved</th><th>What it exposed</th></tr></thead>
+<tbody>
+<tr><td>Cybernetics (1948–)</td><td>Designed function of the error signal</td><td>Robust correction of deviations</td><td>Needs equations for the world and the goal</td></tr>
+<tr><td>Symbolic planning (1959–)</td><td>Search a logical world model</td><td>Purposeful multi-step behaviour, new problems</td><td>Frame problem, knowledge acquisition</td></tr>
+<tr><td>Situated and BDI agents (1986–)</td><td>Reactive layers; committed plans from a library</td><td>Speed, robustness, commitment</td><td>Plans and ontologies still hand-written</td></tr>
+<tr><td>Deep RL (1992–2019)</td><td>Learn from reward by trial and error</td><td>Superhuman play with no hand-written knowledge</td><td>Sample hunger, reward design, no priors</td></tr>
+<tr><td>Language agents (2021–)</td><td>Condition a pre-trained LM on the history</td><td>Broad priors, natural-language goals and actions</td><td>Grounding, reliability over long horizons, cost, safety</td></tr>
+</tbody></table></div>
+
+<p>What remains hard is visible in the last row, and it is the agenda of this book. <em>Reliability</em>: per-step error compounds, and even the best agents of 2025 completed only about half of the tasks a skilled human does in two hours. <em>Context</em>: the agent's entire working state is a token string of bounded length that it must read in full at every step, at a cost that grows quadratically with the horizon. <em>Verification</em>: many valuable tasks (write a good report, handle a customer well) have no test suite, so the agent cannot easily know when it has succeeded, and neither can we. <em>Safety and security</em>: an agent that can act can act wrongly, and an agent that reads untrusted content (a web page, an email, a code comment) can be instructed by it, a vulnerability known as prompt injection that has no complete solution today. And <em>learning</em>: we would like agents to improve from their own experience, which brings back every difficulty of reinforcement learning, now on policies with hundreds of billions of parameters.</p>
+
+<h2 id="s1-12">1.12 A map of the book</h2>
+<p>Figure 1.8 shows how the seven parts depend on one another, each answering the question the previous one leaves open. <strong>Part I</strong> (Chapters 1–4) builds the foundations: the formal model of an agent as a decision process, the language model as its policy, and the context as its only working state. <strong>Part II</strong> (Chapters 5–7) is about deciding well: reasoning, search and self-correction. <strong>Part III</strong> (Chapters 8–12) is about acting: tools, retrieval, code execution, computer use and the protocols that connect them. <strong>Part IV</strong> (Chapters 13–14) is about memory and long horizons. <strong>Part V</strong> (Chapters 15–16) is about systems of many agents and the architectures that organise them. <strong>Part VI</strong> (Chapters 17–18) is about learning: imitation, preferences and reinforcement learning for agents. <strong>Part VII</strong> (Chapters 19–22) is about the practice: evaluation, security, production engineering, and how all of it is examined in interviews.</p>
+
+<figure class="diagram" id="fig-1-8">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Map of the book: seven parts and their dependencies">
+<defs><marker id="ah8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="20" y="100" width="120" height="60" rx="10" class="fill-acc"/><text x="80" y="125" text-anchor="middle" class="t-on t-b">I Foundations</text><text x="80" y="144" text-anchor="middle" class="t-on t-xs">Ch 1–4</text>
+<rect x="180" y="30" width="120" height="60" rx="10" class="bx2"/><text x="240" y="55" text-anchor="middle" class="t-b">II Reasoning</text><text x="240" y="74" text-anchor="middle" class="t-xs">Ch 5–7</text>
+<rect x="180" y="170" width="120" height="60" rx="10" class="bx3"/><text x="240" y="195" text-anchor="middle" class="t-b">III Acting</text><text x="240" y="214" text-anchor="middle" class="t-xs">Ch 8–12</text>
+<rect x="340" y="100" width="120" height="60" rx="10" class="bx5"/><text x="400" y="125" text-anchor="middle" class="t-b">IV Memory</text><text x="400" y="144" text-anchor="middle" class="t-xs">Ch 13–14</text>
+<rect x="500" y="30" width="120" height="60" rx="10" class="bx4"/><text x="560" y="55" text-anchor="middle" class="t-b">V Many agents</text><text x="560" y="74" text-anchor="middle" class="t-xs">Ch 15–16</text>
+<rect x="500" y="170" width="120" height="60" rx="10" class="bx2"/><text x="560" y="195" text-anchor="middle" class="t-b">VI Learning</text><text x="560" y="214" text-anchor="middle" class="t-xs">Ch 17–18</text>
+<rect x="640" y="100" width="70" height="60" rx="10" class="bx"/><text x="675" y="125" text-anchor="middle" class="t-b">VII</text><text x="675" y="144" text-anchor="middle" class="t-xs">Ch 19–22</text>
+<line x1="140" y1="118" x2="178" y2="70" class="ln" marker-end="url(#ah8)"/>
+<line x1="140" y1="142" x2="178" y2="190" class="ln" marker-end="url(#ah8)"/>
+<line x1="300" y1="70" x2="338" y2="118" class="ln" marker-end="url(#ah8)"/>
+<line x1="300" y1="190" x2="338" y2="142" class="ln" marker-end="url(#ah8)"/>
+<line x1="460" y1="118" x2="498" y2="70" class="ln" marker-end="url(#ah8)"/>
+<line x1="460" y1="142" x2="498" y2="190" class="ln" marker-end="url(#ah8)"/>
+<line x1="620" y1="70" x2="652" y2="98" class="ln" marker-end="url(#ah8)"/>
+<line x1="620" y1="190" x2="652" y2="162" class="ln" marker-end="url(#ah8)"/>
+</svg>
+<figcaption><b>Figure 1.8 — How the parts depend on each other.</b> Foundations feed both deciding (II) and acting (III); both feed memory and long horizons (IV); those feed multi-agent systems (V) and learning (VI); everything feeds the practice of evaluation, security and production (VII).</figcaption></figure>
+
+<p>Figure 1.8 also suggests reading orders. A reader preparing for an applied-AI engineering interview in a hurry can read Part I, then Chapters 8, 10, 14, 16 and 19–22. A reader interested in research on agent training can read Part I, then Part II and Part VI. But the book is written to be read in order, because each part's techniques are motivated by the failures of the previous part's.</p>
+
+<h2 id="looking-ahead" class="unnumbered">Looking ahead</h2>
+<p>This chapter used a deliberately informal picture of an agent: a loop of observations and actions with a language model inside, and a crude reliability model in which each step independently succeeds with probability \(\rho\). Both need to be made precise before we can reason with them. What exactly is the "state" an LLM agent is in, when the environment is a code base it has only partly read? In what sense is the context a sufficient summary of the past, and when does it fail to be? What does it mean for an agent to recover from an error, and how does recovery change the \(\rho^H\) law? When is a fixed workflow better than an autonomous agent? Chapter 2 answers these questions by formalising the agent as a policy in a partially observable Markov decision process, the mathematical object that the rest of the book builds on.</p>
+
+<h2 id="summary">Chapter summary</h2>
+<ul>
+<li>An <b>agent</b> is a closed loop: it observes, chooses an action with its <b>policy</b>, and the action changes what it observes next. The difficulty of agents is concentrated in the policy, and in the fact that errors propagate around the loop.</li>
+<li><b>Cybernetics</b> (1948) gave us feedback and the vocabulary of state and estimation, but needed equations for the world. <b>Symbolic planning</b> (GPS, STRIPS, A*) chose actions by searching a world model, but foundered on the frame problem and knowledge acquisition. <b>Situated and BDI agents</b> added reactivity and commitment but still relied on hand-written plans.</li>
+<li><b>Deep reinforcement learning</b> learned superhuman policies from reward alone, but needed millions of trials, a well-specified reward and a simulator, and started with no prior knowledge.</li>
+<li><b>Language models</b> supplied a broad prior over behaviour. <b>WebGPT, SayCan, MRKL and ReAct</b> (2021–2022) grounded them by closing the loop; ReAct's interleaving of thoughts, actions and observations is the template for modern agents.</li>
+<li>Per-step errors compound: an \(H\)-step task succeeds with probability \(\rho^H\approx e^{-H(1-\rho)}\), and the half-success horizon is \(\approx0.69/(1-\rho)\). The four levers are recovery, higher \(\rho\), shorter \(H\) and verification.</li>
+<li>Function calling, realistic benchmarks (SWE-bench), agent–computer interfaces, reasoning models, computer use, MCP and RL on verifiable tasks made agents useful between 2023 and 2026; METR's time horizon doubled roughly every seven months.</li>
+<li><b>pass@\(k\)</b> \(=1-(1-p)^k\) measures best-of-\(k\) with a checker; <b>pass^\(k\)</b> \(=p^k\) measures consistency. Over a task set, pass^\(k\) depends on the spread of per-task difficulty.</li>
+<li>Agent input cost grows quadratically with the horizon; prompt caching reduces it several-fold, and wall-clock time is dominated by sequential steps and output tokens.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ch01-mcq-01" data-topic="§1.1 Agents">
+<p class="q">Which property distinguishes an agent from a classifier that labels images?</p>
+<ol class="opts">
+<li>The agent uses a neural network</li>
+<li data-correct>The agent's outputs change its environment, so its future inputs depend on its past outputs</li>
+<li>The agent has a goal written in natural language</li>
+<li>The agent produces a probability distribution</li>
+</ol>
+<div class="explain">The defining feature is the closed loop: actions affect subsequent observations. A classifier's label has no effect on the next image it sees. Many agents use no neural network, and the goal is part of how we judge an agent, not of the loop itself.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-02" data-topic="§1.1 Agents">
+<p class="q">For the support agent, which of the following is part of the hidden state \(s_t\) rather than the observation \(o_t\)?</p>
+<ol class="opts">
+<li>The text of the customer's latest message</li>
+<li>The result of a booking look-up the agent just ran</li>
+<li data-correct>What the customer actually wants, which may differ from what they wrote</li>
+<li>The tool definitions in the system prompt</li>
+</ol>
+<div class="explain">The customer's true intent is part of the world's state and is only partially revealed by their messages. Messages and tool results are observations; tool definitions are part of the agent's context, supplied by the harness.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-03" data-topic="§1.1 Agents">
+<p class="q">Why are errors in an agent "not independent", in the sense of Figure 1.1?</p>
+<ol class="opts">
+<li>Because the model's sampling uses a shared random seed</li>
+<li data-correct>Because a wrong action changes the environment and therefore every later observation</li>
+<li>Because all steps use the same prompt</li>
+<li>Because tool calls are executed in parallel</li>
+</ol>
+<div class="explain">Closing the loop couples steps: a bad edit produces a different test output, which conditions every later decision. This is why compounding error and recovery are central topics.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-04" data-topic="§1.2 Cybernetics">
+<p class="q">In the linear–quadratic regulator with noisy observations, the optimal policy is:</p>
+<ol class="opts">
+<li>A lookup table learned by Q-learning</li>
+<li>A plan found by A* search</li>
+<li data-correct>A linear gain applied to the Kalman-filter estimate of the state</li>
+<li>A random policy that explores uniformly</li>
+</ol>
+<div class="explain">By the separation principle, the optimal controller applies the Riccati gain \(K\) to the state estimate produced by a Kalman filter. The estimate plays the role of a belief state, which Chapter 2 generalises.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-05" data-topic="§1.2 Cybernetics">
+<p class="q">Which idea from cybernetics most directly survives in a coding agent that runs the tests after every edit?</p>
+<ol class="opts">
+<li>Means–ends analysis</li>
+<li data-correct>Negative feedback: measure the gap to the goal and act to reduce it</li>
+<li>The subsumption architecture</li>
+<li>The frame problem</li>
+</ol>
+<div class="explain">Running tests measures the error signal (which tests still fail) and the next edit tries to reduce it, which is Wiener's feedback loop in a discrete, symbolic setting.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-06" data-topic="§1.3 Planning">
+<p class="q">In STRIPS, applying an operator \((\mathrm{pre},\mathrm{add},\mathrm{del})\) to a state \(s\) with \(\mathrm{pre}\subseteq s\) yields:</p>
+<ol class="opts">
+<li>\(s\cup\mathrm{add}\cup\mathrm{del}\)</li>
+<li data-correct>\((s\setminus\mathrm{del})\cup\mathrm{add}\)</li>
+<li>\(\mathrm{add}\setminus\mathrm{del}\)</li>
+<li>\(s\cap\mathrm{add}\)</li>
+</ol>
+<div class="explain">Remove the deleted facts, then add the new ones. Facts not mentioned are assumed unchanged, which is STRIPS's pragmatic answer to the frame problem.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-07" data-topic="§1.3 Planning">
+<p class="q">The frame problem is the difficulty of:</p>
+<ol class="opts">
+<li>Rendering a robot's camera frames quickly enough</li>
+<li>Choosing the right heuristic for A*</li>
+<li data-correct>Specifying everything an action does <em>not</em> change, without an unmanageable number of axioms</li>
+<li>Splitting a long task into frames of fixed length</li>
+</ol>
+<div class="explain">McCarthy and Hayes (1969) observed that formalising the non-effects of actions is the hard part of a logical world model. STRIPS sidesteps it with a closed-world, unchanged-unless-stated assumption.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-08" data-topic="§1.3 Planning">
+<p class="q">A* is guaranteed to find a shortest path when its heuristic is admissible. "Admissible" means the heuristic:</p>
+<ol class="opts">
+<li>Is computed in constant time</li>
+<li data-correct>Never overestimates the true remaining cost</li>
+<li>Never underestimates the true remaining cost</li>
+<li>Is learned from data</li>
+</ol>
+<div class="explain">An admissible heuristic is optimistic: \(h(s)\le h^*(s)\). With such a heuristic A* never discards a node that could lie on an optimal path.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-09" data-topic="§1.3 Planning">
+<p class="q">Which bottleneck most decisively limited symbolic planners and expert systems as general agents?</p>
+<ol class="opts">
+<li>Lack of fast hardware for logic</li>
+<li data-correct>The knowledge-acquisition bottleneck: facts and operators had to be written and maintained by hand</li>
+<li>The impossibility of search in discrete spaces</li>
+<li>The absence of natural-language interfaces for users</li>
+</ol>
+<div class="explain">Planners worked when given a correct model. Writing and maintaining such models for open-ended domains was the binding constraint, and it is exactly what a pre-trained language model partly supplies.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-10" data-topic="§1.4 BDI">
+<p class="q">The key idea that distinguishes a BDI agent's intentions from its desires is:</p>
+<ol class="opts">
+<li>Intentions are probabilistic, desires are logical</li>
+<li data-correct>Commitment: the agent persists with intentions until they succeed, become impossible or are superseded</li>
+<li>Intentions are learned by reinforcement, desires are programmed</li>
+<li>Intentions concern other agents, desires concern the environment</li>
+</ol>
+<div class="explain">Commitment avoids the cost and erratic behaviour of replanning from scratch at every step. Modern agents face the same trade-off between sticking to a plan and reacting to new observations.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-11" data-topic="§1.4 Situated agents">
+<p class="q">Brooks's slogan "the world is its own best model" argues for:</p>
+<ol class="opts">
+<li>Building detailed simulators before deploying agents</li>
+<li data-correct>Reacting to fresh sensor readings rather than maintaining and planning over an internal symbolic model</li>
+<li>Training agents on internet text</li>
+<li>Giving agents no sensors at all</li>
+</ol>
+<div class="explain">The subsumption architecture maps sensors to actions through layered behaviours, re-observing the world rather than predicting it. A language-agent analogue is re-reading a file rather than trusting an earlier summary of it.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-12" data-topic="§1.5 Reinforcement learning">
+<p class="q">Which was <em>not</em> one of the three walls that kept deep RL from producing general-purpose software agents?</p>
+<ol class="opts">
+<li>Sample efficiency</li>
+<li>Reward specification</li>
+<li>The absence of prior knowledge</li>
+<li data-correct>The inability of neural networks to represent policies over large observation spaces</li>
+</ol>
+<div class="explain">DQN and AlphaGo showed that deep networks represent such policies well. The walls were the number of trials needed, the difficulty of writing rewards for real tasks, and starting from a random initialisation.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-13" data-topic="§1.5 Reinforcement learning">
+<p class="q">AlphaGo combined learned networks with which technique from the planning tradition?</p>
+<ol class="opts">
+<li>STRIPS operators</li>
+<li data-correct>Monte Carlo tree search</li>
+<li>Means–ends analysis</li>
+<li>Subsumption layers</li>
+</ol>
+<div class="explain">AlphaGo used policy and value networks to guide Monte Carlo tree search, a fusion of learning and search that reappears in LLM agents as LATS and similar methods (Chapter 6).</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-14" data-topic="§1.6 LM priors">
+<p class="q">What did in-context learning, as shown by GPT-3, contribute to agents?</p>
+<ol class="opts">
+<li>A guarantee that the model's actions are correct</li>
+<li data-correct>A policy that can be specified for a new task by a description and examples, with no task-specific training</li>
+<li>A way to run tools without a harness</li>
+<li>A memory that persists across sessions</li>
+</ol>
+<div class="explain">In-context learning means the "policy" can be configured by its prompt. It brings a broad prior, but no grounding, persistence or reliability guarantees.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-15" data-topic="§1.6 LM priors">
+<p class="q">InstructGPT matters for agents mainly because:</p>
+<ol class="opts">
+<li>It introduced the Transformer</li>
+<li data-correct>Instruction tuning and RLHF turn a text-continuing model into one that does what it is asked</li>
+<li>It was the first model with tool calling</li>
+<li>It made models smaller than 1B parameters competitive at every task</li>
+</ol>
+<div class="explain">A policy must follow instructions; a raw pre-trained model only continues text. A 1.3B InstructGPT was preferred to the 175B GPT-3 by human raters on instruction-following prompts.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-16" data-topic="§1.6 LM priors">
+<p class="q">Select all that a pre-trained, instruction-tuned language model does <em>not</em> by itself supply to an agent.</p>
+<ol class="opts" data-multi>
+<li data-correct>Grounding: knowledge of what a particular file actually contains</li>
+<li data-correct>Memory beyond its context window</li>
+<li>A broad prior over sensible next actions</li>
+<li data-correct>Reliability over long tasks</li>
+</ol>
+<div class="explain">The model supplies a prior over behaviour. Grounding comes from closing the loop with tools; memory from external stores; reliability from verification, recovery and training.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-17" data-topic="§1.7 Language agents">
+<p class="q">In SayCan, the robot's choice of skill combined:</p>
+<ol class="opts">
+<li>Two language models voting</li>
+<li data-correct>The language model's estimate of a skill's usefulness and a value function's estimate of the skill's chance of success</li>
+<li>A planner and a reward model</li>
+<li>Human demonstrations and a simulator</li>
+</ol>
+<div class="explain">"Say" (what is useful for the instruction) times "can" (what is feasible from the current state): a language prior grounded by a learned affordance estimate.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-18" data-topic="§1.7 ReAct">
+<p class="q">The defining feature of ReAct is:</p>
+<ol class="opts">
+<li>Fine-tuning the model on tool demonstrations</li>
+<li data-correct>Interleaving free-form reasoning ("thoughts") with actions and their observations in one context</li>
+<li>Running several agents in parallel</li>
+<li>Replacing the model's reasoning with a symbolic planner</li>
+</ol>
+<div class="explain">Thoughts help decide and track progress; actions fetch information reasoning would otherwise hallucinate. ReAct worked by prompting alone, with a few examples.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-19" data-topic="§1.7 Harness">
+<p class="q">In a ReAct agent, which of these is the harness's job rather than the model's?</p>
+<ol class="opts">
+<li>Deciding which file to open next</li>
+<li data-correct>Parsing the action from the model's output, executing it and appending the result to the context</li>
+<li>Writing the reasoning that precedes an action</li>
+<li>Choosing the wording of the final answer</li>
+</ol>
+<div class="explain">The model decides; the harness (scaffold) executes, formats observations, enforces stopping rules and builds the next context.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-20" data-topic="§1.7 Toolformer">
+<p class="q">How did Toolformer decide which candidate API calls to keep as training data?</p>
+<ol class="opts">
+<li>Human annotators labelled useful calls</li>
+<li>A reward model scored each call</li>
+<li data-correct>A call was kept if inserting it and its result made the following tokens more predictable</li>
+<li>Calls that returned errors were kept to teach recovery</li>
+</ol>
+<div class="explain">Toolformer's self-supervised criterion compares the language-modelling loss on subsequent tokens with and without the call, keeping calls that reduce it.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-21" data-topic="§1.8 Compounding error">
+<p class="q">Each step of a 20-step task succeeds independently with probability 0.95. The task's success probability is closest to:</p>
+<ol class="opts">
+<li>95%</li><li>75%</li><li data-correct>36%</li><li>5%</li>
+</ol>
+<div class="explain">\(0.95^{20}=e^{20\ln0.95}=e^{-1.026}\approx0.358\).</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-22" data-topic="§1.8 Compounding error">
+<p class="q">Under the independent-step model, improving per-step reliability from 0.99 to 0.999 multiplies the half-success horizon by about:</p>
+<ol class="opts">
+<li>1.01</li><li>2</li><li data-correct>10</li><li>100</li>
+</ol>
+<div class="explain">\(H_{1/2}\approx0.69/(1-\rho)\): from 69 steps to 693 steps. The horizon scales inversely with the error rate.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-23" data-topic="§1.8 Compounding error">
+<p class="q">Select all changes that pull one of the four levers of §1.8.</p>
+<ol class="opts" data-multi>
+<li data-correct>A tool that runs the whole test suite and summarises failures, replacing five shell commands</li>
+<li data-correct>Re-running tests after each edit and fixing what fails</li>
+<li data-correct>Switching to a model with fewer per-step errors</li>
+<li>Raising the sampling temperature to make outputs more varied</li>
+</ol>
+<div class="explain">Fewer steps (shorter \(H\)), recovery through verification, and higher \(\rho\) all help. Higher temperature generally lowers per-step reliability, although diversity can help when combined with selection (Chapter 6).</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-24" data-topic="§1.8 Auto-GPT">
+<p class="q">Which explanation best accounts for the failure of early-2023 autonomous agents such as Auto-GPT on real work?</p>
+<ol class="opts">
+<li>GPT-4 could not write code</li>
+<li>Their tool APIs were too slow</li>
+<li data-correct>Long, open-ended tasks with no verification or recovery, so per-step errors compounded</li>
+<li>They were not allowed to access the internet</li>
+</ol>
+<div class="explain">Open-ended goals required many steps; there were no reliable checks of progress; and errors such as loops and false claims of success were not caught, so \(\rho^H\) was tiny.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-25" data-topic="§1.9 Benchmarks">
+<p class="q">In SWE-bench, a task counts as resolved when:</p>
+<ol class="opts">
+<li>A human reviewer approves the patch</li>
+<li>The patch is syntactically valid</li>
+<li data-correct>The hidden tests associated with the real fix pass after the patch is applied</li>
+<li>The model says it has fixed the issue</li>
+</ol>
+<div class="explain">SWE-bench uses the tests from the original pull request: tests that failed before the human fix and passed after it, plus tests that must keep passing.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-26" data-topic="§1.9 Interfaces">
+<p class="q">The main finding of the SWE-agent paper about agent–computer interfaces was:</p>
+<ol class="opts">
+<li>Agents should use exactly the same tools as human developers</li>
+<li data-correct>Tools designed for the model (concise output, guarded edits, paged file views) substantially improve success with the same model</li>
+<li>A larger model always matters more than the tools</li>
+<li>Agents perform best with no tools, reasoning only</li>
+</ol>
+<div class="explain">Interface design changed resolution rates several-fold with the same underlying model, by shortening trajectories and preventing whole classes of errors.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-27" data-topic="§1.9 Time horizon">
+<p class="q">METR's "50% time horizon" of a model is:</p>
+<ol class="opts">
+<li>How long the model can run before its context overflows</li>
+<li data-correct>The length, in skilled-human time, of tasks the model completes with probability one half</li>
+<li>Half the model's maximum output length</li>
+<li>The median latency of the model's API</li>
+</ol>
+<div class="explain">Tasks are calibrated by how long humans take; a logistic fit of the model's success against log task length gives the length at which success is 50%.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-28" data-topic="§1.10 pass@k">
+<p class="q">An agent solves a task on 40% of attempts. With independent attempts, pass@3 and pass^3 are:</p>
+<ol class="opts">
+<li>0.40 and 0.40</li>
+<li data-correct>0.784 and 0.064</li>
+<li>0.064 and 0.784</li>
+<li>1.20 and 0.064</li>
+</ol>
+<div class="explain">pass@3 \(=1-0.6^3=1-0.216=0.784\); pass^3 \(=0.4^3=0.064\).</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-29" data-topic="§1.10 pass^k">
+<p class="q">Two agents have the same mean success rate over a task set. Agent X's per-task success probabilities are all equal; agent Y's vary widely. Which statement is true for every \(k\ge2\)?</p>
+<ol class="opts">
+<li>X has the higher pass^\(k\)</li>
+<li data-correct>Y has pass^\(k\) at least as high as X's</li>
+<li>They have the same pass^\(k\)</li>
+<li>It depends on the number of tasks only</li>
+</ol>
+<div class="explain">By Jensen's inequality with the convex map \(x\mapsto x^k\), \(\frac1m\sum p_j^k\ge\bar p^k\), and X attains the lower bound. Concentrated success is more consistent.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-30" data-topic="§1.10 Cost">
+<p class="q">An agent's context starts at \(n_1\) tokens and grows by \(\Delta\) per step. For large \(H\), uncached input cost grows like:</p>
+<ol class="opts">
+<li>\(H\)</li>
+<li data-correct>\(H^2\)</li>
+<li>\(\log H\)</li>
+<li>\(2^H\)</li>
+</ol>
+<div class="explain">Total input is \(Hn_1+\Delta H(H-1)/2\), quadratic in \(H\). Caching lowers the constant but not the exponent; bounding context growth changes the shape.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-31" data-topic="§1.10 Cost">
+<p class="q">In the coding-agent worked example, which component dominated the wall-clock time of a step?</p>
+<ol class="opts">
+<li>Prefilling the fresh input tokens</li>
+<li data-correct>Decoding the model's output tokens</li>
+<li>Reading the cached prefix</li>
+<li>Network round trips</li>
+</ol>
+<div class="explain">Decoding 300 tokens at 60 tokens/s takes 5 s of an 8.5 s step; prefill of 2,500 fresh tokens takes 0.5 s. Latency levers are fewer steps and shorter outputs.</div>
+</div>
+
+<div class="mcq" data-id="ch01-mcq-32" data-topic="§1.11 Why now">
+<p class="q">Which statement best explains why reinforcement learning became affordable for language agents when it had been prohibitively sample-hungry for earlier agents?</p>
+<ol class="opts">
+<li>Simulators became faster</li>
+<li data-correct>RL now shapes an already-competent pre-trained policy rather than learning from a random initialisation</li>
+<li>Rewards are no longer needed</li>
+<li>Language agents act in fewer environments</li>
+</ol>
+<div class="explain">Starting from a strong prior, RL needs comparatively few samples to adjust behaviour (reason longer, recover, use tools well), especially with automatically verifiable rewards.</div>
+</div>
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer out loud first, then reveal the model answer and rate yourself. Levels: Warm-up, Core, Deep-dive, Design.</p>
+
+<details class="qa" data-id="ch01-qa-01">
+<summary><span class="lvl warm">Warm-up</span> What is an AI agent? How is it different from a chatbot?</summary>
+<div class="answer">
+<p>An agent is a system that repeatedly observes an environment, decides on an action and executes it, so that its actions affect what it observes next. A chatbot that answers each message in one model call is a degenerate case: its only action is a reply, and its "environment" is the user. An LLM agent uses the model as its policy inside a loop run by a harness: the model emits tool calls, the harness executes them against real systems (files, shells, APIs, browsers), the results are appended to the context, and the loop continues until a stopping condition. The practical differences follow from the loop: the agent can gather information and correct itself, but errors compound over steps, cost grows with the horizon, and actions with side effects raise safety questions a chatbot never faced. A strong answer adds that "agentic" is a spectrum, from fixed workflows where code decides the control flow to autonomous agents where the model does.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch01-qa-02">
+<summary><span class="lvl warm">Warm-up</span> Explain the ReAct pattern and why it works better than chain-of-thought alone or acting alone.</summary>
+<div class="answer">
+<p>ReAct interleaves three kinds of text in one context: thoughts (free-form reasoning), actions (structured commands executed by the harness) and observations (the results). Chain-of-thought alone must reason from the model's parametric knowledge, so on knowledge-intensive tasks it hallucinates facts and cannot check them. Acting alone, with no reasoning, tends to issue poorly chosen actions and loses track of what it has learned. Interleaving lets reasoning choose informative actions and interpret their results, while actions ground the reasoning in real data. It also makes trajectories interpretable and debuggable, because the reasoning behind each action is visible. Modern function-calling agents are ReAct with structured tool calls and, often, hidden reasoning tokens.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch01-qa-03">
+<summary><span class="lvl warm">Warm-up</span> What is the difference between pass@k and pass^k? When would you report each?</summary>
+<div class="answer">
+<p>pass@k is the probability that at least one of k attempts succeeds: \(1-(1-p)^k\) for a task with per-attempt success p. It is appropriate when a reliable selector exists, such as hidden tests or a human choosing among candidates, for example in offline code generation. pass^k is the probability that all k attempts succeed, \(p^k\): it measures consistency and is appropriate for deployed agents that face the same kind of task repeatedly, such as customer service, where each customer gets one attempt. pass@k increases with k and pass^k decreases. Over a task set both are averages of per-task quantities, so pass^k depends on how success is distributed across tasks: concentrated success yields higher pass^k than evenly spread success at the same mean.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch01-qa-04">
+<summary><span class="lvl core">Core</span> A task takes 30 steps and your agent is 97% reliable per step. Estimate its success rate, and describe three ways to improve it.</summary>
+<div class="answer">
+<p>Under independence, \(0.97^{30}=e^{30\ln0.97}=e^{-0.914}\approx0.40\). Three levers: (1) <b>Recovery</b>: add verification after risky steps (run tests, re-read the file after an edit, validate tool outputs) so that many errors cost a retry instead of the task; with good recovery the decay becomes far gentler than exponential. (2) <b>Shorter horizon</b>: better tools that do more per call (a search tool returning only relevant lines, an edit tool that applies a whole patch), or decomposing the task so that sub-tasks are verified independently. (3) <b>Higher per-step reliability</b>: a stronger or reasoning model for hard steps, clearer tool descriptions, better context (relevant files, examples), and constrained output formats to eliminate parsing errors. I would also measure where failures actually occur before choosing, because errors are correlated, for example a misunderstanding of the task at step one dooms the rest and is fixed by clarification, not by any per-step improvement.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch01-qa-05">
+<summary><span class="lvl core">Core</span> Why did classical symbolic planning not lead to general agents, and what do LLMs change?</summary>
+<div class="answer">
+<p>Planning chooses actions by searching a world model, and works superbly when the model is correct and compact. For open-ended domains the model had to be written by hand in logic, which ran into the frame problem (specifying what actions do not change), combinatorial explosion (realistic domains need hand-crafted heuristics) and above all the knowledge-acquisition bottleneck (writing and maintaining the facts and operators). LLMs supply an implicit, broad, if unreliable, world model and action prior learned from text, so the agent does not need a hand-written model to act sensibly. They do not give soundness or optimality guarantees, which is why hybrid designs (an LLM translates a problem into PDDL and a classical planner solves it, or an LLM proposes and a verifier checks) are attractive where correctness matters.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch01-qa-06">
+<summary><span class="lvl core">Core</span> Deep RL produced superhuman game-playing agents. Why didn't it produce useful software agents, and why does RL work for LLM agents now?</summary>
+<div class="answer">
+<p>Three obstacles: sample efficiency (DQN needed tens of millions of frames per game, OpenAI Five tens of thousands of years of play), which is affordable only in fast simulators; reward specification, since real tasks lack a score and naive rewards are hacked; and the absence of priors, since policies started from random weights and had to learn everything about each environment. With LLMs, RL starts from a policy that already reads, writes code and follows instructions, so it shapes behaviour rather than creating it and needs far fewer episodes. Verifiable rewards (unit tests, exact answers, database end-states) avoid hand-written reward functions for many tasks. Sandboxed software environments can be run in parallel at scale. Reward hacking remains a real problem: agents learn to special-case tests or claim success, so environment and reward design are still the hard part.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch01-qa-07">
+<summary><span class="lvl core">Core</span> Estimate the cost of a 40-step coding-agent episode whose context starts at 8k tokens and grows by 2.5k per step, at $3/M input, $15/M output, $0.30/M cached, 300 output tokens per step.</summary>
+<div class="answer">
+<p>Total input is \(\sum_t n_t = 40\cdot8000 + 2500\cdot\frac{40\cdot39}{2} = 320{,}000+1{,}950{,}000=2.27\)M tokens; output is 12k tokens. Uncached: \(2.27\times3=\$6.81\) plus \(\$0.18\) output, about $7. With caching, only the 105.5k newly appended tokens are full price ($0.32); 2.16M cached tokens cost $0.65; total about $1.15. The point to make: input dominates by two orders of magnitude, it grows quadratically with the horizon, and caching is worth 6× here. I would also note the cache must be kept warm (calls within the provider's time-to-live) and the prefix must be stable, so tool definitions and system prompt go first and nothing earlier in the context is edited.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch01-qa-08">
+<summary><span class="lvl core">Core</span> What is a harness or scaffold, and why does it matter as much as the model?</summary>
+<div class="answer">
+<p>The harness is the ordinary software around the model: it assembles the context for each call (system prompt, tool definitions, task, memory, history), parses and validates the model's tool calls, executes them with appropriate permissions, formats observations, enforces budgets and stopping rules, and decides when to ask a human. It matters because many agent failures are harness failures: a tool returning 10,000 lines of noise, an ambiguous tool description, a missing check after an edit, a context that drops the original goal, no limit on repeated actions. SWE-agent showed that redesigning tools alone multiplied resolution rates with the same model, and benchmark scores for the same model vary widely across scaffolds. When comparing agents, one must therefore compare model-plus-harness systems.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch01-qa-09">
+<summary><span class="lvl core">Core</span> How would you interpret a chart showing an agent benchmark going from 33% to 77% in one year?</summary>
+<div class="answer">
+<p>As a real trend with caveats. Check: are the numbers from the same scaffold, sampling settings and task subset (vendor-reported numbers often differ in all three)? Is it single-attempt or best-of-k? Has the benchmark been optimised against, possibly with contamination of tasks in training data? Are the remaining failures hard tasks or flawed ones? (SWE-bench Verified was created because many original tasks were under-specified.) Does the benchmark reflect my distribution of tasks? I would also ask for consistency (pass^k) and cost per resolved task, since a jump in success at ten times the cost may not be progress for a product. The underlying lesson is that benchmark gains combine model, harness and evaluation changes, and only controlled comparisons separate them.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch01-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> The independent-steps model \(\rho^H\) is clearly wrong in detail. In what ways, and what would a better model look like?</summary>
+<div class="answer">
+<p>It is wrong in at least four ways. (1) Not every error is fatal: agents recover, so failure is closer to an absorbing state reached only by unrecovered errors; with per-step error \(\epsilon\) and recovery probability \(r\), the effective fatal-error rate is about \(\epsilon(1-r)\), giving success \(\approx e^{-H\epsilon(1-r)}\) at the cost of extra steps. (2) Steps are not identically difficult: a few critical steps (locating the bug, understanding the policy) carry most of the risk. (3) Errors are correlated through the context: a misunderstanding early on raises the error rate of every later step, and long contexts degrade attention, so \(\rho\) may fall with \(t\). (4) \(H\) is random and depends on the agent's behaviour; a failing agent often takes more steps. A better model is a Markov chain on states such as on-track, off-track-but-recoverable and failed, with transition probabilities estimated from logged trajectories; Chapter 2 develops it. The \(\rho^H\) model survives as a first-order guide because it captures the exponential sensitivity to per-step error.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch01-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> Prove that pass^k over a task set is minimised, for fixed mean success, when all tasks are equally hard. What does this imply for evaluating agents?</summary>
+<div class="answer">
+<p>pass^k \(=\frac1m\sum_j p_j^k\) with \(\frac1m\sum_j p_j=\bar p\) fixed. For \(k\ge1\), \(f(x)=x^k\) is convex on \([0,1]\), so by Jensen \(\frac1m\sum f(p_j)\ge f(\bar p)=\bar p^k\), with equality iff all \(p_j\) are equal (strict convexity for \(k\ge2\)). Conversely, pass@k \(=1-\frac1m\sum(1-p_j)^k\le1-(1-\bar p)^k\), maximised when difficulties are equal. Implications: a single mean success rate does not determine consistency; to predict how a deployed agent behaves you need multiple trials per task to estimate the distribution of \(p_j\). It also suggests product strategy: identify task types with high \(p_j\) and automate them, and route low-\(p_j\) types to humans, which raises the consistency of what is automated.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch01-qa-12">
+<summary><span class="lvl deep">Deep-dive</span> METR reports a 50% time horizon doubling every seven months. What does that imply, and what are the main reasons to be careful with it?</summary>
+<div class="answer">
+<p>Seven-month doubling is about 3.3× per year; extrapolated naively, hour-long tasks in early 2025 become day-long tasks within roughly three years. Reasons for care: the horizon is measured on a particular suite (mostly software and research tasks with automatic scoring), so it may not transfer to messier work; the 50% threshold is far from the reliability production needs, and the 80% horizon is several times shorter; human task times are themselves noisy and depend on the humans' context; the fit has wide confidence intervals; and trend extrapolation assumes the drivers (scale, RL on agentic tasks, better scaffolds) continue. Still, the regularity is useful: it gives a quantitative way to compare models on agentic capability, independent of any one benchmark's saturation.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch01-qa-13">
+<summary><span class="lvl deep">Deep-dive</span> Why does agent input cost grow quadratically with the number of steps, and what are the engineering responses?</summary>
+<div class="answer">
+<p>Each call re-reads the full context, and the context grows roughly linearly with the step count as actions and observations are appended, so the sum over steps is quadratic: \(Hn_1+\Delta H(H-1)/2\). Responses: (1) prompt caching, which charges about a tenth for re-read prefixes and avoids recomputation, but requires an append-only, stable prefix; (2) smaller observations, by designing tools that return concise, relevant output (line ranges, summaries, filtered logs); (3) context management, by compacting old history into summaries, dropping stale tool outputs, or keeping notes in files; (4) delegation, where sub-agents with fresh contexts do bounded sub-tasks and return short results; (5) cheaper models for routine steps. The first lowers the constant; the others change the growth rate.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch01-qa-14">
+<summary><span class="lvl design">Design</span> You are asked to "build an agent" to automate first-line customer support for an airline. Before writing code, what questions do you ask and what do you measure?</summary>
+<div class="answer">
+<p>Scope: which request types (changes, cancellations, refunds, baggage), their volumes and what a correct resolution is for each; the written policy and how often it requires judgement; which actions have irreversible or financial effects. Tools: which systems the agent can query and modify, with what permissions and rate limits. Success criteria: per-type success measured against end-states in the booking database and policy compliance, not just customer satisfaction; consistency (pass^k on repeated simulated conversations); escalation rate and correctness of escalation; cost per conversation; latency per turn. Risk: what the agent must never do (refund outside policy, reveal another customer's data), how it handles adversarial users, and human approval for high-impact actions. I would start with the highest-volume, most verifiable request types, build a simulated-customer evaluation set from historical tickets, measure a baseline of a fixed workflow before giving the model more autonomy, and route uncertain cases to humans from day one.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch01-qa-15">
+<summary><span class="lvl design">Design</span> Sketch the components of a coding agent that fixes GitHub issues, and say where you expect it to fail.</summary>
+<div class="answer">
+<p>Components: a sandboxed container with the repository and its dependencies; tools for searching code, viewing files with line numbers, editing with syntax checks, and running tests or arbitrary commands with time limits; a harness that builds the context (system prompt with conventions, issue text, repository map), runs the loop, caches the prefix and compacts history when long; a stopping rule (tests pass and the model submits, or a budget is exhausted); and an output step that produces a patch and an explanation for review. Expected failures: mislocalising the bug (reading the wrong files), fixing the symptom and not the cause, breaking other tests, editing tests to pass, getting stuck in loops of the same failing command, environment set-up failures, and claiming success without running tests. Mitigations: localisation tools and a repository map; requiring a test run before submission; reproducing the bug first with a new test; loop detection; forbidding edits to test files unless asked; sampling several candidate patches and selecting by test results; and human review of the final diff.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch01-qa-16">
+<summary><span class="lvl design">Design</span> When would you <em>not</em> build an agent, and use a fixed workflow or a single model call instead?</summary>
+<div class="answer">
+<p>When the steps are known in advance (extract fields, classify, then route), a fixed workflow in code is cheaper, faster, easier to test and more reliable, because the model is only asked to do bounded sub-tasks and the control flow cannot go wrong. When one call suffices (summarise this document), a loop adds cost and failure modes without benefit. Agents are worth their cost when the number and kind of steps depend on what is discovered along the way (debugging, research, open-ended customer requests), when the environment provides feedback the model can use, and when errors can be detected and corrected. A good practice is to begin with the simplest design, measure, and add autonomy only where measurements show the fixed design failing, which is the recommendation of most practitioners who have deployed agents at scale.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="ref-aima">S. Russell and P. Norvig. <em>Artificial Intelligence: A Modern Approach</em>. Prentice Hall, 1995; 4th ed., Pearson, 2020.</li>
+<li id="ref-rosenblueth">A. Rosenblueth, N. Wiener, J. Bigelow. Behavior, Purpose and Teleology. <em>Philosophy of Science</em>, 10(1), 1943.</li>
+<li id="ref-wiener">N. Wiener. <em>Cybernetics: or Control and Communication in the Animal and the Machine</em>. MIT Press, 1948.</li>
+<li id="ref-gps">A. Newell, J. C. Shaw, H. A. Simon. Report on a general problem-solving program. <em>Proc. International Conference on Information Processing</em>, 1959; A. Newell and H. A. Simon, GPS, a program that simulates human thought, 1961.</li>
+<li id="ref-strips">R. E. Fikes and N. J. Nilsson. STRIPS: A New Approach to the Application of Theorem Proving to Problem Solving. <em>Artificial Intelligence</em>, 2(3–4), 1971.</li>
+<li id="ref-astar">P. E. Hart, N. J. Nilsson, B. Raphael. A Formal Basis for the Heuristic Determination of Minimum Cost Paths. <em>IEEE Trans. Systems Science and Cybernetics</em>, 4(2), 1968.</li>
+<li id="ref-frame">J. McCarthy and P. J. Hayes. Some Philosophical Problems from the Standpoint of Artificial Intelligence. <em>Machine Intelligence 4</em>, 1969.</li>
+<li id="ref-brooks">R. A. Brooks. A Robust Layered Control System for a Mobile Robot. <em>IEEE Journal of Robotics and Automation</em>, 2(1), 1986; Intelligence without representation, <em>Artificial Intelligence</em> 47, 1991.</li>
+<li id="ref-bdi">A. S. Rao and M. P. Georgeff. BDI Agents: From Theory to Practice. <em>ICMAS</em>, 1995.</li>
+<li id="ref-wooldridge">M. Wooldridge and N. R. Jennings. Intelligent Agents: Theory and Practice. <em>Knowledge Engineering Review</em>, 10(2), 1995.</li>
+<li id="ref-sutton">R. S. Sutton and A. G. Barto. <em>Reinforcement Learning: An Introduction</em>, 2nd ed. MIT Press, 2018; R. S. Sutton, Learning to predict by the methods of temporal differences, <em>Machine Learning</em> 3, 1988; C. Watkins, PhD thesis, Cambridge, 1989.</li>
+<li id="ref-tdgammon">G. Tesauro. Temporal Difference Learning and TD-Gammon. <em>Communications of the ACM</em>, 38(3), 1995.</li>
+<li id="ref-dqn">V. Mnih et al. Human-level control through deep reinforcement learning. <em>Nature</em> 518, 2015; Playing Atari with Deep Reinforcement Learning, <a href="https://arxiv.org/abs/1312.5602">arXiv:1312.5602</a>, 2013.</li>
+<li id="ref-alphago">D. Silver et al. Mastering the game of Go with deep neural networks and tree search. <em>Nature</em> 529, 2016; Mastering the game of Go without human knowledge, <em>Nature</em> 550, 2017.</li>
+<li id="ref-gpt3">T. Brown et al. Language Models are Few-Shot Learners. <em>NeurIPS</em>, 2020. <a href="https://arxiv.org/abs/2005.14165">arXiv:2005.14165</a>.</li>
+<li id="ref-instructgpt">L. Ouyang et al. Training language models to follow instructions with human feedback. <em>NeurIPS</em>, 2022. <a href="https://arxiv.org/abs/2203.02155">arXiv:2203.02155</a>.</li>
+<li id="ref-cot">J. Wei et al. Chain-of-Thought Prompting Elicits Reasoning in Large Language Models. <em>NeurIPS</em>, 2022. <a href="https://arxiv.org/abs/2201.11903">arXiv:2201.11903</a>.</li>
+<li id="ref-webgpt">R. Nakano et al. WebGPT: Browser-assisted question-answering with human feedback. 2021. <a href="https://arxiv.org/abs/2112.09332">arXiv:2112.09332</a>.</li>
+<li id="ref-saycan">M. Ahn et al. Do As I Can, Not As I Say: Grounding Language in Robotic Affordances. 2022. <a href="https://arxiv.org/abs/2204.01691">arXiv:2204.01691</a>.</li>
+<li id="ref-mrkl">E. Karpas et al. MRKL Systems: A modular, neuro-symbolic architecture that combines large language models, external knowledge sources and discrete reasoning. 2022. <a href="https://arxiv.org/abs/2205.00445">arXiv:2205.00445</a>.</li>
+<li id="ref-react">S. Yao, J. Zhao, D. Yu, N. Du, I. Shafran, K. Narasimhan, Y. Cao. ReAct: Synergizing Reasoning and Acting in Language Models. <em>ICLR</em>, 2023. <a href="https://arxiv.org/abs/2210.03629">arXiv:2210.03629</a>.</li>
+<li id="ref-toolformer">T. Schick et al. Toolformer: Language Models Can Teach Themselves to Use Tools. <em>NeurIPS</em>, 2023. <a href="https://arxiv.org/abs/2302.04761">arXiv:2302.04761</a>.</li>
+<li id="ref-reflexion">N. Shinn, F. Cassano, E. Berman, A. Gopinath, K. Narasimhan, S. Yao. Reflexion: Language Agents with Verbal Reinforcement Learning. <em>NeurIPS</em>, 2023. <a href="https://arxiv.org/abs/2303.11366">arXiv:2303.11366</a>.</li>
+<li id="ref-genagents">J. S. Park et al. Generative Agents: Interactive Simulacra of Human Behavior. <em>UIST</em>, 2023. <a href="https://arxiv.org/abs/2304.03442">arXiv:2304.03442</a>.</li>
+<li id="ref-voyager">G. Wang et al. Voyager: An Open-Ended Embodied Agent with Large Language Models. 2023. <a href="https://arxiv.org/abs/2305.16291">arXiv:2305.16291</a>.</li>
+<li id="ref-swebench">C. E. Jimenez et al. SWE-bench: Can Language Models Resolve Real-World GitHub Issues? <em>ICLR</em>, 2024. <a href="https://arxiv.org/abs/2310.06770">arXiv:2310.06770</a>.</li>
+<li id="ref-sweagent">J. Yang et al. SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering. <em>NeurIPS</em>, 2024. <a href="https://arxiv.org/abs/2405.15793">arXiv:2405.15793</a>.</li>
+<li id="ref-r1">DeepSeek-AI. DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning. 2025. <a href="https://arxiv.org/abs/2501.12948">arXiv:2501.12948</a>.</li>
+<li id="ref-mcp">Anthropic. Introducing the Model Context Protocol. November 2024. <a href="https://modelcontextprotocol.io">modelcontextprotocol.io</a>.</li>
+<li id="ref-metr">T. Kwa et al. Measuring AI Ability to Complete Long Tasks. METR, 2025. <a href="https://arxiv.org/abs/2503.14499">arXiv:2503.14499</a>.</li>
+<li id="ref-bea">E. Schluntz and B. Zhang. Building Effective Agents. Anthropic, December 2024. <a href="https://www.anthropic.com/research/building-effective-agents">anthropic.com</a>.</li>
+<li id="ref-codex">M. Chen et al. Evaluating Large Language Models Trained on Code. 2021. <a href="https://arxiv.org/abs/2107.03374">arXiv:2107.03374</a>.</li>
+<li id="ref-taubench">S. Yao, N. Shinn, P. Razavi, K. Narasimhan. τ-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains. 2024. <a href="https://arxiv.org/abs/2406.12045">arXiv:2406.12045</a>.</li>
+<li>Further reading: T. Sumers, S. Yao, K. Narasimhan, T. Griffiths, Cognitive Architectures for Language Agents, <a href="https://arxiv.org/abs/2309.02427">arXiv:2309.02427</a>; L. Weng, LLM Powered Autonomous Agents (2023), <a href="https://lilianweng.github.io/posts/2023-06-23-agent/">lilianweng.github.io</a>; N. J. Nilsson, <em>The Quest for Artificial Intelligence</em>, Cambridge University Press, 2010.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

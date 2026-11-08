@@ -1,0 +1,711 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 5 · GPU Architecture from First Principles — Introduction to LLM Engineering</title>
+<meta name="description" content="Chapter 5 of Introduction to LLM Engineering: latency vs throughput machines, the CUDA execution model, streaming multiprocessors, the memory hierarchy, tensor cores from Volta to Blackwell, HBM, NVLink, TPUs and other accelerators, and reading spec sheets.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script defer src="/library/assets/book-shim.js" data-library="/library/" data-field="/library/AI_Engineering/" data-field-title="AI Engineering"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-chapter="ch05" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Part II · The Machine — Chapter 5</div>
+<h1 id="top">GPU Architecture from First Principles</h1>
+<p class="lede">Why a chip that can do a thousand trillion operations a second spends most of its time waiting, and what every part of a modern GPU is for.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Part I treated the accelerator as three numbers: peak compute \(\pi\), memory bandwidth \(\beta\) and memory capacity \(M_{\text{HBM}}\), plus an unexplained "overhead". With nothing more than those numbers, we explained why decode is memory-bound, sized the KV cache, and costed a request. But the numbers themselves were taken on faith, and almost every optimisation in the rest of the book works by exploiting structure that the three numbers hide. FlashAttention (Chapter 9) runs faster than ordinary attention while performing <em>more</em> arithmetic, because it keeps data in a layer of memory that \(\beta\) does not describe. Kernel fusion (Chapter 7) speeds up code without changing a single FLOP. Tensor parallelism (Chapter 18) is viable inside a server and painful across servers because of a hundredfold difference in link bandwidth. To understand these techniques, and to reason about hardware no one has benchmarked yet, we need a working model of the machine.</p>
+<p>This chapter builds that model from first principles, for a reader who has never thought about processor design. We start with a question of economics: given a fixed budget of transistors and watts, should a chip make one task fast or many tasks fast? The answer leads to the GPU's programming model of thousands of threads grouped into warps and blocks. Then come its building block, the streaming multiprocessor; its memory hierarchy, from registers to HBM; the tensor cores that supply most of its arithmetic; and the links that join GPUs into servers and racks. We follow NVIDIA's data-centre line from Volta (2017) to Blackwell (2025) and Rubin (2026), because each generation's changes were driven by the workloads in this book, and we compare it with Google's TPUs, AMD's Instinct GPUs and dataflow chips such as Groq's and Cerebras's. We end with a practical skill: reading a spec sheet without being fooled by it.</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Explain the latency-versus-throughput design trade-off, and use Little's law to show why a GPU needs tens of thousands of threads in flight.</li>
+<li>Describe the CUDA execution model (grids, blocks, warps, threads) and the cost of divergence.</li>
+<li>Describe a streaming multiprocessor and derive a GPU's peak FLOP/s from SM count, per-SM throughput and clock.</li>
+<li>Draw the memory hierarchy with approximate capacities and bandwidths, and explain why on-chip reuse is the key to performance.</li>
+<li>Trace the evolution of tensor cores from Volta to Blackwell, including the move to lower precisions and asynchronous execution.</li>
+<li>Derive HBM bandwidth from stacks, bus width and pin rate, and compare NVLink, PCIe and network bandwidth.</li>
+<li>Compare GPUs with TPUs, AMD Instinct and SRAM-based dataflow accelerators, and read a spec sheet critically.</li>
+</ol>
+<p class="small muted">Uses: Chapter 1 (§1.9 the factory and warehouse), Chapter 3 (§3.4 compute, memory, overhead; §3.5 the roofline). Symbols: <a href="../notation.html">notation page</a>.</p>
+</div>
+
+<h2 id="s5-1">5.1 Two ways to spend a transistor budget</h2>
+<p>A processor designer has a fixed budget of chip area and power, and must decide what to optimise. One option is to make a <em>single</em> stream of instructions finish as quickly as possible. That is what a CPU does. Each CPU core devotes most of its area to machinery that reduces <strong>latency</strong>, the time until one result is ready. Large caches keep recently used data close. Branch predictors guess which way an <code>if</code> will go before the condition is known. Out-of-order execution reorders instructions to avoid waiting. A server CPU has a few dozen such cores, each a marvel of latency hiding, and is ideal for code that does one complicated thing after another, such as an operating system, a database or a Python interpreter.</p>
+<p>The other option is to make <em>many</em> independent streams finish at a high total rate, accepting that each individual stream is slow. That is what a GPU does. It optimises <strong>throughput</strong>, results per second summed over all streams. It strips each processing lane down to little more than an arithmetic unit and a slice of register file, and spends the savings on thousands of lanes. It does not try to make any one memory access fast. Instead, when one group of threads must wait for memory, it simply switches to another group that is ready to compute. This works only if there is always another group ready, so a GPU must be given a huge amount of parallel work. Neural networks, whose core operation is the product of large matrices, are an almost perfect fit.</p>
+
+<figure class="diagram" id="fig-5-1">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-label="A CPU spends area on control and cache; a GPU spends area on many arithmetic units">
+<text x="180" y="22" text-anchor="middle" class="t-b">CPU: few cores, optimised for latency</text>
+<text x="540" y="22" text-anchor="middle" class="t-b">GPU: many lanes, optimised for throughput</text>
+<rect x="30" y="36" width="300" height="150" rx="10" class="fill-muted"/>
+<rect x="44" y="50" width="130" height="58" rx="6" class="bx5"/><text x="109" y="74" text-anchor="middle" class="t-sm">control: branch</text><text x="109" y="90" text-anchor="middle" class="t-sm">prediction, out-of-order</text>
+<rect x="184" y="50" width="62" height="58" rx="6" class="bx2"/><text x="215" y="83" text-anchor="middle" class="t-sm">ALUs</text>
+<rect x="256" y="50" width="62" height="58" rx="6" class="bx2"/><text x="287" y="83" text-anchor="middle" class="t-sm">ALUs</text>
+<rect x="44" y="118" width="274" height="56" rx="6" class="bx4"/><text x="181" y="150" text-anchor="middle" class="t-sm">large caches (tens of MB)</text>
+<rect x="390" y="36" width="300" height="150" rx="10" class="fill-muted"/>
+<g>
+<rect x="402" y="48" width="66" height="60" rx="5" class="bx"/><rect x="474" y="48" width="66" height="60" rx="5" class="bx"/><rect x="546" y="48" width="66" height="60" rx="5" class="bx"/><rect x="618" y="48" width="66" height="60" rx="5" class="bx"/>
+<rect x="402" y="114" width="66" height="60" rx="5" class="bx"/><rect x="474" y="114" width="66" height="60" rx="5" class="bx"/><rect x="546" y="114" width="66" height="60" rx="5" class="bx"/><rect x="618" y="114" width="66" height="60" rx="5" class="bx"/>
+</g>
+<g class="t-xs">
+<text x="435" y="74" text-anchor="middle">SM</text><text x="507" y="74" text-anchor="middle">SM</text><text x="579" y="74" text-anchor="middle">SM</text><text x="651" y="74" text-anchor="middle">SM</text>
+<text x="435" y="140" text-anchor="middle">SM</text><text x="507" y="140" text-anchor="middle">SM</text><text x="579" y="140" text-anchor="middle">SM</text><text x="651" y="140" text-anchor="middle">SM</text>
+</g>
+<g><rect x="410" y="82" width="10" height="10" class="fill-s2"/><rect x="423" y="82" width="10" height="10" class="fill-s2"/><rect x="436" y="82" width="10" height="10" class="fill-s2"/><rect x="449" y="82" width="10" height="10" class="fill-s2"/>
+<rect x="482" y="82" width="10" height="10" class="fill-s2"/><rect x="495" y="82" width="10" height="10" class="fill-s2"/><rect x="508" y="82" width="10" height="10" class="fill-s2"/><rect x="521" y="82" width="10" height="10" class="fill-s2"/>
+<rect x="554" y="82" width="10" height="10" class="fill-s2"/><rect x="567" y="82" width="10" height="10" class="fill-s2"/><rect x="580" y="82" width="10" height="10" class="fill-s2"/><rect x="593" y="82" width="10" height="10" class="fill-s2"/>
+<rect x="626" y="82" width="10" height="10" class="fill-s2"/><rect x="639" y="82" width="10" height="10" class="fill-s2"/><rect x="652" y="82" width="10" height="10" class="fill-s2"/><rect x="665" y="82" width="10" height="10" class="fill-s2"/>
+<rect x="410" y="148" width="10" height="10" class="fill-s2"/><rect x="423" y="148" width="10" height="10" class="fill-s2"/><rect x="436" y="148" width="10" height="10" class="fill-s2"/><rect x="449" y="148" width="10" height="10" class="fill-s2"/>
+<rect x="482" y="148" width="10" height="10" class="fill-s2"/><rect x="495" y="148" width="10" height="10" class="fill-s2"/><rect x="508" y="148" width="10" height="10" class="fill-s2"/><rect x="521" y="148" width="10" height="10" class="fill-s2"/>
+<rect x="554" y="148" width="10" height="10" class="fill-s2"/><rect x="567" y="148" width="10" height="10" class="fill-s2"/><rect x="580" y="148" width="10" height="10" class="fill-s2"/><rect x="593" y="148" width="10" height="10" class="fill-s2"/>
+<rect x="626" y="148" width="10" height="10" class="fill-s2"/><rect x="639" y="148" width="10" height="10" class="fill-s2"/><rect x="652" y="148" width="10" height="10" class="fill-s2"/><rect x="665" y="148" width="10" height="10" class="fill-s2"/></g>
+<text x="180" y="210" text-anchor="middle" class="t-xs">dozens of cores; each finishes one task fast</text>
+<text x="540" y="210" text-anchor="middle" class="t-xs">132 SMs (H100), each running thousands of threads; total rate matters</text>
+</svg>
+<figcaption><b>Figure 5.1 — Where the transistors go.</b> A CPU core spends most of its area on control logic and cache to make a single instruction stream fast. A GPU spends it on arithmetic units (orange) replicated across many streaming multiprocessors (SMs), and hides latency by switching between threads.</figcaption></figure>
+
+<p>Figure 5.1 caricatures the two designs. On the left, a CPU core is dominated by control logic and cache, with a modest number of arithmetic units. On the right, a GPU is a grid of identical <strong>streaming multiprocessors</strong> (SMs), each dense with arithmetic lanes and with comparatively little control. An H100 has 132 SMs. The difference in philosophy has a precise quantitative core, which is worth deriving because it explains much of what follows.</p>
+
+<h3 id="littles-law-memory">Little's law, again: how much parallelism does memory need?</h3>
+<p>We met Little's law in §1.13 as a statement about requests in a server: \(\bar n=\lambda W\). It applies equally to memory. Let \(\delta_{\text{mem}}\) be the latency of a main-memory access, the time from issuing a load to receiving the data. On an H100 this is of the order of 600–800 nanoseconds under load. If memory is to deliver its full bandwidth \(\beta\), then by Little's law the number of bytes in flight at any moment must be</p>
+\[ \text{bytes in flight} = \beta\cdot\delta_{\text{mem}} \approx 3.35\times10^{12}\ \text{B/s}\times 700\times10^{-9}\ \text{s}\approx 2.3\ \text{MB}. \]
+<p>A single CPU core can keep only a few dozen memory requests outstanding, perhaps a few kilobytes. To saturate HBM, an H100 must therefore have about two megabytes of loads outstanding at every instant, roughly 18 KB per SM, or over a thousand outstanding 16-byte requests per SM. The only practical way to generate that many independent requests is to run a very large number of threads, each issuing its own loads and each willing to wait. This is the deepest reason GPUs are built the way they are, and also the reason a GPU running a small amount of work, such as a decode step at batch size 1 in a small model, struggles to reach its rated bandwidth: there are not enough independent loads to fill the pipe.</p>
+
+<h2 id="s5-2">5.2 The programming model: threads, warps and blocks</h2>
+<p>How does a programmer express "thousands of independent streams"? NVIDIA's answer, introduced with CUDA in 2007, is the <strong>kernel</strong>: a function written from the point of view of a single thread, launched over a large index space. The programmer writes, in effect, "for each index \(i\) in this range, do the following", and the hardware runs all the indices in parallel, in an order it chooses.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — a kernel is a map over an index set</div>
+<p>Think of a kernel as a function \(f\) applied to every element of an index set \(\mathcal I\), typically a product of integer intervals such as \(\{0,\dots,1023\}^2\). The programmer defines \(f(i)\), which reads some inputs and writes some outputs, and the hardware evaluates \(\{f(i)\}_{i\in\mathcal I}\) in an unspecified order. Correctness requires that the result not depend on that order, which in practice means different indices write to different outputs, or combine their results with explicit synchronisation. The CPU-side program, the <em>host</em>, launches kernels on the GPU, the <em>device</em>, and continues without waiting. Kernels run asynchronously, in the order they were issued.</p>
+</div>
+
+<p>The index space is organised hierarchically, and each level of the hierarchy corresponds to a level of the hardware.</p>
+<ul>
+<li>A <strong>thread</strong> is one evaluation of \(f(i)\). It has its own registers: private, extremely fast storage.</li>
+<li>Threads are grouped into <strong>warps</strong> of 32. A warp is the true unit of execution. Its 32 threads execute the same instruction at the same time on 32 lanes, like a 32-wide vector instruction. NVIDIA calls this SIMT, single instruction, multiple threads.</li>
+<li>Warps are grouped into <strong>thread blocks</strong> (also called CTAs, cooperative thread arrays) of up to 1,024 threads. All warps of a block run on the same SM, can share data through that SM's fast <em>shared memory</em>, and can synchronise with one another.</li>
+<li>Blocks form the <strong>grid</strong>, the whole launch. Blocks are independent and may run in any order on any SM, which is what lets the same program scale from a laptop GPU to an H100.</li>
+</ul>
+
+<figure class="diagram" id="fig-5-2">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-label="Grid of thread blocks, each made of warps of 32 threads, mapped to SMs">
+<defs><marker id="a52" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<text x="130" y="20" text-anchor="middle" class="t-b">Grid (one kernel launch)</text>
+<g>
+<rect x="20" y="30" width="60" height="40" rx="5" class="bx"/><rect x="90" y="30" width="60" height="40" rx="5" class="bx5"/><rect x="160" y="30" width="60" height="40" rx="5" class="bx"/>
+<rect x="20" y="80" width="60" height="40" rx="5" class="bx"/><rect x="90" y="80" width="60" height="40" rx="5" class="bx"/><rect x="160" y="80" width="60" height="40" rx="5" class="bx"/>
+<rect x="20" y="130" width="60" height="40" rx="5" class="bx"/><rect x="90" y="130" width="60" height="40" rx="5" class="bx"/><rect x="160" y="130" width="60" height="40" rx="5" class="bx"/>
+<text x="120" y="54" text-anchor="middle" class="t-xs">block</text>
+</g>
+<text x="120" y="194" text-anchor="middle" class="t-xs">blocks are independent; any order, any SM</text>
+<line x1="150" y1="50" x2="290" y2="50" class="ln" marker-end="url(#a52)"/>
+<text x="400" y="20" text-anchor="middle" class="t-b">One thread block (e.g. 128 threads)</text>
+<rect x="290" y="30" width="220" height="140" rx="8" class="bx5"/>
+<rect x="302" y="42" width="196" height="24" rx="4" class="bx"/><text x="400" y="58" text-anchor="middle" class="t-xs">warp 0: threads 0–31</text>
+<rect x="302" y="72" width="196" height="24" rx="4" class="bx"/><text x="400" y="88" text-anchor="middle" class="t-xs">warp 1: threads 32–63</text>
+<rect x="302" y="102" width="196" height="24" rx="4" class="bx"/><text x="400" y="118" text-anchor="middle" class="t-xs">warp 2: threads 64–95</text>
+<rect x="302" y="132" width="196" height="24" rx="4" class="bx"/><text x="400" y="148" text-anchor="middle" class="t-xs">warp 3: threads 96–127</text>
+<text x="400" y="194" text-anchor="middle" class="t-xs">shares the SM's shared memory; can synchronise</text>
+<line x1="510" y1="100" x2="560" y2="100" class="ln" marker-end="url(#a52)"/>
+<text x="635" y="20" text-anchor="middle" class="t-b">Runs on one SM</text>
+<rect x="560" y="30" width="150" height="140" rx="8" class="bx2"/>
+<text x="635" y="70" text-anchor="middle" class="t-sm">warp schedulers</text>
+<text x="635" y="90" text-anchor="middle" class="t-sm">pick a ready warp</text>
+<text x="635" y="110" text-anchor="middle" class="t-sm">every cycle;</text>
+<text x="635" y="130" text-anchor="middle" class="t-sm">stalled warps wait</text>
+<text x="635" y="194" text-anchor="middle" class="t-xs">up to 64 warps resident per SM</text>
+<text x="360" y="220" text-anchor="middle" class="t-sm">thread = one index · warp = 32 threads in lockstep · block = warps sharing an SM · grid = all blocks</text>
+</svg>
+<figcaption><b>Figure 5.2 — The CUDA execution hierarchy.</b> A kernel launch is a grid of independent thread blocks. Each block is a set of warps that run together on one SM; each warp is 32 threads executing in lockstep.</figcaption></figure>
+
+<p>Figure 5.2 shows the hierarchy from left to right. The grid is a set of independent blocks. One block is a handful of warps, each of 32 consecutive threads. Each block is assigned to an SM, where the SM's warp schedulers interleave the warps of all resident blocks. On every clock cycle a scheduler picks a warp whose next instruction has its operands ready and issues it. A warp waiting for memory simply is not picked. This is how the GPU hides the memory latency of §5.1: with many warps resident, there is almost always one ready to compute. The number of resident warps divided by the maximum (64 per SM on H100) is called <strong>occupancy</strong>. It is limited by how many registers and how much shared memory each block needs, a trade-off kernel writers balance constantly (Chapter 7).</p>
+<p>Lockstep execution has a cost. If threads of the same warp take different branches of an <code>if</code>, the warp executes <em>both</em> branches one after the other, with the inactive threads masked off. This is called <strong>divergence</strong>, and in the worst case it can cut throughput by up to 32×. Well-written kernels arrange work so that whole warps take the same path. Matrix multiplication, where every thread does the same thing on different data, has no divergence at all, which is one more reason it runs so well.</p>
+
+<h2 id="s5-3">5.3 The streaming multiprocessor</h2>
+<p>The SM is the GPU's building block; everything else is replication and plumbing. Understanding one SM well is enough to understand the chip. On Hopper (H100), an SM is divided into four <em>sub-partitions</em>. Each has its own warp scheduler, a quarter of the register file (64 KB, so 256 KB per SM), 32 lanes of FP32 arithmetic ("CUDA cores"), special-function units for operations such as \(\exp\) and reciprocal, load/store units, and one <strong>tensor core</strong>. The four sub-partitions share 256 KB of fast on-chip SRAM, which is configurable as L1 cache or as programmer-managed <strong>shared memory</strong> (up to 228 KB). On Hopper they also share a <strong>Tensor Memory Accelerator</strong> (TMA), a copy engine that moves whole tiles between HBM and shared memory asynchronously.</p>
+
+<figure class="diagram" id="fig-5-3">
+<svg class="dg" viewBox="0 0 720 290" role="img" aria-label="Block diagram of a Hopper streaming multiprocessor">
+<rect x="20" y="20" width="680" height="256" rx="12" class="fill-muted"/>
+<text x="360" y="42" text-anchor="middle" class="t-b">One H100 streaming multiprocessor (×132 per GPU)</text>
+<g>
+<rect x="36" y="54" width="154" height="140" rx="8" class="bx"/><text x="113" y="72" text-anchor="middle" class="t-sm t-b">sub-partition 0</text>
+<rect x="46" y="80" width="134" height="20" rx="3" class="bx5"/><text x="113" y="94" text-anchor="middle" class="t-xs">warp scheduler</text>
+<rect x="46" y="104" width="134" height="20" rx="3" class="bx4"/><text x="113" y="118" text-anchor="middle" class="t-xs">registers 64 KB</text>
+<rect x="46" y="128" width="64" height="26" rx="3" class="bx3"/><text x="78" y="145" text-anchor="middle" class="t-xs">32 FP32</text>
+<rect x="116" y="128" width="64" height="26" rx="3" class="bx3"/><text x="148" y="145" text-anchor="middle" class="t-xs">SFU, LD/ST</text>
+<rect x="46" y="158" width="134" height="28" rx="3" class="bx2"/><text x="113" y="177" text-anchor="middle" class="t-sm">tensor core</text>
+</g>
+<g>
+<rect x="200" y="54" width="154" height="140" rx="8" class="bx"/><text x="277" y="72" text-anchor="middle" class="t-sm t-b">sub-partition 1</text>
+<rect x="210" y="80" width="134" height="20" rx="3" class="bx5"/><rect x="210" y="104" width="134" height="20" rx="3" class="bx4"/><rect x="210" y="128" width="64" height="26" rx="3" class="bx3"/><rect x="280" y="128" width="64" height="26" rx="3" class="bx3"/><rect x="210" y="158" width="134" height="28" rx="3" class="bx2"/><text x="277" y="177" text-anchor="middle" class="t-sm">tensor core</text>
+</g>
+<g>
+<rect x="364" y="54" width="154" height="140" rx="8" class="bx"/><text x="441" y="72" text-anchor="middle" class="t-sm t-b">sub-partition 2</text>
+<rect x="374" y="80" width="134" height="20" rx="3" class="bx5"/><rect x="374" y="104" width="134" height="20" rx="3" class="bx4"/><rect x="374" y="128" width="64" height="26" rx="3" class="bx3"/><rect x="444" y="128" width="64" height="26" rx="3" class="bx3"/><rect x="374" y="158" width="134" height="28" rx="3" class="bx2"/><text x="441" y="177" text-anchor="middle" class="t-sm">tensor core</text>
+</g>
+<g>
+<rect x="528" y="54" width="154" height="140" rx="8" class="bx"/><text x="605" y="72" text-anchor="middle" class="t-sm t-b">sub-partition 3</text>
+<rect x="538" y="80" width="134" height="20" rx="3" class="bx5"/><rect x="538" y="104" width="134" height="20" rx="3" class="bx4"/><rect x="538" y="128" width="64" height="26" rx="3" class="bx3"/><rect x="608" y="128" width="64" height="26" rx="3" class="bx3"/><rect x="538" y="158" width="134" height="28" rx="3" class="bx2"/><text x="605" y="177" text-anchor="middle" class="t-sm">tensor core</text>
+</g>
+<rect x="36" y="204" width="510" height="30" rx="6" class="bx4"/><text x="291" y="224" text-anchor="middle" class="t-sm">256 KB L1 / shared memory (up to 228 KB as shared memory)</text>
+<rect x="556" y="204" width="126" height="30" rx="6" class="bx5"/><text x="619" y="224" text-anchor="middle" class="t-sm">TMA copy engine</text>
+<text x="360" y="260" text-anchor="middle" class="t-xs">≈ 4,096 dense BF16 FLOPs per clock per SM from the four tensor cores, versus 256 from the FP32 lanes</text>
+</svg>
+<figcaption><b>Figure 5.3 — Inside a Hopper SM.</b> Four sub-partitions, each with a scheduler, registers, FP32 lanes, special-function and load/store units, and a tensor core, share a 256 KB pool of on-chip SRAM and an asynchronous copy engine (TMA).</figcaption></figure>
+
+<p>Figure 5.3 draws this layout, and its footnote contains the single most important fact about modern GPUs. The four tensor cores of an H100 SM together perform about 4,096 dense BF16 FLOPs per clock cycle (2,048 multiply-adds). The 128 FP32 lanes perform 256 (one fused multiply-add each). <strong>More than 90% of the chip's arithmetic capability is in the tensor cores</strong>, and it is available only for one operation: small dense matrix multiplication. An LLM is fast on a GPU precisely to the extent that its work is expressed as matrix products. Anything else, such as softmax, normalisation, activation functions or sampling, runs on the much weaker general-purpose lanes.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — deriving peak FLOP/s</div>
+<p>Peak throughput is SMs × FLOPs per clock per SM × clock frequency \(f_{\text{clk}}\).</p>
+<ul>
+<li><strong>V100:</strong> 80 SMs × 1,024 FP16 FLOPs/clock (8 tensor cores × 64 multiply-adds × 2) × 1.53 GHz ≈ 125 TFLOP/s.</li>
+<li><strong>A100:</strong> 108 SMs × 2,048 × 1.41 GHz ≈ 312 TFLOP/s.</li>
+<li><strong>H100 SXM:</strong> 132 SMs × 4,096 × ≈1.83 GHz ≈ 989 TFLOP/s.</li>
+</ul>
+<p>The FP32 lanes of an H100 give only 132 × 256 × 1.83 GHz ≈ 62 TFLOP/s. This is the number that matters for a softmax or an RMSNorm written naively, and it is why non-matmul operations can dominate time out of all proportion to their FLOP count (FlashAttention-4 explicitly works around the limited throughput of the exponential unit on Blackwell; Chapter 9).</p>
+</div>
+
+<h2 id="s5-4">5.4 The memory hierarchy</h2>
+<p>Arithmetic needs operands, and the GPU stores them in a hierarchy of memories. Each level is larger but slower than the one above, and the whole game of performance engineering is to keep the data that arithmetic needs as high in the hierarchy as possible, for as long as possible.</p>
+
+<div class="table-wrap">
+<table>
+<caption>The H100 SXM memory hierarchy (approximate). Bandwidths of on-chip levels are aggregate across all SMs.</caption>
+<thead><tr><th>Level</th><th>Capacity</th><th>Bandwidth</th><th>Latency</th><th>Managed by</th></tr></thead>
+<tbody>
+<tr><td>Registers</td><td>256 KB per SM (≈ 33 MB total)</td><td>highest; feeds every lane every cycle</td><td>~1 cycle</td><td>compiler</td></tr>
+<tr><td>Shared memory / L1</td><td>256 KB per SM (≈ 33 MB total)</td><td>≈ 30 TB/s aggregate (128 B/clock/SM)</td><td>~30 cycles</td><td>programmer (shared) / hardware (L1)</td></tr>
+<tr><td>L2 cache</td><td>50 MB</td><td>a small multiple of HBM's</td><td>~200–300 cycles</td><td>hardware</td></tr>
+<tr><td>HBM</td><td>80 GB</td><td>3.35 TB/s</td><td>~600–800 ns</td><td>programmer (allocations)</td></tr>
+<tr><td>Host DRAM via PCIe Gen5 x16</td><td>up to TBs</td><td>≈ 64 GB/s per direction</td><td>microseconds</td><td>programmer</td></tr>
+<tr><td>NVMe SSD</td><td>many TB</td><td>≈ 7–14 GB/s per drive</td><td>tens of µs</td><td>programmer / OS</td></tr>
+</tbody>
+</table>
+</div>
+
+<figure class="chart" id="fig-5-4">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"H100 memory hierarchy: capacity versus bandwidth","height":340,
+ "x":{"label":"Capacity (bytes, log)","log":true,"min":1e7,"max":1e14},
+ "y":{"label":"Bandwidth (bytes/s, log)","log":true,"min":1e9,"max":1e14},
+ "series":[{"name":"H100 SXM","color":"s1","labels":true,"points":[
+   [3.3e7,3.1e13,"shared memory / L1 (33 MB, ~30 TB/s)"],[5.0e7,8e12,"L2 (50 MB)",{"dx":8,"dy":14}],[8.0e10,3.35e12,"HBM (80 GB, 3.35 TB/s)"],[2.0e12,6.4e10,"host DRAM over PCIe (64 GB/s)",{"dx":-8,"a":"end","dy":-10}],[3.0e13,1.0e10,"NVMe SSD (~10 GB/s)",{"dx":-8,"a":"end","dy":-10}]]}]}
+</script>
+<figcaption><b>Figure 5.4 — Every step down the hierarchy trades bandwidth for capacity.</b> Approximate values for one H100; the L2 bandwidth is indicative only. Moving from HBM to on-chip SRAM gains about 10× bandwidth but loses about 2,500× capacity; moving from HBM to host memory loses about 50× bandwidth.</figcaption></figure>
+
+<p>Figure 5.4 plots each level's capacity against its bandwidth, and the points fall roughly along a descending line. Each step down trades bandwidth for capacity. Three gaps deserve emphasis because whole chapters of this book exploit them. First, on-chip SRAM is about ten times faster than HBM but holds only tens of megabytes in total. An algorithm that loads a tile of data into shared memory once and reuses it many times escapes the HBM bottleneck. This is the principle behind tiled matrix multiplication (Chapter 7) and FlashAttention (Chapter 9). Second, HBM is roughly fifty times faster than host memory over PCIe. Offloading the KV cache or weights to CPU memory (Chapter 10) is therefore viable only for data that is accessed rarely, or whose transfer can be overlapped with other work. Third, the hierarchy is <em>programmer-managed</em> to an unusual degree. A CPU's caches work transparently, but GPU shared memory is an explicit scratchpad: a kernel must decide what to load into it, when and in what layout. That is both why GPU kernels are hard to write and why the best ones are so fast.</p>
+
+<div class="box thm">
+<div class="box-title">Why reuse is everything: a tiling argument</div>
+<p>Multiply two \(n\times n\) matrices. The product needs \(2n^3\) FLOPs, but each input element is used \(n\) times. If every use fetched its operand from HBM, the kernel would move \(\Theta(n^3)\) bytes and have constant arithmetic intensity: memory-bound for any \(n\). Instead, give each thread block a \(t\times t\) tile of the output. To compute it, the block streams through the shared dimension, loading a \(t\times t_k\) slice of \(A\) and a \(t_k\times t\) slice of \(B\) into shared memory at a time. Each element loaded is then reused \(t\) times, so the traffic per block falls by a factor of \(t\) and the intensity of that traffic rises to about \(t/b\) FLOPs per byte. The tile size is bounded by on-chip capacity. Real kernels use block tiles such as 128 × 256, giving about 85 FLOPs per byte in BF16 (\(2\cdot128\cdot256/((128+256)\cdot2)\)). That alone is <em>below</em> the H100's ridge point of 295, so fast GEMMs add a second level of reuse. Blocks that run at the same time are scheduled to work on neighbouring output tiles, so they share rows of \(A\) and columns of \(B\), and most of their loads hit in the 50 MB L2 cache. HBM then sees each input element only a few times, and the overall HBM intensity of a large GEMM approaches its minimum-traffic value \(2n^3/(3n^2b)=n/(3b)\), in the thousands. On-chip capacity, shared memory for each block and L2 across blocks, is what makes compute-bound matrix multiplication possible at all. Chapter 7 writes such a kernel.</p>
+</div>
+
+<h2 id="s5-5">5.5 Tensor cores and the march to lower precision</h2>
+<p>Why did GPUs grow dedicated matrix units? The answer is energy. Horowitz's widely cited estimates for a 45 nm process put a 32-bit floating-point multiply at about 3.7 pJ and an add at 0.9 pJ, while reading 32 bits from a small on-chip SRAM costs about 5 pJ and from off-chip DRAM about 640 pJ<span class="cite"><a href="#r-horowitz">[1]</a></span>. The absolute numbers have shrunk with every process generation, but the proportions have not changed much: <strong>moving data costs far more energy than computing on it</strong>. A general-purpose lane that fetches two operands from registers, multiplies them and writes the result back spends most of its energy on the fetching. A tensor core instead performs a whole small matrix multiply-accumulate, \(D\leftarrow AB+C\) on tiles such as \(16\times8\times16\), as a single instruction. It reuses each operand many times inside the unit, amortising the cost of moving it. That is how tensor cores deliver an order of magnitude more FLOPs per watt and per square millimetre.</p>
+
+<figure class="diagram" id="fig-5-5">
+<svg class="dg" viewBox="0 0 720 200" role="img" aria-label="A tensor core computes D = A times B plus C on small tiles in one instruction">
+<rect x="40" y="40" width="110" height="110" rx="6" class="bx2"/><text x="95" y="100" text-anchor="middle" class="t-b">A</text><text x="95" y="170" text-anchor="middle" class="t-xs">m × k (e.g. 16 × 16)</text>
+<text x="170" y="100" text-anchor="middle" class="t-b">×</text>
+<rect x="190" y="40" width="110" height="110" rx="6" class="bx5"/><text x="245" y="100" text-anchor="middle" class="t-b">B</text><text x="245" y="170" text-anchor="middle" class="t-xs">k × n (e.g. 16 × 8)</text>
+<text x="320" y="100" text-anchor="middle" class="t-b">+</text>
+<rect x="340" y="40" width="110" height="110" rx="6" class="bx4"/><text x="395" y="100" text-anchor="middle" class="t-b">C</text><text x="395" y="170" text-anchor="middle" class="t-xs">accumulator (FP32)</text>
+<text x="470" y="100" text-anchor="middle" class="t-b">→</text>
+<rect x="490" y="40" width="110" height="110" rx="6" class="bx3"/><text x="545" y="100" text-anchor="middle" class="t-b">D</text><text x="545" y="170" text-anchor="middle" class="t-xs">m × n</text>
+<text x="660" y="80" text-anchor="middle" class="t-xs">one instruction:</text><text x="660" y="96" text-anchor="middle" class="t-xs">2mnk FLOPs</text><text x="660" y="112" text-anchor="middle" class="t-xs">inputs low precision,</text><text x="660" y="128" text-anchor="middle" class="t-xs">accumulate in FP32</text>
+<text x="360" y="194" text-anchor="middle" class="t-sm">each element of A is reused n times and each element of B m times inside the unit</text>
+</svg>
+<figcaption><b>Figure 5.5 — The tensor-core operation.</b> A matrix multiply-accumulate on small tiles, with low-precision inputs and higher-precision accumulation, executed as one instruction.</figcaption></figure>
+
+<p>Figure 5.5 shows the operation. Inputs \(A\) and \(B\) arrive in a low-precision format, products are accumulated into \(C\) at higher precision (usually FP32), and the result \(D\) is written out. The tile shapes, the supported formats and how the instruction is issued have changed in every generation since tensor cores appeared, and those changes track the history of deep learning closely.</p>
+
+<div class="table-wrap">
+<table>
+<caption>NVIDIA data-centre GPU generations. Throughputs are dense, for the SXM parts, approximate.</caption>
+<thead><tr><th>Generation (part, year)</th><th>What changed in the tensor cores and memory system</th><th class="num">Dense 16-bit TFLOP/s</th><th class="num">Lowest precision</th></tr></thead>
+<tbody>
+<tr><td>Volta (V100, 2017)</td><td>first tensor cores: FP16 in, FP32 accumulate; 8 per SM</td><td class="num">125</td><td class="num">FP16</td></tr>
+<tr><td>Ampere (A100, 2020)</td><td>BF16 and TF32 (FP32 range with 10-bit mantissa); 2:4 structured sparsity; asynchronous global→shared copies</td><td class="num">312</td><td class="num">INT8 / INT4</td></tr>
+<tr><td>Hopper (H100, 2022)</td><td>FP8 (E4M3, E5M2) with the "Transformer Engine"; warpgroup-wide asynchronous MMA (<code>wgmma</code>); TMA copy engine; thread-block clusters with distributed shared memory</td><td class="num">989</td><td class="num">FP8</td></tr>
+<tr><td>Blackwell (B200, 2025)</td><td>FP6/FP4 and block-scaled micro-formats (MXFP, NVFP4); new <code>tcgen05</code> MMA with a dedicated 256 KB-per-SM <em>tensor memory</em> (TMEM) for accumulators; pairs of SMs cooperating on one MMA; two dies (148 SMs) in one package</td><td class="num">≈ 2,250</td><td class="num">FP4</td></tr>
+<tr><td>Rubin (2026)</td><td>HBM4 (288 GB per GPU), further gains in low-precision throughput; rack-scale NVLink domains</td><td class="num">—</td><td class="num">FP4</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Read the table as a story with two threads. The first is <strong>lower precision</strong>. Each halving of operand width (FP16 → FP8 → FP4) roughly doubles throughput per unit of area and power, and halves the bytes that must be moved. The hardware followed the algorithms here: Hopper's FP8 arrived as research showed that Transformers could be trained and served in 8 bits, and Blackwell's FP4 as 4-bit inference with fine-grained scaling matured (Chapter 14). The second thread is <strong>asynchrony</strong>. On Volta and Ampere, a warp issued a tensor-core instruction and waited for it. On Hopper, a group of four warps issues a large MMA that proceeds asynchronously, while the TMA copies the next tiles from HBM into shared memory in the background. On Blackwell, accumulators move out of registers into dedicated tensor memory, so warps can do other work entirely. The goal throughout is to keep the tensor cores fed. As they got faster, everything around them (copying, softmax, bookkeeping) had to be overlapped with them, or it would become the bottleneck. Kernels written for one generation therefore often perform poorly on the next. This is why FlashAttention has had four versions (Chapter 9).</p>
+
+<details class="drill">
+<summary>Drill 5.1 — Deriving peak FLOP/s from the SM count</summary>
+<p>An H100 SXM has 132 SMs, four tensor cores per SM, and each tensor core performs 512 dense BF16 fused multiply-adds per clock at a boost clock of about 1.83 GHz. Derive the dense BF16 peak, and say what FP8 and 2:4 sparsity change.</p>
+<p><em>Solution.</em> \(132\times4\times512\) FMAs per clock is 270,336 FMAs, or 540,672 FLOPs per clock; at \(1.83\times10^{9}\) clocks per second that is about \(9.89\times10^{14}\), the familiar 989 TFLOP/s. FP8 tensor cores process twice as many elements per clock, giving about 1,979 TFLOP/s. The 2:4 structured-sparsity figures quoted on spec sheets double these again by skipping zeros, which is why this book always quotes dense numbers (§5.9). Sustained clocks under load are often lower than boost, so achieved peaks are a few per cent below the formula even before kernel inefficiency.</p>
+</details>
+
+<h2 id="s5-6">5.6 HBM: why bandwidth is expensive</h2>
+<p>If bandwidth is the limit for decode, why not simply add more? To answer, we need to know what HBM physically is. <strong>High-bandwidth memory</strong> consists of stacks of DRAM dies, eight to twelve or more, connected vertically by thousands of through-silicon vias and placed beside the GPU die on a silicon <em>interposer</em> that carries very fine wiring. The key to its bandwidth is width. Each stack has a 1,024-bit interface (HBM4 doubles this to 2,048 bits), compared with 32 or 64 bits for conventional memory, so a stack transfers 128 bytes per transfer cycle. The bandwidth of a GPU's memory system is therefore</p>
+\[ \beta = (\text{number of stacks})\times\frac{\text{bus width per stack}}{8}\times(\text{data rate per pin}) . \]
+
+<div class="box example">
+<div class="box-title">Worked example — H100's 3.35 TB/s</div>
+<p>The H100 SXM uses five active HBM3 stacks, each 1,024 bits wide, running at about 5.2 Gb/s per pin: \(5\times128\ \text{B}\times5.23\times10^{9}\ \text{s}^{-1}\approx 3.35\times10^{12}\) B/s. The H200 uses six faster HBM3e stacks (4.8 TB/s, 141 GB), and the B200 eight (8 TB/s), while Rubin's HBM4 doubles the width per stack.</p>
+</div>
+
+<p>Each term in that formula is hard to grow. More stacks need more space beside the die, and the interposer and package are already at the limits of manufacturable size. Wider buses need more connections through the interposer. Faster pins need more power per bit and run into signal-integrity limits. HBM is also expensive, a large fraction of the cost of an accelerator, and it is supplied by only three manufacturers. Compare this with compute, which scales with transistor density and with narrower number formats. This asymmetry is the physical root of the memory wall of §1.9. It is also why every generation's headline improvement in FLOP/s is accompanied by a much smaller improvement in bandwidth.</p>
+
+<details class="drill">
+<summary>Drill 5.2 — Bandwidth from the memory bus</summary>
+<p>The H100 SXM uses five HBM3 stacks, each with a 1,024-bit interface, at about 5.2 Gb/s per pin. The H200 uses six HBM3e stacks at about 6.25 Gb/s per pin. Compute both bandwidths and the ratio of decode speed you would expect for a memory-bound model.</p>
+<p><em>Solution.</em> H100: \(5\times1024\times5.2\times10^{9}/8\approx3.33\times10^{12}\) B/s, the quoted 3.35 TB/s. H200: \(6\times1024\times6.25\times10^{9}/8=4.8\times10^{12}\) B/s. For memory-bound decode, time per step is bytes over bandwidth, so the H200 decodes about \(4.8/3.35\approx1.43\) times faster at the same batch, with no change in compute; its extra capacity (141 GB versus 80 GB) also allows larger batches. Bandwidth comes from bus width times pin rate, and both are expensive, which is the theme of §5.6.</p>
+</details>
+
+<h2 id="s5-7">5.7 Beyond one GPU: NVLink, NVSwitch and the network</h2>
+<p>Llama 3 70B does not fit in one H100, and DeepSeek-V3 needs a server just for its weights (§2.11). GPUs must therefore cooperate, and the bandwidth between them shapes which kinds of parallelism (Chapter 18) are practical.</p>
+<p>Inside a server, GPUs are connected by <strong>NVLink</strong>, NVIDIA's point-to-point interconnect. On Hopper, each GPU has 18 NVLink links totalling 900 GB/s of bidirectional bandwidth (450 GB/s each way). Blackwell doubles this to 1.8 TB/s. In an 8-GPU server (such as a DGX or HGX H100), the GPUs connect through <strong>NVSwitch</strong> chips that let every GPU talk to every other at full NVLink bandwidth, so the eight GPUs behave much like one machine with 640 GB of memory. Blackwell's NVL72 rack extends this switched NVLink domain to 72 GPUs. Between servers, traffic leaves through network adapters (InfiniBand or Ethernet with RDMA) at typically 400 Gb/s (50 GB/s) per GPU, or 800 Gb/s on newer systems. Host memory hangs off PCIe at about 64 GB/s per direction.</p>
+
+<figure class="diagram" id="fig-5-6">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Eight GPUs connected by NVSwitch inside a server, with network adapters linking servers">
+<rect x="20" y="20" width="520" height="220" rx="12" class="fill-muted"/>
+<text x="280" y="40" text-anchor="middle" class="t-b">One 8-GPU server (HGX H100)</text>
+<g>
+<rect x="40" y="56" width="52" height="40" rx="6" class="bx2"/><text x="66" y="81" text-anchor="middle" class="t-xs">GPU0</text>
+<rect x="102" y="56" width="52" height="40" rx="6" class="bx2"/><text x="128" y="81" text-anchor="middle" class="t-xs">GPU1</text>
+<rect x="164" y="56" width="52" height="40" rx="6" class="bx2"/><text x="190" y="81" text-anchor="middle" class="t-xs">GPU2</text>
+<rect x="226" y="56" width="52" height="40" rx="6" class="bx2"/><text x="252" y="81" text-anchor="middle" class="t-xs">GPU3</text>
+<rect x="288" y="56" width="52" height="40" rx="6" class="bx2"/><text x="314" y="81" text-anchor="middle" class="t-xs">GPU4</text>
+<rect x="350" y="56" width="52" height="40" rx="6" class="bx2"/><text x="376" y="81" text-anchor="middle" class="t-xs">GPU5</text>
+<rect x="412" y="56" width="52" height="40" rx="6" class="bx2"/><text x="438" y="81" text-anchor="middle" class="t-xs">GPU6</text>
+<rect x="474" y="56" width="52" height="40" rx="6" class="bx2"/><text x="500" y="81" text-anchor="middle" class="t-xs">GPU7</text>
+</g>
+<rect x="40" y="130" width="486" height="34" rx="6" class="bx5"/><text x="283" y="152" text-anchor="middle" class="t-sm">NVSwitch fabric: any GPU ↔ any GPU at 900 GB/s (bidirectional)</text>
+<g class="ln-acc">
+<line x1="66" y1="96" x2="66" y2="130"/><line x1="128" y1="96" x2="128" y2="130"/><line x1="190" y1="96" x2="190" y2="130"/><line x1="252" y1="96" x2="252" y2="130"/><line x1="314" y1="96" x2="314" y2="130"/><line x1="376" y1="96" x2="376" y2="130"/><line x1="438" y1="96" x2="438" y2="130"/><line x1="500" y1="96" x2="500" y2="130"/>
+</g>
+<rect x="40" y="186" width="230" height="36" rx="6" class="bx4"/><text x="155" y="209" text-anchor="middle" class="t-xs">CPUs + host DRAM (PCIe ≈ 64 GB/s per GPU)</text>
+<rect x="296" y="186" width="230" height="36" rx="6" class="bx3"/><text x="411" y="209" text-anchor="middle" class="t-xs">8 × NICs, 400 Gb/s (50 GB/s) each</text>
+<line x1="526" y1="204" x2="600" y2="204" class="ln-s3"/>
+<rect x="600" y="150" width="104" height="100" rx="10" class="bx3"/><text x="652" y="186" text-anchor="middle" class="t-sm">network</text><text x="652" y="204" text-anchor="middle" class="t-xs">(InfiniBand /</text><text x="652" y="220" text-anchor="middle" class="t-xs">RoCE) to other</text><text x="652" y="236" text-anchor="middle" class="t-xs">servers</text>
+<text x="620" y="60" class="t-xs">bandwidth per GPU:</text><text x="620" y="78" class="t-xs">HBM 3,350 GB/s</text><text x="620" y="96" class="t-xs">NVLink 450 GB/s/dir</text><text x="620" y="114" class="t-xs">network 50 GB/s</text><text x="620" y="132" class="t-xs">PCIe 64 GB/s</text>
+</svg>
+<figcaption><b>Figure 5.6 — A server is a small, fast world.</b> Inside an 8-GPU server, NVSwitch connects every GPU to every other at NVLink speed. Between servers, each GPU has a network adapter roughly an order of magnitude slower.</figcaption></figure>
+
+<p>Figure 5.6 shows the topology of a standard 8-GPU server, and the bandwidths in its margin tell the story. Each GPU reads its own HBM at 3,350 GB/s, its peers' memory over NVLink at 450 GB/s each way, and other servers at 50 GB/s. Each step down is almost an order of magnitude. This hierarchy of bandwidths, like the memory hierarchy within the chip, determines where computation should be placed. Parallelism schemes that communicate on every layer, such as tensor parallelism, are confined to the NVLink domain. Schemes that communicate rarely, such as pipeline parallelism or independent replicas, can span the network. The trend towards ever larger NVLink domains (8 GPUs on Hopper, 72 on Blackwell NVL72, more on Rubin) is a direct response to models, such as large mixtures of experts, whose communication would otherwise be confined to a single server. Chapter 17 makes this quantitative with a cost model for collective communication.</p>
+
+<h2 id="s5-8">5.8 Other accelerators</h2>
+<p>NVIDIA's GPUs dominate LLM serving, but they are not the only design, and the alternatives illuminate the trade-offs by taking different positions on them.</p>
+<p><strong>Google's TPU</strong> (first deployed in 2015 and described by Jouppi et al. in 2017<span class="cite"><a href="#r-tpu">[2]</a></span>) is built around the <strong>systolic array</strong>: a two-dimensional grid of multiply-accumulate cells through which operands flow rhythmically from neighbour to neighbour, so that each value fetched from memory is used by an entire row or column of cells. There are no warps or threads in the GPU sense. The compiler (XLA) schedules the whole computation statically. TPUs connect directly to one another through inter-chip interconnect (ICI) links in a torus topology, building "pods" of thousands of chips without external switches. The seventh-generation TPU, Ironwood (2025), has 192 GB of HBM at about 7.4 TB/s and about 4.6 PFLOP/s of FP8 compute per chip<span class="cite"><a href="#r-ironwood">[3]</a></span>. That is a ridge point similar to a B200's, reflecting the same physics.</p>
+
+<figure class="diagram" id="fig-5-7">
+<svg class="dg" viewBox="0 0 720 224" role="img" aria-label="A systolic array passes weights and activations between neighbouring cells">
+<defs><marker id="a57" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<text x="230" y="20" text-anchor="middle" class="t-b">4 × 4 systolic array (real MXUs are 128 × 128 or larger)</text>
+<g>
+<rect x="130" y="40" width="40" height="34" rx="4" class="bx"/><rect x="190" y="40" width="40" height="34" rx="4" class="bx"/><rect x="250" y="40" width="40" height="34" rx="4" class="bx"/><rect x="310" y="40" width="40" height="34" rx="4" class="bx"/>
+<rect x="130" y="84" width="40" height="34" rx="4" class="bx"/><rect x="190" y="84" width="40" height="34" rx="4" class="bx"/><rect x="250" y="84" width="40" height="34" rx="4" class="bx"/><rect x="310" y="84" width="40" height="34" rx="4" class="bx"/>
+<rect x="130" y="128" width="40" height="34" rx="4" class="bx"/><rect x="190" y="128" width="40" height="34" rx="4" class="bx"/><rect x="250" y="128" width="40" height="34" rx="4" class="bx"/><rect x="310" y="128" width="40" height="34" rx="4" class="bx"/>
+<rect x="130" y="172" width="40" height="34" rx="4" class="bx"/><rect x="190" y="172" width="40" height="34" rx="4" class="bx"/><rect x="250" y="172" width="40" height="34" rx="4" class="bx"/><rect x="310" y="172" width="40" height="34" rx="4" class="bx"/>
+</g>
+<g class="t-xs"><text x="150" y="62" text-anchor="middle">MAC</text><text x="210" y="62" text-anchor="middle">MAC</text><text x="270" y="62" text-anchor="middle">MAC</text><text x="330" y="62" text-anchor="middle">MAC</text></g>
+<line x1="80" y1="57" x2="128" y2="57" class="ln-s2" marker-end="url(#a57)"/><line x1="80" y1="101" x2="128" y2="101" class="ln-s2" marker-end="url(#a57)"/><line x1="80" y1="145" x2="128" y2="145" class="ln-s2" marker-end="url(#a57)"/><line x1="80" y1="189" x2="128" y2="189" class="ln-s2" marker-end="url(#a57)"/>
+<text x="40" y="125" text-anchor="middle" class="t-xs t-s2">activations</text><text x="40" y="139" text-anchor="middle" class="t-xs t-s2">flow right →</text>
+<line x1="170" y1="57" x2="188" y2="57" class="ln"/><line x1="230" y1="57" x2="248" y2="57" class="ln"/><line x1="290" y1="57" x2="308" y2="57" class="ln"/>
+<line x1="150" y1="74" x2="150" y2="84" class="ln"/><line x1="210" y1="74" x2="210" y2="84" class="ln"/><line x1="270" y1="74" x2="270" y2="84" class="ln"/><line x1="330" y1="74" x2="330" y2="84" class="ln"/>
+<text x="372" y="214" class="t-xs">partial sums flow down ↓</text>
+<text x="480" y="60" class="t-sm">Each cell: multiply the value arriving</text>
+<text x="480" y="78" class="t-sm">from the left by its stored weight,</text>
+<text x="480" y="96" class="t-sm">add the partial sum from above,</text>
+<text x="480" y="114" class="t-sm">pass both on.</text>
+<text x="480" y="150" class="t-sm">Every operand fetched is reused</text>
+<text x="480" y="168" class="t-sm">across a whole row or column,</text>
+<text x="480" y="186" class="t-sm">with no register-file traffic.</text>
+</svg>
+<figcaption><b>Figure 5.7 — A systolic array</b>, the core of Google's TPU matrix units. Operands pulse through a grid of multiply-accumulate (MAC) cells, so data fetched once is reused across the whole array.</figcaption></figure>
+
+<p>Figure 5.7 sketches how a systolic array achieves reuse without a programmer-managed scratchpad. Weights are preloaded into the cells, activations stream in from the left, and partial sums cascade downwards, so each operand fetched is used by every cell it passes. The design is extremely efficient for large dense matrix products and less flexible for irregular work, the opposite end of the flexibility–efficiency spectrum from a CPU, with the GPU in between.</p>
+<p><strong>AMD's Instinct</strong> GPUs follow the same SIMT philosophy as NVIDIA's (AMD calls warps "wavefronts", of 64 threads on these parts) but lead on memory capacity. They are built from <em>chiplets</em>, several smaller dies in one package. The MI300X (2023) has 192 GB of HBM3 at 5.3 TB/s and about 1.3 PFLOP/s of dense FP16. The MI355X (2025) has 288 GB of HBM3E at 8 TB/s. Large capacity lets big models and long caches fit on fewer GPUs, which can matter more for decode than peak FLOP/s. <strong>AWS Trainium and Inferentia</strong>, <strong>Microsoft's Maia</strong> and <strong>Meta's MTIA</strong> are hyperscalers' own designs for their own fleets.</p>
+<p>At the other extreme are <strong>SRAM-based dataflow</strong> designs that abolish HBM altogether. <strong>Groq's LPU</strong> holds a model entirely in on-chip SRAM, about 230 MB per chip, spread across hundreds of chips, and executes a schedule fixed at compile time with no caches and no dynamic arbitration. Its per-chip bandwidth to weights is enormous, giving very high single-stream decode speed, at the cost of needing many chips per model. <strong>Cerebras's</strong> wafer-scale engine takes this to its limit: a single wafer-sized chip with 44 GB of SRAM and on-chip bandwidth measured in petabytes per second. These designs attack the decode bottleneck of Chapter 3 directly, by making \(\beta\) for weights enormous. They trade capacity and cost per token for latency.</p>
+
+<figure class="chart" id="fig-5-8">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Accelerators: peak dense 16-bit compute versus memory bandwidth","height":360,
+ "x":{"label":"Memory bandwidth β (TB/s, log)","log":true,"min":0.5,"max":20},
+ "y":{"label":"Peak dense BF16/FP16 π (TFLOP/s, log)","log":true,"min":50,"max":5000},
+ "series":[
+  {"name":"NVIDIA","color":"s1","line":false,"labels":true,"points":[[0.9,125,"V100"],[2.04,312,"A100"],[3.35,989,"H100",{"dx":-8,"a":"end","dy":-8}],[4.8,989,"H200",{"dx":8,"dy":14}],[8.0,2250,"B200"]]},
+  {"name":"AMD","color":"s2","labels":true,"points":[[5.3,1307,"MI300X",{"dx":8,"dy":14}]]},
+  {"name":"Google TPU","color":"s3","labels":true,"points":[[7.37,2307,"Ironwood",{"dx":-8,"a":"end","dy":-10}]]}
+ ],
+ "notes":[{"x":0.6,"y":3500,"text":"points further up-left have higher ridge points π/β"}]}
+</script>
+<figcaption><b>Figure 5.8 — The accelerator landscape on one chart.</b> Dense 16-bit peak against HBM bandwidth (approximate datasheet values). Every design sits at a ridge point of roughly 150–310 FLOPs per byte; generations move up and to the right together, but compute moves faster.</figcaption></figure>
+
+<p>Figure 5.8 places these accelerators on one chart, with bandwidth on the horizontal axis and dense 16-bit compute on the vertical, both logarithmic. Two things stand out. First, all of them cluster in a band of ridge points between about 150 and 310 FLOPs per byte, so all of them face the same memory-bound decode problem. The physics of DRAM is shared by everyone. Second, the progression from V100 to B200 runs up and to the right, but steeper than the diagonal, the memory wall again. The H200 sits directly to the right of the H100. It is the same chip with faster, larger memory, and for decode-heavy inference it is substantially faster than the H100 despite having identical FLOP/s, a clean natural experiment confirming Chapter 3's analysis.</p>
+
+<h2 id="s5-9">5.9 Reading a spec sheet</h2>
+<p>Accelerator datasheets are marketing documents, and an inference engineer must read them the way a statistician reads a press release. Five traps account for most misreadings.</p>
+<p><strong>Dense versus sparse.</strong> Since Ampere, NVIDIA's headline tensor throughputs usually assume 2:4 <em>structured sparsity</em>: two of every four weights are zero and skipped. Real LLM weights are not sparse in this pattern unless specially pruned (Chapter 15), so the usable dense figure is half the headline. The H100's "1,979 TFLOP/s BF16" is 989 dense, and a B200 "20 PFLOP/s FP4" figure is about half that when dense. <strong>Precision.</strong> FP4 throughput is roughly double FP8, which is double BF16. A headline in the lowest supported precision says nothing about the precision your model actually uses. <strong>Clocks and power.</strong> Peak figures assume the boost clock, but sustained clocks under a heavy tensor-core load may be lower, especially for parts configured at lower power limits. The same chip can be sold at different power envelopes (for example 700 W versus 1,000 W variants of Blackwell parts), with different sustained throughput. <strong>Capacity.</strong> Some vendors quote raw HBM, others usable HBM after reserving space for error correction or firmware (hence B200 figures of both 180 GB and 192 GB). <strong>Packaging.</strong> Dual-die parts may be quoted per die or per package, and rack systems per GPU, per "superchip" or per rack. Interconnect bandwidths are quoted bidirectional (NVLink's "900 GB/s") or per direction.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — a sceptical reading</div>
+<p>A datasheet says "up to 20 PFLOPS FP4, 192 GB HBM3e, 8 TB/s". For serving Llama 3 70B in FP8 at batch 64 with 2k contexts: dense FP8 is about a quarter of the headline sparse FP4 figure, roughly 4.5 PFLOP/s. Weights are 70.6 GB, and the cache is \(64\times2048\times320\) KiB ≈ 43 GB in BF16 (21 GB in FP8). Usable memory may be 180 GB, so it fits. Decode bytes per step ≈ 70.6 + 21 ≈ 92 GB, so at 80% of 8 TB/s a step takes about 14 ms, compute about \(2\times70\text{e}9\times64/4.5\text{e}15\approx2\) ms. Decode is memory-bound, and the number that matters is the 8 TB/s, not the 20 PFLOPS.</p>
+</div>
+
+<h2 id="looking-ahead" class="unnumbered">Looking ahead</h2>
+<p>We now know what the three numbers of Part I stand for. \(\pi\) is SMs × tensor-core throughput × clock, available only for dense matrix products at a given precision. \(\beta\) is HBM stacks × bus width × pin rate, the slowest-improving resource on the chip. "Overhead" is the cost of feeding the machine enough parallel work. We have also seen that the machine has <em>more</em> structure than three numbers: an on-chip hierarchy roughly ten times faster than HBM, general-purpose lanes much slower than tensor cores, and an interconnect hierarchy that falls by an order of magnitude at each level. To use that structure in calculations, we need a sharper version of the roofline of Chapter 3, one with several ceilings and several bandwidths, and a way to measure how close real code comes to them. Chapter 6 builds that tool.</p>
+
+<h2 id="summary">Chapter summary</h2>
+<ul>
+<li>CPUs optimise latency with big cores and caches; GPUs optimise throughput with thousands of simple lanes and hide latency by switching between warps. Little's law shows an H100 needs about \(\beta\delta_{\text{mem}}\approx2\) MB of loads in flight to saturate HBM.</li>
+<li>CUDA model: a kernel is a map over an index space. Threads → warps of 32 in lockstep (SIMT) → blocks sharing an SM's shared memory → grid. Divergence serialises branches; occupancy is resident warps over the maximum.</li>
+<li>An H100 SM has four sub-partitions (scheduler, 64 KB registers, 32 FP32 lanes, one tensor core) and 256 KB of L1/shared memory. Tensor cores supply more than 90% of peak FLOP/s: \(\pi\approx132\times4096\times1.83\text{ GHz}\approx989\) TFLOP/s.</li>
+<li>Memory hierarchy: registers, shared memory (≈ 30 TB/s aggregate), L2 (50 MB), HBM (80 GB, 3.35 TB/s), host over PCIe (≈ 64 GB/s), NVMe. Tiling into on-chip memory raises arithmetic intensity to \(\Theta(\text{tile size})\).</li>
+<li>Data movement costs far more energy than arithmetic, hence tensor cores. Generations from Volta to Blackwell added lower precisions (FP16 → BF16/TF32 → FP8 → FP4) and asynchrony (TMA, wgmma, tcgen05 with tensor memory).</li>
+<li>HBM bandwidth = stacks × width × pin rate. It grows slowly and expensively, which is the physical root of the memory wall.</li>
+<li>Interconnect hierarchy per GPU: HBM 3.35 TB/s, NVLink 450 GB/s per direction (H100), network ≈ 50 GB/s. NVLink domains are growing (8 → 72 GPUs).</li>
+<li>TPUs use systolic arrays and torus interconnect; AMD leads on HBM capacity; Groq and Cerebras put weights in SRAM. All mainstream designs have ridge points of ~150–310 FLOPs/byte in 16-bit.</li>
+<li>Spec sheets: check dense vs sparse, precision, sustained clocks and power, usable capacity, per-die vs per-package, and bidirectional vs per-direction bandwidth.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+<div class="mcq" data-id="ch05-mcq-01" data-topic="§5.1 Latency vs throughput">
+<p class="q">A GPU primarily hides memory latency by:</p>
+<ol class="opts"><li>Large caches and branch prediction</li><li data-correct>Keeping many warps resident and switching to a ready warp whenever one stalls</li><li>Out-of-order execution within each thread</li><li>Prefetching from SSD</li></ol>
+<div class="explain">Latency hiding by massive multithreading is the defining GPU strategy; CPUs rely on caches and speculation.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-02" data-topic="§5.1 Little's law">
+<p class="q">HBM bandwidth 3.35 TB/s and load latency 700 ns. How many bytes must be in flight to saturate bandwidth?</p>
+<ol class="opts"><li>≈ 2.3 KB</li><li>≈ 230 KB</li><li data-correct>≈ 2.3 MB</li><li>≈ 2.3 GB</li></ol>
+<div class="explain">Little's law: \(\beta\delta_{\text{mem}}=3.35\times10^{12}\times7\times10^{-7}\approx2.3\times10^{6}\) bytes.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-03" data-topic="§5.1 Little's law">
+<p class="q">Why does a small workload (e.g. a tiny model at batch 1) often fail to reach rated HBM bandwidth?</p>
+<ol class="opts"><li>HBM is slower for small tensors by design</li><li data-correct>It cannot generate enough independent outstanding memory requests to cover the latency–bandwidth product</li><li>Tensor cores are disabled</li><li>The L2 cache is too small</li></ol>
+<div class="explain">Saturating bandwidth requires roughly \(\beta\delta_{\text{mem}}\) bytes in flight; too little parallel work leaves the memory pipe partly empty.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-04" data-topic="§5.2 Execution model">
+<p class="q">The basic unit that executes one instruction across 32 lanes in lockstep on NVIDIA GPUs is the:</p>
+<ol class="opts"><li>Thread</li><li data-correct>Warp</li><li>Thread block</li><li>Grid</li></ol>
+<div class="explain">32 threads form a warp (SIMT). AMD's equivalent, a wavefront, has 64 threads on Instinct GPUs.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-05" data-topic="§5.2 Execution model">
+<p class="q">Threads can share data through on-chip shared memory and synchronise only if they belong to the same:</p>
+<ol class="opts"><li>Warp only</li><li data-correct>Thread block (CTA), which always runs on a single SM</li><li>Grid</li><li>GPU</li></ol>
+<div class="explain">Blocks are independent of one another; within a block, warps share the SM's shared memory. (Hopper's thread-block clusters extend sharing to neighbouring SMs.)</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-06" data-topic="§5.2 Divergence">
+<p class="q">Half the threads of a warp take the <code>if</code> branch and half take the <code>else</code> branch. What happens?</p>
+<ol class="opts"><li>Both halves run simultaneously at full speed</li><li data-correct>The warp executes both branches in sequence, masking inactive threads, so it takes the time of both</li><li>The kernel crashes</li><li>The compiler removes one branch</li></ol>
+<div class="explain">Divergence serialises paths within a warp; well-written kernels keep whole warps on the same path.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-07" data-topic="§5.2 Occupancy">
+<p class="q">Occupancy on an SM is limited by:</p>
+<ol class="opts"><li>The size of HBM</li><li data-correct>The registers and shared memory each block needs, relative to the SM's capacity (and the max warps per SM)</li><li>The PCIe bandwidth</li><li>The clock frequency</li></ol>
+<div class="explain">Each resident block consumes registers and shared memory; more per block means fewer resident warps.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-08" data-topic="§5.3 SM">
+<p class="q">In an H100 SM, roughly what fraction of peak 16-bit FLOP/s comes from the tensor cores rather than the FP32 lanes?</p>
+<ol class="opts"><li>~25%</li><li>~50%</li><li data-correct>&gt;90%</li><li>100%</li></ol>
+<div class="explain">≈ 4,096 versus ≈ 256 FLOPs per clock per SM. Work not expressed as matrix products runs on the much weaker lanes.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-09" data-topic="§5.3 Peak FLOP/s">
+<p class="q">An accelerator has 108 SMs, each delivering 2,048 dense FP16 FLOPs per clock, at 1.41 GHz. Peak dense FP16 is about:</p>
+<ol class="opts"><li>31 TFLOP/s</li><li data-correct>312 TFLOP/s</li><li>989 TFLOP/s</li><li>3.1 PFLOP/s</li></ol>
+<div class="explain">\(108\times2048\times1.41\times10^9\approx3.12\times10^{14}\): the A100.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-10" data-topic="§5.3 Non-matmul ops">
+<p class="q">Why can a softmax or RMSNorm take far more time than its FLOP count suggests?</p>
+<ol class="opts"><li>It uses FP64</li><li data-correct>It runs on general-purpose lanes and special-function units (an order of magnitude slower than tensor cores) and is usually memory-bound</li><li>It must run on the CPU</li><li>It cannot be parallelised</li></ol>
+<div class="explain">Non-matmul work cannot use tensor cores; it is limited by lane throughput, special functions (e.g. exp) and bandwidth.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-11" data-topic="§5.4 Hierarchy">
+<p class="q">Order these by bandwidth available to an H100, highest first: HBM, shared memory, host DRAM over PCIe, NVMe.</p>
+<ol class="opts"><li>HBM, shared memory, PCIe, NVMe</li><li data-correct>shared memory, HBM, PCIe, NVMe</li><li>shared memory, PCIe, HBM, NVMe</li><li>NVMe, PCIe, HBM, shared memory</li></ol>
+<div class="explain">≈ 30 TB/s (aggregate SRAM) &gt; 3.35 TB/s &gt; ≈ 64 GB/s &gt; ≈ 10 GB/s.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-12" data-topic="§5.4 Hierarchy">
+<p class="q">GPU shared memory differs from a CPU's L1 cache in that it is:</p>
+<ol class="opts"><li>Larger than HBM</li><li data-correct>An explicitly programmer-managed scratchpad: the kernel decides what to load and when</li><li>Shared across all GPUs in a server</li><li>Slower than HBM</li></ol>
+<div class="explain">This control is both what makes GPU kernels hard to write and what makes tiled kernels so fast.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-13" data-topic="§5.4 Tiling">
+<p class="q">Tiling a matrix multiplication with \(t\times t\) tiles in shared memory raises its arithmetic intensity to roughly:</p>
+<ol class="opts"><li>\(\Theta(1)\)</li><li data-correct>\(\Theta(t)\)</li><li>\(\Theta(t^2)\)</li><li>\(\Theta(n)\) regardless of \(t\)</li></ol>
+<div class="explain">Each element loaded is reused \(t\) times, so HBM traffic falls by a factor of \(t\).</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-14" data-topic="§5.4 Offload">
+<p class="q">Offloading KV cache to host memory over PCIe Gen5 is attractive mainly when:</p>
+<ol class="opts"><li>The cache is read every decode step</li><li data-correct>The data is accessed rarely (e.g. idle conversations) or its transfer can be overlapped with other work</li><li>HBM bandwidth is higher than PCIe</li><li>Never</li></ol>
+<div class="explain">PCIe is ≈ 50× slower than HBM, so data on the critical path of every step should stay in HBM.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-15" data-topic="§5.5 Energy">
+<p class="q">According to Horowitz's estimates, which costs the most energy?</p>
+<ol class="opts"><li>A 32-bit floating-point multiply</li><li>A 32-bit floating-point add</li><li>Reading 32 bits from a small on-chip SRAM</li><li data-correct>Reading 32 bits from off-chip DRAM</li></ol>
+<div class="explain">≈ 640 pJ for DRAM versus ≈ 3.7 pJ for a multiply (45 nm). Data movement dominates energy, which motivates tensor cores and on-chip reuse.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-16" data-topic="§5.5 Tensor cores">
+<p class="q">A tensor core instruction computes:</p>
+<ol class="opts"><li>One scalar fused multiply-add</li><li data-correct>A small matrix multiply-accumulate \(D\leftarrow AB+C\) on tiles, with low-precision inputs and typically FP32 accumulation</li><li>A softmax</li><li>A memory copy</li></ol>
+<div class="explain">Amortising operand movement over a whole tile product is the source of its efficiency.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-17" data-topic="§5.5 Generations">
+<p class="q">Match the first generation to introduce each feature: FP8 tensor cores; BF16/TF32; FP4.</p>
+<ol class="opts"><li>Volta; Ampere; Hopper</li><li data-correct>Hopper; Ampere; Blackwell</li><li>Ampere; Volta; Hopper</li><li>Blackwell; Hopper; Rubin</li></ol>
+<div class="explain">Ampere (2020) BF16/TF32; Hopper (2022) FP8; Blackwell (2025) FP4/FP6.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-18" data-topic="§5.5 Asynchrony">
+<p class="q">What does Hopper's Tensor Memory Accelerator (TMA) do?</p>
+<ol class="opts"><li>Compresses tensors</li><li data-correct>Copies multi-dimensional tiles between HBM and shared memory asynchronously, freeing threads from address calculation and waiting</li><li>Accelerates tokenisation</li><li>Replaces the L2 cache</li></ol>
+<div class="explain">TMA lets data movement overlap with tensor-core computation, central to FlashAttention-3 and Hopper GEMMs.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-19" data-topic="§5.5 Blackwell">
+<p class="q">Blackwell's tensor memory (TMEM) is:</p>
+<ol class="opts"><li>A new kind of HBM</li><li data-correct>A dedicated on-chip store (256 KB per SM) for tensor-core operands/accumulators, freeing registers</li><li>A software cache in host memory</li><li>An NVLink buffer</li></ol>
+<div class="explain">With <code>tcgen05</code>, accumulators live in TMEM rather than registers, enabling larger tiles and more overlap.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-20" data-topic="§5.5 Precision">
+<p class="q">Moving from FP16 to FP8 operands typically does what to peak tensor throughput and bytes moved per weight?</p>
+<ol class="opts"><li>Halves throughput; doubles bytes</li><li data-correct>Roughly doubles throughput; halves bytes</li><li>No change to either</li><li>Doubles both</li></ol>
+<div class="explain">Narrower operands mean more multiplies per unit area/power and half the memory traffic; both matter for inference.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-21" data-topic="§5.6 HBM">
+<p class="q">Five HBM stacks, 1,024 bits wide each, at 5.2 Gb/s per pin give a bandwidth of about:</p>
+<ol class="opts"><li>0.67 TB/s</li><li data-correct>3.3 TB/s</li><li>26 TB/s</li><li>5.2 TB/s</li></ol>
+<div class="explain">\(5\times128\text{ B}\times5.2\times10^9\approx3.3\times10^{12}\) B/s (the H100).</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-22" data-topic="§5.6 HBM">
+<p class="q">Which are reasons HBM bandwidth is hard to scale? (select all that apply)</p>
+<ol class="opts"><li data-correct>Limited space for stacks beside the die and limited interposer size</li><li data-correct>Wider buses require more connections; faster pins cost power and signal integrity</li><li>HBM cannot be stacked</li><li data-correct>Cost and limited supply of HBM</li></ol>
+<div class="explain">Compute scales with transistor density and narrower formats; bandwidth runs into packaging, power and cost.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-23" data-topic="§5.6 H200">
+<p class="q">The H200 has the same tensor cores as the H100 but 141 GB at 4.8 TB/s. For memory-bound decode, the expected speed-up is roughly:</p>
+<ol class="opts"><li>1.0×</li><li data-correct>≈ 1.4×</li><li>≈ 3×</li><li>≈ 0.7×</li></ol>
+<div class="explain">Decode scales with bandwidth: 4.8/3.35 ≈ 1.43; the extra capacity also allows larger batches.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-24" data-topic="§5.7 Interconnect">
+<p class="q">Per H100 GPU, roughly how do HBM, NVLink (per direction) and network (400 Gb/s NIC) bandwidths compare?</p>
+<ol class="opts"><li>3.35 TB/s; 3.35 TB/s; 3.35 TB/s</li><li data-correct>3.35 TB/s; 450 GB/s; 50 GB/s</li><li>3.35 TB/s; 50 GB/s; 450 GB/s</li><li>900 GB/s; 450 GB/s; 400 GB/s</li></ol>
+<div class="explain">Each level is roughly an order of magnitude below the previous one. Note 400 Gb/s = 50 GB/s.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-25" data-topic="§5.7 NVSwitch">
+<p class="q">What does NVSwitch provide inside an 8-GPU server?</p>
+<ol class="opts"><li>A connection to the internet</li><li data-correct>Full-bandwidth any-to-any NVLink connectivity between all GPUs</li><li>More HBM</li><li>A CPU</li></ol>
+<div class="explain">This makes collective operations within the server fast and uniform, enabling tensor parallelism across 8 GPUs.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-26" data-topic="§5.7 Placement">
+<p class="q">Which parallelism scheme is most constrained to stay inside a single NVLink domain?</p>
+<ol class="opts"><li>Independent replicas (data parallelism)</li><li data-correct>Tensor parallelism, which communicates within every layer</li><li>Pipeline parallelism</li><li>Request routing</li></ol>
+<div class="explain">Frequent, latency-sensitive collectives need NVLink-class bandwidth; replicas need none.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-27" data-topic="§5.8 TPU">
+<p class="q">A systolic array achieves operand reuse by:</p>
+<ol class="opts"><li>A large L2 cache</li><li data-correct>Passing operands and partial sums between neighbouring multiply-accumulate cells, so each fetched value is used across a row or column</li><li>Warp switching</li><li>Speculative execution</li></ol>
+<div class="explain">Data pulses through the grid; the compiler schedules it statically (XLA on TPUs).</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-28" data-topic="§5.8 Dataflow chips">
+<p class="q">SRAM-based designs such as Groq's LPU and Cerebras's WSE attack decode latency mainly by:</p>
+<ol class="opts"><li>Using FP64</li><li data-correct>Holding weights in on-chip SRAM with enormous bandwidth, at the cost of needing many chips (or a whole wafer) per model</li><li>Removing the KV cache</li><li>Running on CPUs</li></ol>
+<div class="explain">They make β for weights huge; the trade-off is capacity and cost per token.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-29" data-topic="§5.8 Landscape">
+<p class="q">Across V100, A100, H100, B200, MI300X and TPU Ironwood, dense 16-bit ridge points lie roughly in which range?</p>
+<ol class="opts"><li>1–10 FLOPs/byte</li><li data-correct>~140–310 FLOPs/byte</li><li>~1,000–3,000 FLOPs/byte</li><li>They vary from 1 to 10,000</li></ol>
+<div class="explain">All face the same DRAM physics, so all make memory-bound decode the central problem.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-30" data-topic="§5.9 Spec sheets">
+<p class="q">A datasheet lists "1,979 TFLOPS BF16 (with sparsity)". The dense BF16 peak you should use for LLM estimates is:</p>
+<ol class="opts"><li>1,979</li><li data-correct>≈ 989</li><li>≈ 495</li><li>≈ 3,958</li></ol>
+<div class="explain">Structured 2:4 sparsity doubles headline numbers; ordinary LLM weights are dense.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-31" data-topic="§5.9 Spec sheets">
+<p class="q">Which are legitimate reasons two quoted capacities for the "same" GPU (e.g. 180 GB vs 192 GB) differ? (select all that apply)</p>
+<ol class="opts"><li data-correct>Raw versus usable capacity (reserved memory)</li><li data-correct>Different SKUs or configurations</li><li>HBM capacity changes with temperature</li><li>One figure includes host memory</li></ol>
+<div class="explain">Vendors and resellers quote raw or usable figures, and SKUs differ. Always check what is available to your process.</div>
+</div>
+
+<div class="mcq" data-id="ch05-mcq-32" data-topic="§5.9 Spec sheets">
+<p class="q">NVLink on Hopper is often quoted as 900 GB/s. For estimating a one-way transfer between two GPUs, the relevant figure is about:</p>
+<ol class="opts"><li>1,800 GB/s</li><li>900 GB/s</li><li data-correct>450 GB/s</li><li>50 GB/s</li></ol>
+<div class="explain">900 GB/s is total bidirectional bandwidth; each direction carries half.</div>
+</div>
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+<details class="qa" data-id="ch05-qa-01">
+<summary><span class="lvl warm">Warm-up</span> What is a warp, and why does divergence matter?</summary>
+<div class="answer">
+<p>A warp is a group of 32 threads that the hardware executes in lockstep: one instruction is issued for all 32 lanes (SIMT). If threads in a warp take different control-flow paths, the warp must execute each path in turn with the inactive threads masked off. Throughput falls in proportion to the number of distinct paths, up to 32×. Kernels therefore assign work so that whole warps follow the same path. Dense linear algebra has no divergence, while data-dependent code (sampling, sparse operations, variable-length sequences) must be structured carefully.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch05-qa-02">
+<summary><span class="lvl warm">Warm-up</span> Explain the GPU memory hierarchy and give approximate numbers for an H100.</summary>
+<div class="answer">
+<p>Registers (256 KB per SM, ≈ 33 MB total, ~1 cycle) → shared memory/L1 (256 KB per SM, ≈ 33 MB total, ≈ 30 TB/s aggregate, ~30 cycles, programmer-managed) → L2 (50 MB, a few times HBM bandwidth) → HBM (80 GB, 3.35 TB/s, ~600–800 ns) → host DRAM via PCIe Gen5 (≈ 64 GB/s per direction) → NVMe (~10 GB/s). Each level trades bandwidth for capacity. Performance comes from reusing data in the upper levels, for example tiled GEMMs and FlashAttention keeping tiles in shared memory and registers.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch05-qa-03">
+<summary><span class="lvl core">Core</span> Why does a GPU need so many threads? Give a quantitative argument.</summary>
+<div class="answer">
+<p>Little's law applied to memory: to sustain bandwidth \(\beta\) with access latency \(\delta_{\text{mem}}\), bytes in flight = \(\beta\delta_{\text{mem}}\). For an H100, \(3.35\text{ TB/s}\times\sim700\text{ ns}\approx2.3\) MB, about 18 KB per SM, over a thousand outstanding 16-byte loads per SM. Each thread can have only a few loads outstanding, so tens of thousands of resident threads (up to 2,048 per SM) are needed. Warp schedulers switch among resident warps every cycle to keep the arithmetic units busy while others wait. A workload with too little parallelism cannot saturate either bandwidth or compute.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch05-qa-04">
+<summary><span class="lvl core">Core</span> Derive the H100's peak dense BF16 throughput from its architecture.</summary>
+<div class="answer">
+<p>132 SMs × 4 tensor cores per SM × 1,024 dense BF16 FLOPs per tensor core per clock (512 multiply-adds) = 132 × 4,096 FLOPs/clock ≈ 540,672 FLOPs/clock. At ≈ 1.83 GHz that is ≈ 989 TFLOP/s. The FP32 lanes give only 132 × 128 × 2 × 1.83 GHz ≈ 62 TFLOP/s, so over 90% of peak requires tensor-core matrix products. FP8 doubles the tensor figure (≈ 1,979 dense); the "with sparsity" headlines double again.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch05-qa-05">
+<summary><span class="lvl core">Core</span> What are tensor cores and why are they so much more efficient than ordinary ALUs?</summary>
+<div class="answer">
+<p>Tensor cores execute small matrix multiply-accumulates (\(D\leftarrow AB+C\) on tiles such as 16×8×16) as single instructions, with low-precision inputs (FP16/BF16/FP8/FP4) and higher-precision accumulation. Efficiency comes from energy: moving data costs far more than arithmetic (Horowitz: DRAM read ≈ 640 pJ versus FP32 multiply ≈ 3.7 pJ at 45 nm). A scalar ALU pays register-file traffic per operation; a tensor core reuses each operand across a whole tile inside the unit, so energy and area per FLOP fall by an order of magnitude. Lower precision compounds the gain: half the bits per operand, roughly double the multiplies per unit area, half the bytes moved.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch05-qa-06">
+<summary><span class="lvl core">Core</span> Summarise what changed from Volta to Hopper to Blackwell, and why kernels must be rewritten for each.</summary>
+<div class="answer">
+<p>Volta (2017): first tensor cores (FP16). Ampere (2020): BF16/TF32, 2:4 sparsity, asynchronous global→shared copies. Hopper (2022): FP8, warpgroup-level asynchronous MMA (wgmma), the TMA copy engine, thread-block clusters with distributed shared memory. Blackwell (2025): FP4/FP6 and micro-scaled formats, tcgen05 MMA with accumulators in 256 KB-per-SM tensor memory, two-SM cooperative MMAs, dual-die packages. Each step made tensor cores faster relative to everything else, so the bottleneck moved to feeding them: data movement, softmax/exponentials, synchronisation. Fast kernels must use the new asynchronous instructions and overlap copy, MMA and non-matmul work in pipelined, warp-specialised designs, which is why FlashAttention 1→4 and new GEMM libraries appear with each generation.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch05-qa-07">
+<summary><span class="lvl core">Core</span> Why does memory bandwidth grow more slowly than compute? Reason from how HBM works.</summary>
+<div class="answer">
+<p>HBM bandwidth = stacks × bus width × pin rate. Stacks are limited by space beside the die and interposer size; bus width by the number of fine connections through the interposer; pin rate by power per bit and signal integrity; and all by cost (HBM is a large fraction of accelerator cost) and supply. Compute instead scales with transistor density and with narrower number formats (each halving roughly doubles tensor throughput). So FLOP/s has grown about 100× from P100 to B200 while bandwidth grew about 11×. Consequences: rising ridge points, memory-bound decode, and the value of quantisation, KV compression and on-chip reuse.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch05-qa-08">
+<summary><span class="lvl deep">Deep-dive</span> Explain, with the tiling argument, why matrix multiplication can be compute-bound on a GPU but a naive implementation is not.</summary>
+<div class="answer">
+<p>An \(n\times n\) GEMM performs \(2n^3\) FLOPs on \(3n^2\) elements, so the <em>minimum</em> traffic gives intensity \(n/(3b)\), but only if each element is read from HBM about once. A naive kernel that fetches operands from HBM for each multiply-add moves \(\Theta(n^3)\) bytes: constant intensity, memory-bound. Tiling: each thread block computes a \(t\times t\) output tile, streaming slices of the inputs through shared memory, so each element loaded is reused \(t\) times and the block's traffic has intensity ≈ \(t/b\). With 128 × 256 BF16 tiles that is ≈ 85 FLOPs/byte, still below the H100's ridge of 295, so a second level of reuse is needed. Concurrently running blocks are scheduled ("rasterised" or swizzled) to share input tiles through the 50 MB L2, so HBM traffic approaches the minimum and the HBM intensity reaches the thousands. Inside each block, register tiling adds a third level, keeping shared-memory bandwidth from binding. The hardware hierarchy (registers → shared memory → L2 → HBM) mirrors a hierarchy of tiles.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch05-qa-09">
+<summary><span class="lvl core">Core</span> Compare H100 and MI300X for serving Llama 3 70B.</summary>
+<div class="answer">
+<p>H100: 80 GB, 3.35 TB/s, 989 dense BF16 TFLOP/s. MI300X: 192 GB, 5.3 TB/s, ≈ 1,307 dense FP16 TFLOP/s. In BF16 (141 GB) the model needs at least 2 H100s (tensor parallelism, with its communication) but fits on one MI300X with ≈ 50 GB left for KV cache. Decode is bandwidth-bound: per-GPU bandwidth is 1.6× higher on MI300X, and avoiding tensor parallelism removes all-reduces, so single-GPU MI300X decode may match or beat 2×H100 per user, and per-GPU throughput is likely higher. Caveats: software maturity (kernels, inference engines, FP8 support), achieved MBU, interconnect for multi-GPU scaling, availability and price per hour. The right answer compares cost per million tokens at the SLO on real benchmarks.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch05-qa-10">
+<summary><span class="lvl core">Core</span> How do the bandwidths of HBM, NVLink and the network constrain how a model is split across GPUs?</summary>
+<div class="answer">
+<p>Per H100: HBM 3.35 TB/s; NVLink 450 GB/s per direction (900 GB/s bidirectional) to any GPU in the server via NVSwitch; network ≈ 50 GB/s per GPU (400 Gb/s NIC). Tensor parallelism performs collectives on activations twice per layer, every step, so it must stay inside the NVLink domain (8 GPUs on HGX, 72 on GB200 NVL72). Pipeline parallelism sends activations once per stage boundary and tolerates slower links, so it can span servers. Data parallelism (replicas) communicates nothing per token. Expert parallelism for MoE needs all-to-all exchanges every MoE layer, and benefits from large NVLink domains or careful overlap across the network. Bigger NVLink domains (NVL72) exist precisely to keep such traffic off the network.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch05-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> Why does Blackwell need FP4, and what new bottlenecks appear as tensor cores get faster?</summary>
+<div class="answer">
+<p>FP4 roughly doubles tensor throughput again and halves bytes per weight relative to FP8. That serves both compute-bound prefill (more FLOP/s) and memory-bound decode (fewer bytes). Block-scaled formats (MXFP4, NVFP4) keep accuracy acceptable by sharing a scale per small block. As tensor throughput grows faster than other units: (1) non-matmul operations (softmax exponentials, normalisation) become relatively expensive. FlashAttention-4 emulates part of the exponential on FMA units because the special-function units did not scale. (2) Data movement into the tensor cores must be overlapped (TMA, TMEM, warp specialisation). (3) HBM bandwidth is still the decode limit. (4) Quantisation overheads (scale handling, dequantisation) must be fused. The system becomes a pipeline-balancing problem rather than a raw-FLOPs problem.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch05-qa-12">
+<summary><span class="lvl core">Core</span> How do TPUs differ architecturally from GPUs, and what does that mean for LLM inference?</summary>
+<div class="answer">
+<p>TPUs build their matrix units as large systolic arrays (MXUs) where operands flow between neighbouring cells, giving very high reuse and efficiency for dense matmuls with little control overhead. Programs are compiled ahead of time (XLA) into static schedules rather than run as many dynamically scheduled threads. Chips connect directly through ICI links in 2D/3D tori to form large pods without external switches. For inference: excellent efficiency on large static-shape matmuls; dynamic, ragged workloads (variable-length batches, paged KV caches, sampling) are harder and benefit from compiler-friendly formulations (padding/bucketing, static shapes); large pods with fast ICI suit big model-parallel deployments. Memory physics is the same (Ironwood: 192 GB, ≈ 7.4 TB/s), so decode remains bandwidth-bound.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch05-qa-13">
+<summary><span class="lvl design">Design</span> You must choose hardware for a latency-critical chat product (low TPOT) and for a bulk batch-summarisation job. What specifications matter for each?</summary>
+<div class="answer">
+<p><strong>Latency-critical decode:</strong> HBM bandwidth per GPU (TPOT ∝ bytes/β), capacity (fit weights + KV for the concurrency you need without heavy tensor parallelism), NVLink bandwidth and latency if tensor parallelism is required, and FP8/FP4 support (fewer bytes). Consider H200/B200/MI-series for bandwidth and capacity; SRAM dataflow chips for extreme single-stream speed. <strong>Bulk batch jobs:</strong> cost per token at maximum throughput, so dense FLOP/s per dollar matters more (large batches push toward compute-bound), together with enough capacity for big batches, and low-precision support. Older or cheaper parts (A100, L40S-class, spot instances) can win on cost. In both cases, benchmark the real model and engine at the target SLO and compare cost per million tokens, not datasheet peaks.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch05-qa-14">
+<summary><span class="lvl warm">Warm-up</span> What are the common ways spec sheets overstate usable performance?</summary>
+<div class="answer">
+<p>(1) Quoting throughput with 2:4 structured sparsity (2× the dense figure). (2) Quoting the lowest precision (FP4) as the headline. (3) Boost clocks rather than sustained clocks under heavy load or at lower power limits. (4) Raw rather than usable HBM capacity. (5) Per-package versus per-die, or per-rack aggregate figures. (6) Bidirectional interconnect bandwidth (NVLink 900 GB/s = 450 per direction). (7) "Up to" figures for ideal access patterns. Always reduce to dense FLOP/s at your precision, usable memory, and per-direction bandwidth, then apply realistic MFU/MBU.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch05-qa-15">
+<summary><span class="lvl deep">Deep-dive</span> What is occupancy, and is higher occupancy always better?</summary>
+<div class="answer">
+<p>Occupancy is the ratio of resident warps on an SM to the maximum (64 on H100). It is limited by per-block register and shared-memory usage and by block size. Higher occupancy gives more warps to hide latency. But it is not always better: high-performance GEMM and attention kernels deliberately use few, very large thread blocks with many registers and large shared-memory tiles, giving low occupancy but high reuse, and hide latency with explicit asynchronous pipelining (TMA, wgmma, multi-stage buffers) and warp specialisation instead of thread switching. Memory-bound elementwise kernels, conversely, benefit from high occupancy to generate enough outstanding loads. The right target depends on whether the kernel is limited by latency, bandwidth or reuse.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-horowitz">M. Horowitz. Computing's Energy Problem (and What We Can Do About It). <em>ISSCC</em>, 2014.</li>
+<li id="r-tpu">N. P. Jouppi et al. In-Datacenter Performance Analysis of a Tensor Processing Unit. <em>ISCA</em>, 2017. <a href="https://arxiv.org/abs/1704.04760">arXiv:1704.04760</a>; N. P. Jouppi et al. TPU v4. <em>ISCA</em>, 2023. <a href="https://arxiv.org/abs/2304.01433">arXiv:2304.01433</a>.</li>
+<li id="r-ironwood">Google Cloud. TPU7x (Ironwood) documentation. <a href="https://docs.cloud.google.com/tpu/docs/tpu7x">docs.cloud.google.com</a>.</li>
+<li>NVIDIA. Tesla V100 GPU Architecture (whitepaper), 2017; A100 Tensor Core GPU Architecture, 2020; H100 Tensor Core GPU Architecture, 2022; Blackwell Architecture Technical Brief, 2024.</li>
+<li>NVIDIA. CUDA C++ Programming Guide; Hopper Tuning Guide (shared memory and L1 configuration).</li>
+<li>D. B. Kirk and W. W. Hwu. <em>Programming Massively Parallel Processors: A Hands-on Approach</em>, 4th ed. Morgan Kaufmann, 2022.</li>
+<li>Z. Jia, M. Maggioni, B. Staiger, D. P. Scarpazza. Dissecting the NVIDIA Volta GPU Architecture via Microbenchmarking. 2018. <a href="https://arxiv.org/abs/1804.06826">arXiv:1804.06826</a>.</li>
+<li>W. Luo et al. Benchmarking and Dissecting the Nvidia Hopper GPU Architecture. 2024. <a href="https://arxiv.org/abs/2402.13499">arXiv:2402.13499</a>.</li>
+<li>Microbenchmarking NVIDIA's Blackwell Architecture: An In-depth Architectural Analysis. 2025. <a href="https://arxiv.org/abs/2512.02189">arXiv:2512.02189</a>.</li>
+<li>Chips and Cheese. Nvidia's H100: Funny L2, and Tons of Bandwidth. <a href="https://chipsandcheese.com/p/nvidias-h100-funny-l2-and-tons-of-bandwidth">chipsandcheese.com</a>.</li>
+<li>HazyResearch (Stanford). ThunderKittens on Blackwell. 2025. <a href="https://hazyresearch.stanford.edu/blog/2025-03-15-tk-blackwell">hazyresearch.stanford.edu</a>.</li>
+<li>AMD. Instinct MI300X and MI355X data sheets; Groq LPU and Cerebras WSE-3 technical overviews.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

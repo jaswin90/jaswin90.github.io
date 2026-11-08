@@ -1,0 +1,710 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 6 · The Roofline Model and Performance Analysis — Introduction to LLM Engineering</title>
+<meta name="description" content="Chapter 6 of Introduction to LLM Engineering: multi-ceiling and hierarchical rooflines, the intensity of every LLM operator, the critical batch size and critical context length for decode, MFU and MBU, profiling, and effects outside the roofline.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script defer src="/library/assets/book-shim.js" data-library="/library/" data-field="/library/AI_Engineering/" data-field-title="AI Engineering"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-chapter="ch06" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Part II · The Machine — Chapter 6</div>
+<h1 id="top">The Roofline Model and Performance Analysis</h1>
+<p class="lede">A pen-and-paper model that predicts the speed of any kernel, a way to measure how far real code falls short of it, and the habits of mind that turn a profiler trace into a diagnosis.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Chapter 3 introduced the roofline in its simplest form, one compute ceiling \(\pi\) and one bandwidth slope \(\beta\), and used it to explain why decode is memory-bound. Chapter 5 then showed that the machine has much more structure than two numbers. There are several compute ceilings (tensor cores at different precisions, and the far weaker general-purpose lanes) and several bandwidths (registers, shared memory, L2, HBM, NVLink, the network). Real kernels rarely reach any of these limits, and when a serving system is slower than expected, an engineer needs to know <em>which</em> limit it is up against and <em>how far</em> from it it is. Guessing produces optimisations that do nothing. A model plus measurement produces optimisations that work.</p>
+<p>This chapter turns the roofline from an illustration into a working tool. We first restate it precisely and extend it to multiple ceilings and multiple memory levels, the <em>hierarchical roofline</em>. We then place every operation of an LLM on it, and use it to answer one of the most consequential questions in inference: at what batch size, and at what context length, does decoding become compute-bound? The answer, the <em>critical batch size</em>, turns out to depend dramatically on the KV cache. For Llama 3 8B, beyond a context of only a few hundred tokens, decode can never become compute-bound on an H100, however large the batch. We then define the two utilisation metrics everyone quotes, MFU and MBU, and show how to compute them from a benchmark. We close with how profilers expose the gap between model and reality, and with the effects the roofline does not capture.</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>State the roofline bound with multiple compute ceilings and explain its log–log geometry.</li>
+<li>Build a hierarchical roofline and identify which memory level limits a kernel.</li>
+<li>Compute the arithmetic intensity of each LLM operator: GEMM, skinny GEMM, attention in prefill and decode, normalisation, element-wise ops, and communication.</li>
+<li>Derive the critical batch size for decode including KV-cache traffic, and the critical context length beyond which decode can never be compute-bound.</li>
+<li>Draw up a roofline budget for a whole decode step and choose an operating point on the latency–throughput frontier under a TPOT target.</li>
+<li>Compute MFU and MBU from a benchmark and interpret them correctly for prefill and decode.</li>
+<li>Read a profiler timeline and diagnose compute-, memory- or overhead-bound behaviour, and recognise effects outside the roofline (wave quantisation, launch latency, clock throttling).</li>
+</ol>
+<p class="small muted">Uses: Chapter 3 (§3.4–3.7), Chapter 5 (§5.3 the SM, §5.4 the memory hierarchy). Symbols: <a href="../notation.html">notation page</a>.</p>
+</div>
+
+<h2 id="s6-1">6.1 The roofline, precisely</h2>
+<p>The roofline model of Williams, Waterman and Patterson (2009)<span class="cite"><a href="#r-roofline">[1]</a></span> rests on one assumption: a kernel's time is bounded below by the time to do its arithmetic and by the time to move its data, and with enough overlap it approaches the larger of the two. If a kernel performs \(F\) FLOPs and moves \(Q\) bytes between HBM and the chip, then</p>
+\[ t \ \ge\ \max\Big(\frac{F}{\pi},\ \frac{Q}{\beta}\Big) \qquad\Longleftrightarrow\qquad \frac{F}{t}\ \le\ \min\big(\pi,\ I\beta\big),\quad I=\frac{F}{Q}. \]
+<p>On log–log axes, with intensity \(I\) horizontal and attainable FLOP/s vertical, \(I\beta\) is a line of slope one and \(\pi\) is a horizontal line. The bound is the lower envelope of the two, a "roof" with a sloped section and a flat section that meet at the ridge point \(I^{*}=\pi/\beta\). Its usefulness comes from what the axes separate. \(I\) is a property of the <em>algorithm</em> and its implementation: how many operations it performs per byte it fetches. \(\pi\) and \(\beta\) are properties of the <em>machine</em>. The roofline tells us, before writing any code, which property limits us.</p>
+<p>Chapter 5 showed that a GPU has several compute ceilings, not one. On an H100 the dense tensor-core ceiling is 989 TFLOP/s in BF16 and twice that in FP8, while any work that cannot use tensor cores is limited by the FP32 lanes at about 62 TFLOP/s. The roofline accommodates this naturally. Each class of operation has its own ceiling, and the ridge point is different for each.</p>
+
+<figure class="chart" id="fig-6-1">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"H100 roofline with several compute ceilings","height":380,
+ "x":{"label":"Arithmetic intensity I (FLOPs / HBM byte, log)","log":true,"min":0.1,"max":10000},
+ "y":{"label":"Attainable TFLOP/s (log)","log":true,"min":0.3,"max":3000},
+ "series":[
+  {"name":"FP8 tensor cores (1,979)","color":"s2","markers":false,"points":[[0.1,0.335],[591,1979],[10000,1979]]},
+  {"name":"BF16 tensor cores (989)","color":"s1","markers":false,"points":[[0.1,0.335],[295,989],[10000,989]]},
+  {"name":"FP32 lanes, no tensor cores (≈ 62)","color":"s3","markers":false,"dash":true,"points":[[0.1,0.335],[18.5,62],[10000,62]]}
+ ],
+ "vlines":[{"x":295,"text":"BF16 ridge 295"}],
+ "notes":[{"x":0.15,"y":1.5,"text":"slope = β = 3.35 TB/s"},{"x":600,"y":45,"text":"FP32 ridge ≈ 18.5"}]}
+</script>
+<figcaption><b>Figure 6.1 — One machine, several roofs.</b> All three ceilings share the same bandwidth slope, but their ridge points differ by a factor of 30. A kernel at intensity 50 is memory-bound if it runs on tensor cores but compute-bound if it runs on the FP32 lanes.</figcaption></figure>
+
+<p>Figure 6.1 draws the H100's three main ceilings over a common bandwidth slope. Two observations follow immediately. First, a lower-precision ceiling raises the roof but also moves the ridge to the right. FP8's ridge is at about 590 FLOPs per byte, so <em>more</em> workloads become memory-bound when you switch to FP8, unless the bytes shrink too. That is why FP8 inference stores weights in FP8, which halves \(Q\) and doubles \(I\), instead of only computing in FP8. Second, the FP32 ceiling is low enough that operations which cannot use tensor cores become compute-bound at modest intensities. The exponentials in a softmax, for example, have their own even lower ceiling set by the special-function units, which is the bottleneck FlashAttention-4 was designed around (Chapter 9).</p>
+
+<h2 id="s6-2">6.2 The hierarchical roofline</h2>
+<p>The basic roofline counts only bytes moved to and from HBM. But Chapter 5 showed that data also moves between L2 and the SMs, and between shared memory and registers, each with its own bandwidth. A kernel can be limited by any of these. The <strong>hierarchical roofline</strong><span class="cite"><a href="#r-hier">[2]</a></span> handles this by computing a separate intensity for each level \(\ell\) of the hierarchy, \(I_\ell=F/Q_\ell\), where \(Q_\ell\) is the traffic at that level, and applying the bound at every level simultaneously:</p>
+\[ \frac{F}{t}\ \le\ \min\Big(\pi,\ \min_{\ell}\ I_\ell\,\beta_\ell\Big). \]
+<p>A well-tiled kernel has very different intensities at different levels. Tiling in shared memory makes HBM traffic small (high \(I_{\text{HBM}}\)), but every tile is read from shared memory into registers many times (lower \(I_{\text{SMEM}}\)). The level that binds is the one where \(I_\ell\beta_\ell\) is smallest.</p>
+
+<figure class="chart" id="fig-6-2">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Hierarchical roofline (H100, BF16, approximate bandwidths)","height":360,
+ "x":{"label":"Arithmetic intensity at that level (FLOPs / byte, log)","log":true,"min":1,"max":10000},
+ "y":{"label":"Attainable TFLOP/s (log)","log":true,"min":3,"max":3000},
+ "series":[
+  {"name":"HBM (3.35 TB/s)","color":"s1","markers":false,"points":[[1,3.35],[295,989],[10000,989]]},
+  {"name":"L2 (≈ 10 TB/s, indicative)","color":"s3","markers":false,"dash":true,"points":[[1,10],[98.9,989],[10000,989]]},
+  {"name":"Shared memory (≈ 31 TB/s)","color":"s2","markers":false,"points":[[1,31],[31.9,989],[10000,989]]},
+  {"name":"A tiled GEMM kernel","color":"s5","line":false,"labels":true,"points":[[1500,989,"HBM intensity ≈ 1,500",{"dx":0,"dy":20,"a":"middle"}],[64,989,"SMEM intensity ≈ 64",{"dx":-6,"dy":-10,"a":"end"}]]}
+ ]}
+</script>
+<figcaption><b>Figure 6.2 — Each memory level has its own roof.</b> Faster levels have ridge points further left. A kernel must clear the ridge at every level it touches. The two purple points are the same hypothetical tiled GEMM plotted at its HBM intensity and at its shared-memory intensity: both are on the flat part, so it is compute-bound.</figcaption></figure>
+
+<p>Figure 6.2 overlays roofs for HBM, L2 and shared memory. Because shared memory is about ten times faster than HBM, its ridge point is about ten times further left, around 32 FLOPs per byte. The two purple points are one hypothetical tiled GEMM. Measured at HBM, where each element is fetched once per tile and reused, its intensity is in the thousands. Measured at shared memory, where each tile element is read into registers once per use within the tile, its intensity is about 64. Both points sit on the flat part of their roofs, so the kernel can in principle reach peak. Had its shared-memory intensity been below 32, shared-memory bandwidth would have been the binding constraint, even though HBM looked comfortable. This is a real situation for small tiles. It is also why fast kernels keep a second level of tiling in registers, and why Blackwell's tensor memory (§5.5) relieves pressure on shared memory. The lesson generalises: <strong>a kernel is limited by the weakest level it touches</strong>, and "memory-bound" should always be qualified by <em>which</em> memory.</p>
+
+<h2 id="s6-3">6.3 Every LLM operator on the roofline</h2>
+<p>We can now place every component of a Transformer on the roofline, using the counting of Chapter 2. The table gives the HBM intensity of each operation in BF16 (\(b=2\)) on our running example, Llama 3 8B, together with its regime on an H100.</p>
+
+<div class="table-wrap">
+<table>
+<caption>Arithmetic intensity (FLOPs per HBM byte, BF16) of LLM operations, Llama 3 8B, H100. \(m\) = tokens sharing the weights; \(t\) = context length; \(g\) = GQA group size.</caption>
+<thead><tr><th>Operation</th><th>FLOPs</th><th>HBM bytes</th><th>Intensity</th><th>Regime on H100</th></tr></thead>
+<tbody>
+<tr><td>Linear layer, prefill (\(m=B n_{\text{in}}\), thousands)</td><td>\(2mkn\)</td><td>\(b(kn+mk+mn)\)</td><td>hundreds–thousands</td><td>compute-bound</td></tr>
+<tr><td>Linear layer, decode (\(m=B\))</td><td>\(2Bkn\)</td><td>\(\approx bkn\)</td><td>\(\approx B\)</td><td>memory-bound unless \(B\gtrsim300\)</td></tr>
+<tr><td>Attention, decode (per sequence)</td><td>\(4tn_hd_h\)</td><td>\(2tn_{kv}d_hb\)</td><td>\(2g/b = g\) (= 4)</td><td>memory-bound always</td></tr>
+<tr><td>Attention, prefill (FlashAttention, causal)</td><td>\(\approx2T^2n_hd_h\)</td><td>\(\approx b\,T(2n_h+2n_{kv})d_h\)</td><td>\(\approx \frac{T}{b}\cdot\frac{n_h}{n_h+n_{kv}}\) (≈ 1,640 at \(T=4096\))</td><td>compute-bound for long \(T\)</td></tr>
+<tr><td>RMSNorm, residual add, SiLU·mul</td><td>a few per element</td><td>read + write each element</td><td>\(\approx 0.5\)–\(2\)</td><td>memory-bound</td></tr>
+<tr><td>Softmax (unfused)</td><td>\(\approx 5\) per element</td><td>read + write</td><td>\(\approx 1\)</td><td>memory-bound</td></tr>
+<tr><td>Embedding lookup</td><td>0</td><td>\(d\,b\) per token</td><td>0</td><td>memory-bound</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Four lessons are packed into this table. First, only the matrix products of prefill and of large-batch decode are naturally compute-bound. Everything else is memory-bound, so its cost is the bytes it moves, not the FLOPs it performs. Second, the memory-bound element-wise operations (norms, activations, residual additions) each read and write the whole activation tensor. Executed as separate kernels, they each pay a full round-trip to HBM for a handful of FLOPs. Fusing them into the neighbouring matrix product, or into each other, removes those round-trips entirely. This is the single most effective optimisation for them, and the subject of Chapter 7. Third, attention changes character between phases. With FlashAttention, prefill attention reads \(Q\), \(K\) and \(V\) once and never writes the \(T\times T\) score matrix to HBM, so its intensity grows linearly with \(T\) and it is compute-bound. Decode attention has intensity \(g\) regardless of anything else. Fourth, the embedding lookup has zero arithmetic intensity, but it is tiny: one row per token.</p>
+
+<details class="drill">
+<summary>Drill 6.1 — Where does a prefill spend its time?</summary>
+<p>Llama 3 8B, prefill of 4,096 tokens on an H100. Estimate the time of (a) all linear layers, (b) attention, (c) all RMSNorms, at roofline speed.</p>
+<p><em>Solution.</em> (a) \(2\times7.5\times10^{9}\times4096\approx6.1\times10^{13}\) FLOPs ÷ 989 TFLOP/s ≈ 62 ms (compute-bound). (b) \(2Ld\,T^2\approx 2\times32\times4096\times4096^2\approx4.4\times10^{12}\) FLOPs ≈ 4.4 ms. (c) Each of the \(2L+1=65\) RMSNorms reads and writes \(4096\times4096\times2\) B = 32 MiB, so about \(65\times2\times33.5\) MB ≈ 4.4 GB at 3.35 TB/s ≈ 1.3 ms. The norms perform a negligible fraction of the FLOPs yet cost about 2% of the time. Unfused residual additions and activations would add similar amounts. This is why fusion matters even in compute-bound phases.</p>
+</details>
+
+<h2 id="s6-4">6.4 The critical batch size, including the KV cache</h2>
+<p>Batching is the main lever for decode throughput (§3.6). It shares each weight read among \(B\) sequences, raising intensity until compute becomes the limit. At what batch size does that happen? Chapter 3 gave the answer for the weights alone: \(B^{*}\approx I^{*}b/2\), about 295 on an H100. But Chapter 3 also showed that the KV cache adds traffic proportional to \(B\), which batching cannot amortise. Including it changes the answer completely.</p>
+<p>For a decode step with \(B\) sequences at context \(t\), set compute time equal to memory time, using the latency model of §3.6 and ignoring the small attention FLOP term:</p>
+\[ \frac{2N_{\text{mm}}B}{\pi} = \frac{Nb_w + B\,t\,s_{kv}}{\beta} \quad\Longrightarrow\quad B^{*}(t) = \frac{Nb_w/\beta}{\;2N_{\text{mm}}/\pi \;-\; t\,s_{kv}/\beta\;} . \]
+<p>Read the denominator as a race between two per-sequence costs. \(2N_{\text{mm}}/\pi\) is the compute time each additional sequence adds, and \(t\,s_{kv}/\beta\) is the time to read its cache. If the cache read takes longer than the compute, then each added sequence adds more memory time than compute time, and no batch size, however large, makes the step compute-bound. The denominator vanishes at a <strong>critical context length</strong>:</p>
+<div class="box formula">
+\[ t_{\text{crit}} = \frac{2N_{\text{mm}}\,\beta}{\pi\, s_{kv}} = \frac{2N_{\text{mm}}}{I^{*} s_{kv}} . \]
+<p class="small">For \(t\ge t_{\text{crit}}\), decode is memory-bound at every batch size.</p>
+</div>
+
+<div class="box example">
+<div class="box-title">Worked example — the running examples on an H100</div>
+<p><strong>Llama 3 8B</strong> (BF16 cache, \(s_{kv}=128\) KiB): \(t_{\text{crit}}=2\times7.5\times10^9/(295\times131{,}072)\approx 388\) tokens. With an FP8 cache, about 775.</p>
+<p><strong>Llama 3 70B</strong> (\(s_{kv}=320\) KiB, \(N_{\text{mm}}\approx69.5\)B): \(t_{\text{crit}}\approx 1{,}437\) tokens; with an FP8 cache about 2,870.</p>
+<p>Typical chat contexts are thousands of tokens and reasoning traces tens of thousands. In production, decode for these models on H100s is memory-bound essentially always. Throughput is governed by bytes, both weights and cache, and by the batch size that memory capacity allows, not by FLOP/s.</p>
+</div>
+
+<figure class="chart" id="fig-6-3">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Critical batch size for decode on H100 versus context length (BF16 weights and cache)","height":350,
+ "x":{"label":"Context length t (tokens)","min":0,"max":1700,"ticks":[0,250,500,750,1000,1250,1500]},
+ "y":{"label":"Batch size B* to become compute-bound (log)","log":true,"min":100,"max":20000},
+ "vlines":[{"x":388,"text":"8B: t_crit ≈ 388"},{"x":1437,"text":"70B: ≈ 1,437"}],
+ "series":[
+  {"name":"Llama 3 8B","color":"s1","points":[[0,316],[100,426],[200,653],[250,890],[300,1398],[330,2126],[350,3255],[370,6946],[380,16035]]},
+  {"name":"Llama 3 70B","color":"s2","points":[[0,300],[250,363],[500,460],[750,627],[1000,986],[1100,1279],[1200,1819],[1300,3149],[1350,4961],[1400,11692]]}
+ ]}
+</script>
+<figcaption><b>Figure 6.3 — The KV cache moves the compute-bound regime out of reach.</b> The batch size needed for decode to become compute-bound, as a function of context length. It starts near the weights-only value of about 300 and diverges at the critical context length.</figcaption></figure>
+
+<p>Figure 6.3 plots \(B^{*}(t)\) on a logarithmic axis for both models. At zero context, both need a batch of about 300, the weights-only answer. As the context grows, the required batch climbs and then diverges: Llama 3 8B's asymptote is at 388 tokens, and Llama 3 70B's at about 1,437. Two architectural facts explain why the larger model tolerates longer contexts. It has many more weights to amortise per token of cache (\(N_{\text{mm}}/s_{kv}\) is larger), and its larger GQA group (\(g=8\) versus 4) makes its cache relatively smaller. The formula also tells us exactly which levers could move decode back towards compute-bound: a smaller \(s_{kv}\) (GQA, MLA, FP8 or INT4 caches; Chapter 8), more FLOPs per sequence per cache byte (speculative decoding, which verifies several tokens per cache read; Chapter 20), or hardware with a lower ridge point.</p>
+
+<div class="box interview">
+<div class="box-title">A classic interview question</div>
+<p>"At what batch size does Llama 70B decode become compute-bound on an H100?" The textbook answer, "about 300", ignores the cache. The strong answer derives \(B^{*}(t)\), notes that for realistic contexts (above about 1,400 tokens in BF16) the answer is "never", and concludes that the operating point is chosen by memory capacity and the TPOT target, not by FLOPs.</p>
+</div>
+
+
+<h2 id="s6-5">6.5 A roofline budget for a whole decode step</h2>
+<p>The roofline is most useful when applied not to one kernel but to an entire step, because the step's time is the sum of its parts, and optimising a part that is already small cannot help much. This is Amdahl's law, and the way to respect it is to draw up a <em>budget</em>: for each class of operation, its necessary bytes and FLOPs, its roofline time, and its share of the total. Here is that budget for our running example in a representative serving configuration.</p>
+
+<div class="table-wrap">
+<table>
+<caption>Roofline budget for one decode step: Llama 3 8B, BF16 weights and cache, 64 sequences at 2,048 tokens of context, one H100. Times are ideal (100% of \(\beta\) or \(\pi\)).</caption>
+<thead><tr><th>Component</th><th class="num">HBM bytes</th><th class="num">FLOPs</th><th class="num">Roofline time</th><th class="num">Share</th></tr></thead>
+<tbody>
+<tr><td>Weight matrices (all layers + LM head)</td><td class="num">15.0 GB</td><td class="num">\(9.6\times10^{11}\)</td><td class="num">4.48 ms (memory)</td><td class="num">46%</td></tr>
+<tr><td>Attention over the KV cache</td><td class="num">17.2 GB</td><td class="num">\(6.9\times10^{10}\)</td><td class="num">5.13 ms (memory)</td><td class="num">53%</td></tr>
+<tr><td>Norms, residuals, activations (fused or not)</td><td class="num">≈ 0.2 GB</td><td class="num">small</td><td class="num">≈ 0.06 ms</td><td class="num">&lt; 1%</td></tr>
+<tr><td>Sampling over \(64\times128{,}256\) logits</td><td class="num">≈ 0.1 GB</td><td class="num">small</td><td class="num">≈ 0.05 ms</td><td class="num">&lt; 1%</td></tr>
+<tr><td><strong>Total</strong></td><td class="num"><strong>≈ 32.5 GB</strong></td><td class="num">\(\approx10^{12}\)</td><td class="num"><strong>≈ 9.7 ms</strong></td><td class="num">100%</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The budget makes priorities obvious. Weight reads and cache reads split the step roughly evenly, and everything else is noise <em>in bytes</em>. That does not mean the small operations are free. In an unoptimised implementation each of them is a separate kernel launch, and the roughly 250 launches of a decode step can cost a millisecond or more of overhead (§3.4). But it does mean that, once overhead is handled, the only ways to make this step substantially faster are to read fewer weight bytes (quantisation, Chapter 14), read fewer cache bytes (Chapters 8 and 14), read them faster (better kernels reaching higher MBU, Chapter 9; or faster memory), or produce more than one token per read (Chapter 20). At 80% MBU the step takes about 12 ms, which matches the latency model of §3.6.</p>
+
+<details class="drill">
+<summary>Drill 6.2 — The same budget at batch 8 and 32k context</summary>
+<p>Redo the budget for 8 sequences at 32,768 tokens each.</p>
+<p><em>Solution.</em> Weights: still 15.0 GB, 4.48 ms. Cache: \(8\times32{,}768\times131{,}072\) B ≈ 34.4 GB, 10.3 ms. Total ≈ 14.8 ms, with 70% now in attention. A long-context workload is dominated by the cache, and halving it (FP8) is worth almost 35% of the step. Quantising the weights instead would gain only 15%. The optimal optimisation depends on the workload, which is why the budget must be drawn for production traffic, not for a benchmark.</p>
+</details>
+
+
+<h3 id="budget-hardware">The same budget on other hardware</h3>
+<p>Because the budget is expressed in bytes and FLOPs, it transfers directly to any accelerator: divide by that machine's \(\beta\) and \(\pi\). For the step above, 32.5 GB and about \(10^{12}\) FLOPs, the ideal times are:</p>
+<div class="table-wrap">
+<table>
+<caption>Ideal decode-step time for the budget above (Llama 3 8B, batch 64, 2k context, BF16) on different accelerators.</caption>
+<thead><tr><th>Accelerator</th><th class="num">β (TB/s)</th><th class="num">Memory time</th><th class="num">Compute time</th><th class="num">Ideal step</th><th class="num">Relative to H100</th></tr></thead>
+<tbody>
+<tr><td>A100 80 GB</td><td class="num">2.04</td><td class="num">15.9 ms</td><td class="num">3.2 ms</td><td class="num">15.9 ms</td><td class="num">0.61×</td></tr>
+<tr><td>H100 SXM</td><td class="num">3.35</td><td class="num">9.7 ms</td><td class="num">1.0 ms</td><td class="num">9.7 ms</td><td class="num">1.00×</td></tr>
+<tr><td>MI300X</td><td class="num">5.3</td><td class="num">6.1 ms</td><td class="num">0.8 ms</td><td class="num">6.1 ms</td><td class="num">1.58×</td></tr>
+<tr><td>H200</td><td class="num">4.8</td><td class="num">6.8 ms</td><td class="num">1.0 ms</td><td class="num">6.8 ms</td><td class="num">1.43×</td></tr>
+<tr><td>B200</td><td class="num">8.0</td><td class="num">4.1 ms</td><td class="num">0.44 ms</td><td class="num">4.1 ms</td><td class="num">2.39×</td></tr>
+</tbody>
+</table>
+</div>
+<p>On every one of these machines the step is memory-bound, and the ranking follows bandwidth, not FLOP/s. The A100, with a third of the H100's compute, is only 39% slower here. The MI300X and H200 beat the H100 despite similar or identical compute. Two caveats keep this from being the whole story. First, these are ideal times. Achieved MBU depends on kernel quality, which differs between software stacks and is often lower on newer or less widely used hardware. Second, memory capacity changes what batch is possible: the 141–192 GB parts can run much larger batches than an 80 GB part, and so reach operating points further right on the frontier of §6.6. Comparing accelerators for inference therefore means comparing bandwidth, capacity and achieved MBU together, and then dividing by price, which is what the cost-per-token calculations of Chapter 27 do.</p>
+
+<h2 id="s6-6">6.6 Choosing the operating point</h2>
+<p>The roofline and the budget tell us the time of a step at a given batch size. A serving system must choose the batch size, and with it the trade-off between per-user speed and total throughput introduced in §3.6. We can now make that choice systematically. Suppose the product requires a TPOT of at most 20 ms (50 tokens per second per user, comfortably faster than reading). Using the latency model at a realistic 80% MBU, the step time for Llama 3 8B at 2,048-token contexts is \((16.06+0.268B)/2.68\) ms. Setting this to 20 ms gives \(B\le140\). Within that limit, throughput is maximised at the largest feasible batch, provided memory allows it: about 140 sequences, giving roughly 7,000 tokens per second.</p>
+
+<figure class="chart" id="fig-6-7">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Latency–throughput frontier, Llama 3 8B on one H100 at 2k context (80% MBU)","height":350,
+ "x":{"label":"Total decode throughput (tokens/s)","min":0,"max":16000,"ticks":[0,4000,8000,12000,16000]},
+ "y":{"label":"TPOT (ms)","min":0,"max":30,"ticks":[0,5,10,15,20,25,30]},
+ "hlines":[{"y":20,"text":"TPOT SLO = 20 ms"}],
+ "series":[
+  {"name":"BF16 KV cache","color":"s1","labels":true,"points":[[164,6.09,"B=1",{"dx":8,"dy":4}],[2105,7.6,"16"],[5161,12.4,"64"],[6804,18.8,"128"],[7880,28.4,"224",{"dx":-8,"a":"end"}]]},
+  {"name":"FP8 KV cache","color":"s2","labels":true,"points":[[166,6.04],[2356,6.79],[6964,9.19,"64",{"dx":0,"dy":16,"a":"middle"}],[10331,12.39,"128",{"dx":0,"dy":16,"a":"middle"}],[13023,17.2,"224",{"dx":0,"dy":16,"a":"middle"}],[15775,28.4,"448",{"dx":-8,"a":"end"}]]}
+ ]}
+</script>
+<figcaption><b>Figure 6.7 — Choosing the operating point.</b> Each point is a batch size. Moving right raises throughput at the cost of per-user latency. Under a 20 ms TPOT target, the BF16 system can run about 140 sequences (≈ 7,000 tokens/s); with an FP8 cache, about 270 (≈ 13,500 tokens/s), almost doubling throughput at the same latency.</figcaption></figure>
+
+<p>Figure 6.7 draws the whole frontier. Each point is a batch size, plotted by the total throughput it delivers and the TPOT each user experiences. The BF16 curve rises steeply: beyond batch 128 every additional sequence adds almost as much time as it adds throughput. The horizontal line is the SLO, and the best operating point is where each curve crosses it. The orange curve shows the same system with an FP8 cache. Its slope is half as steep, because each sequence adds half as many bytes, so it crosses the SLO at roughly twice the throughput. This is how optimisations should be evaluated: not by how much they speed up an isolated kernel, but by how far they move the frontier at the latency the product requires. The same picture also explains why <em>goodput</em> (§1.13) is the right summary metric. Points to the right of the crossing deliver more raw throughput, but every request served there violates the SLO.</p>
+
+
+<h3 id="request-budget">Where GPU time goes across a whole request</h3>
+<p>The frontier concerns decode, but a serving GPU also runs prefills, and a budget for a whole <em>request</em> reveals something that the per-step view hides. Take the chat workload of §3.8: 2,000 prompt tokens, 500 output tokens, Llama 3 8B on one H100, about 64 sequences decoding concurrently. The request's prefill occupies the GPU for about 63 ms. Its decode is spread over 500 steps of about 13 ms each, but each step is shared with 63 other sequences, so the request's <em>share</em> of decode GPU time is \(500\times13/64\approx102\) ms. Prefill is therefore about 38% of the GPU time the request consumes, even though it is only 1% of the request's latency (63 ms out of 6.6 s).</p>
+<p>This asymmetry has two consequences that shape Part IV. First, prefill is not a minor cost to be squeezed in. At realistic input-to-output ratios it is a large fraction of the work, and because it is compute-bound while decode is memory-bound, the two phases contend for <em>different</em> resources of the same GPU. Running them together wastes some of each: during a long prefill the bandwidth sits underused, and during decode the compute does. That observation motivates chunked prefill (Chapter 11) and the disaggregation of prefill and decode onto separate pools of GPUs (Chapter 13). Second, any technique that avoids prefill work, above all reusing cached prefixes (Chapter 10), saves a large share of total GPU time, not just latency. A system prompt of 1,500 tokens shared by every request, if cached, removes three-quarters of this workload's prefill cost.</p>
+
+<h2 id="s6-7">6.7 Measuring how close you are: MFU and MBU</h2>
+<p>The roofline gives an upper bound. To know whether an implementation is good, we compare achieved performance with that bound, and two ratios have become standard. <strong>Model FLOPs utilisation (MFU)</strong>, popularised by the PaLM paper<span class="cite"><a href="#r-palm">[3]</a></span>, is the useful FLOP/s achieved divided by peak:</p>
+\[ \text{MFU} = \frac{F_{\text{model}}/t}{\pi}, \]
+<p>where \(F_{\text{model}}\) counts only the FLOPs the model mathematically requires (§2.10), not recomputation, padding or wasted work. <strong>Memory-bandwidth utilisation (MBU)</strong>, its analogue for memory-bound phases, is the bytes that must necessarily be moved per second divided by peak bandwidth:</p>
+\[ \text{MBU} = \frac{Q_{\text{model}}/t}{\beta},\qquad Q_{\text{model}} = N b_w + \sum_{\text{seq}} t_{\text{seq}}\,s_{kv}\ \text{ per decode step}. \]
+
+<div class="box example">
+<div class="box-title">Worked example — computing MBU from a benchmark</div>
+<p>A benchmark reports Llama 3 8B in BF16 on one H100 decoding 32 sequences of 1,024-token context at 7.9 ms per step. Necessary bytes per step: 16.06 GB of weights plus \(32\times1024\times131{,}072\) B ≈ 4.29 GB of cache, 20.35 GB in total. Achieved bandwidth = 20.35 GB / 7.9 ms ≈ 2.58 TB/s, so MBU ≈ 2.58/3.35 ≈ 77%. MFU for the same step is \(2\times7.5\times10^{9}\times32/0.0079\) ≈ 61 TFLOP/s, about 6%. Both numbers describe the same, well-optimised step.</p>
+</div>
+
+<p>The example exposes a common error. Reporting "6% GPU utilisation" for a decode step suggests a badly written system. In fact the step is within a quarter of its true limit, which is bandwidth. <strong>MFU is the right metric for compute-bound phases (prefill, training) and MBU for memory-bound phases (decode)</strong>. Good prefill implementations reach 40–70% MFU, and good decode implementations 60–85% MBU. A system that reports both, separately for each phase, is being honest. Neither metric captures latency, which is governed by the batching and scheduling choices of Part IV.</p>
+
+<h2 id="s6-8">6.8 Profiling: from trace to diagnosis</h2>
+<p>When a system misses its expected performance, the profiler tells you why. Three tools cover most needs on NVIDIA hardware. <strong>Nsight Systems</strong> records a timeline of everything that happens: CPU threads, kernel launches, GPU kernels, memory copies, communication. <strong>Nsight Compute</strong> examines individual kernels in depth: achieved FLOP/s and bandwidth at each memory level, occupancy, stall reasons, and a roofline plot. The <strong>PyTorch profiler</strong> attributes GPU time to framework operators and Python code. Reading their output is a skill, and the roofline gives the framework for it.</p>
+
+<figure class="diagram" id="fig-6-4">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-label="Schematic profiler timelines for overhead-bound and well-optimised decode steps">
+<text x="20" y="22" class="t-b">Schematic timelines of one decode step</text>
+<text x="20" y="56" class="t-sm">overhead-bound</text>
+<text x="20" y="72" class="t-xs">CPU</text>
+<rect x="120" y="60" width="560" height="14" rx="3" class="fill-s4" opacity=".7"/><text x="400" y="71" text-anchor="middle" class="t-xs">Python + launches, kernel by kernel</text>
+<text x="20" y="96" class="t-xs">GPU</text>
+<g><rect x="130" y="84" width="14" height="16" class="fill-acc"/><rect x="170" y="84" width="14" height="16" class="fill-acc"/><rect x="210" y="84" width="14" height="16" class="fill-acc"/><rect x="250" y="84" width="14" height="16" class="fill-acc"/><rect x="290" y="84" width="14" height="16" class="fill-acc"/><rect x="330" y="84" width="14" height="16" class="fill-acc"/><rect x="370" y="84" width="14" height="16" class="fill-acc"/><rect x="410" y="84" width="14" height="16" class="fill-acc"/><rect x="450" y="84" width="14" height="16" class="fill-acc"/><rect x="490" y="84" width="14" height="16" class="fill-acc"/><rect x="530" y="84" width="14" height="16" class="fill-acc"/><rect x="570" y="84" width="14" height="16" class="fill-acc"/><rect x="610" y="84" width="14" height="16" class="fill-acc"/><rect x="650" y="84" width="14" height="16" class="fill-acc"/></g>
+<text x="400" y="118" text-anchor="middle" class="t-xs">GPU idle between short kernels: gaps dominate</text>
+<text x="20" y="156" class="t-sm">optimised</text>
+<text x="20" y="172" class="t-xs">CPU</text>
+<rect x="120" y="160" width="60" height="14" rx="3" class="fill-s4" opacity=".7"/><text x="186" y="171" class="t-xs">schedule next step (overlapped)</text>
+<text x="20" y="196" class="t-xs">GPU</text>
+<rect x="130" y="184" width="300" height="16" class="fill-acc"/><text x="280" y="196" text-anchor="middle" class="t-xs" style="fill:#fff">one CUDA graph, fused kernels</text>
+<rect x="432" y="184" width="40" height="16" class="fill-s3"/><text x="478" y="196" class="t-xs">sampling</text>
+<text x="400" y="222" text-anchor="middle" class="t-xs">GPU busy throughout; step time ≈ bytes / (MBU · β)</text>
+</svg>
+<figcaption><b>Figure 6.4 — What a timeline reveals.</b> Top: a step dominated by CPU launch overhead, with short GPU kernels separated by idle gaps. Bottom: the same step captured as a CUDA graph with fused kernels and overlapped scheduling; the GPU is continuously busy.</figcaption></figure>
+
+<p>Figure 6.4 contrasts two schematic timelines of a decode step. In the top one, the CPU launches kernels one at a time, and each GPU kernel is so short that the GPU sits idle between launches. The timeline looks like a comb. No amount of kernel optimisation will help, because the kernels are not the bottleneck. In the bottom one, the step has been captured as a CUDA graph and the small kernels fused, so the GPU executes one dense block of work while the CPU prepares the next step in parallel. With that picture in mind, a practical diagnosis proceeds in three questions. Is the GPU busy? If there are gaps, the problem is overhead: use CUDA graphs, fusion, asynchronous scheduling. If it is busy, which kernels take the time? Rank them, and compare each kernel's achieved FLOP/s and bandwidth with its roofline. A kernel far below both roofs is <em>latency-bound</em> (too little parallelism, too many synchronisations), the subject of the next section. A kernel near one roof is as fast as it can be in its current form, and the only remedy is to change the algorithm: raise its intensity, reduce its bytes or its FLOPs.</p>
+
+<figure class="diagram" id="fig-6-5">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-label="A decision procedure for diagnosing performance problems">
+<defs><marker id="a65" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="20" y="90" width="120" height="50" rx="8" class="bx"/><text x="80" y="112" text-anchor="middle" class="t-sm">Is the GPU</text><text x="80" y="128" text-anchor="middle" class="t-sm">busy?</text>
+<line x1="140" y1="100" x2="200" y2="50" class="ln" marker-end="url(#a65)"/><text x="160" y="66" class="t-xs">no</text>
+<rect x="200" y="22" width="180" height="50" rx="8" class="bx4"/><text x="290" y="44" text-anchor="middle" class="t-sm">overhead-bound</text><text x="290" y="60" text-anchor="middle" class="t-xs">CUDA graphs, fusion, async CPU</text>
+<line x1="140" y1="130" x2="200" y2="160" class="ln" marker-end="url(#a65)"/><text x="160" y="160" class="t-xs">yes</text>
+<rect x="200" y="140" width="180" height="50" rx="8" class="bx"/><text x="290" y="162" text-anchor="middle" class="t-sm">top kernels near</text><text x="290" y="178" text-anchor="middle" class="t-sm">a roof?</text>
+<line x1="380" y1="150" x2="440" y2="100" class="ln" marker-end="url(#a65)"/><text x="398" y="118" class="t-xs">yes</text>
+<rect x="440" y="62" width="260" height="58" rx="8" class="bx3"/><text x="570" y="84" text-anchor="middle" class="t-sm">at the limit: change the algorithm</text><text x="570" y="102" text-anchor="middle" class="t-xs">fewer bytes (quantise), more reuse (fuse, tile),</text><text x="570" y="114" text-anchor="middle" class="t-xs">fewer FLOPs, or better hardware</text>
+<line x1="380" y1="180" x2="440" y2="190" class="ln" marker-end="url(#a65)"/><text x="400" y="200" class="t-xs">no</text>
+<rect x="440" y="160" width="260" height="58" rx="8" class="bx2"/><text x="570" y="182" text-anchor="middle" class="t-sm">latency-bound kernel</text><text x="570" y="200" text-anchor="middle" class="t-xs">too little parallelism, wave quantisation,</text><text x="570" y="212" text-anchor="middle" class="t-xs">synchronisation: retile, split-K, overlap</text>
+</svg>
+<figcaption><b>Figure 6.5 — A diagnosis procedure.</b> First check for idle time (overhead); then compare the dominant kernels with their roofline; kernels far below every roof are latency-bound.</figcaption></figure>
+
+<p>Figure 6.5 condenses this procedure into a decision tree, and it is worth internalising because it prevents the most common waste of engineering effort: optimising a kernel that is not on the critical path, or tuning a kernel that is already at its roof. A good habit is to write down the roofline prediction <em>before</em> profiling. The size of the gap between prediction and measurement tells you whether you misunderstood the workload or the implementation.</p>
+
+<h2 id="s6-9">6.9 What the roofline does not see</h2>
+<p>The roofline is an upper bound, and real kernels can fall short of it for reasons the model ignores. Four matter routinely in LLM inference.</p>
+<p><strong>Wave quantisation.</strong> A kernel's work is divided into tiles, each processed by one thread block on one SM. An H100 has 132 SMs. If a matrix product produces 133 output tiles, the first 132 run in parallel as one "wave" and the last runs alone in a second wave while 131 SMs idle. The kernel takes two waves' time for 133/264 ≈ 50% of the work it could have done. Small decode matrices are especially prone to this, because their total tile count is small. Remedies include choosing tile sizes that divide the work evenly, splitting the reduction dimension across more blocks ("split-K"), and persistent kernels that schedule tiles dynamically.</p>
+
+<figure class="diagram" id="fig-6-6">
+<svg class="dg" viewBox="0 0 720 170" role="img" aria-label="Wave quantisation: 133 tiles on 132 SMs need two waves">
+<text x="20" y="22" class="t-b">133 output tiles on a GPU with 132 SMs (each square = one SM in one wave)</text>
+<g>
+<rect x="20" y="40" width="560" height="30" rx="4" class="bx3"/><text x="300" y="60" text-anchor="middle" class="t-sm">wave 1: 132 tiles in parallel, every SM busy</text>
+<rect x="20" y="80" width="4" height="30" class="fill-s2"/><rect x="26" y="80" width="554" height="30" rx="4" class="fill-muted"/><text x="300" y="100" text-anchor="middle" class="t-sm">wave 2: 1 tile; 131 SMs idle</text>
+</g>
+<text x="600" y="60" class="t-xs">time ≈ 2 waves</text><text x="600" y="100" class="t-xs">useful ≈ 50%</text>
+<text x="20" y="140" class="t-sm">Fix: tile size giving ≈ 132k tiles, split-K, or a persistent kernel that balances tiles dynamically.</text>
+</svg>
+<figcaption><b>Figure 6.6 — Wave quantisation.</b> When the number of tiles slightly exceeds a multiple of the SM count, a nearly empty final wave doubles the runtime of a small kernel.</figcaption></figure>
+
+<p>Figure 6.6 shows the worst case, and it explains a puzzle that confuses many newcomers: making a matrix very slightly larger can make a kernel almost twice as slow. <strong>Launch and synchronisation latency.</strong> Every kernel launch costs a few microseconds of CPU time, and every synchronisation (between thread blocks, between the CPU and GPU, between GPUs) costs latency that no bandwidth or FLOP figure captures. At small batch, decode is often a sequence of hundreds of kernels lasting tens of microseconds each, and this latency adds up (§3.4). <strong>Clock and power throttling.</strong> Peak FLOP/s assumes the rated clock, but a GPU running dense tensor work at its power limit may lower its clock. Sustained throughput can sit 10–20% below the datasheet figure, so measure achieved clocks. <strong>Communication.</strong> In multi-GPU inference, collectives add their own roofline: bytes divided by link bandwidth, plus a per-message latency that dominates for the small messages of decode (Chapter 17). A tensor-parallel decode step can be limited by the <em>latency</em> of its 160 all-reduces rather than by any bandwidth.</p>
+
+<p>It helps to see these effects add up on a single number. Figure 6.8 decomposes the time of one batch-1 decode step of Llama 3 8B on an H100 into the roofline floor and the losses stacked on top of it. The floor is the weight read alone: 16.06 GB at 3.35 TB/s is 4.8 ms. A good implementation measures about 6.5 ms, an MBU of 74%. The figure is schematic, since the exact split depends on the engine and driver, but its proportions are typical. The largest single loss is that no real kernel streams HBM at the datasheet rate; roughly 90% is achievable, which costs half a millisecond before anything else goes wrong. Launch and synchronisation gaps come next, and they are exactly what CUDA graphs (Chapter 7) remove. Small unfused operators and wave tails account for the rest. Reading the figure from right to left is the profiling procedure of Figure 6.5: first remove idle time, then fuse, then tune tiles, and accept that the last 10% is the hardware's.</p>
+
+<figure class="diagram" id="fig-6-8">
+<svg class="dg" viewBox="0 0 720 200" role="img" aria-label="Schematic decomposition of a 6.5 ms decode step into a 4.8 ms roofline floor and four losses">
+<text x="20" y="22" class="t-b">One decode step, Llama 3 8B, batch 1, H100 (schematic)</text>
+<rect x="20" y="50" width="443" height="40" rx="3" class="fill-acc"/>
+<text x="241" y="75" text-anchor="middle" class="t-sm t-on">roofline floor: 16.06 GB / 3.35 TB/s = 4.8 ms</text>
+<rect x="463" y="50" width="46" height="40" class="fill-s2"/>
+<rect x="509" y="50" width="55" height="40" class="fill-s3"/>
+<rect x="564" y="50" width="28" height="40" class="fill-s4"/>
+<rect x="592" y="50" width="28" height="40" class="fill-s5"/>
+<line x1="486" y1="90" x2="486" y2="118" class="ln"/><text x="486" y="132" text-anchor="middle" class="t-xs">HBM at ~90%</text><text x="486" y="146" text-anchor="middle" class="t-xs">+0.5 ms</text>
+<line x1="536" y1="90" x2="536" y2="160" class="ln"/><text x="536" y="174" text-anchor="middle" class="t-xs">launch gaps +0.6 ms</text>
+<line x1="578" y1="90" x2="600" y2="118" class="ln"/><text x="612" y="132" text-anchor="start" class="t-xs">unfused ops +0.3</text>
+<line x1="606" y1="90" x2="640" y2="104" class="ln"/><text x="644" y="108" text-anchor="start" class="t-xs">waves +0.3</text>
+<line x1="20" y1="40" x2="620" y2="40" class="ln dash"/>
+<text x="620" y="34" text-anchor="end" class="t-xs">measured ≈ 6.5 ms (MBU 74%)</text>
+</svg>
+<figcaption><b>Figure 6.8 — From roofline floor to measured time.</b> Bar length is proportional to time. The roofline floor is exact; the four losses are a typical, schematic split for a well-engineered engine. Each loss has its own remedy: better copy kernels for bandwidth, CUDA graphs for launch gaps, fusion for small operators and tile choice for waves.</figcaption>
+</figure>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — the roofline as a bound, not a model</div>
+<p>The roofline is a lower bound on time, \(t\ge\max(F/\pi,Q/\beta)\), derived from two capacity constraints. It becomes a good <em>prediction</em> only when the implementation overlaps compute and data movement perfectly, keeps enough work in flight to hide latency (Little's law, §5.1), and incurs no other costs. Treat it like a lower bound in optimisation: it tells you how much improvement is possible, and which constraint is active, but not how to reach it.</p>
+</div>
+
+<h2 id="looking-ahead" class="unnumbered">Looking ahead</h2>
+<p>The roofline told us that most of an LLM's non-matmul operations are memory-bound and that fusing them removes their cost, that tiling raises intensity at one level of the hierarchy and moves the pressure to the next, and that decode spends its time reading bytes. All of these conclusions end the same way: <em>write a better kernel</em>. Fuse these operations, tile that loop, overlap this copy with that multiply. For a mathematician without a systems background, that is where the black box remains. Chapter 7 opens it, showing how GPU kernels are actually written, from a first matrix-multiply in CUDA to the Triton language that most LLM engineers use, and how the online softmax makes fused attention possible.</p>
+
+<h2 id="summary">Chapter summary</h2>
+<ul>
+<li>Roofline: \(F/t\le\min(\pi, I\beta)\), with \(I=F/Q\). Each class of operation has its own ceiling (BF16 989, FP8 1,979, FP32 lanes ≈ 62 TFLOP/s on H100) and therefore its own ridge point.</li>
+<li>Hierarchical roofline: compute \(I_\ell\) at every memory level and take the minimum of \(I_\ell\beta_\ell\). A kernel is limited by the weakest level it touches.</li>
+<li>LLM operators: prefill GEMMs and prefill attention are compute-bound; decode GEMMs have \(I\approx B\); decode attention has \(I=2g/b\); norms, activations and softmax have \(I\approx1\), which is why fusion matters.</li>
+<li>Critical batch size with KV traffic: \(B^{*}(t)=(Nb_w/\beta)/(2N_{\text{mm}}/\pi - ts_{kv}/\beta)\). It diverges at \(t_{\text{crit}}=2N_{\text{mm}}/(I^{*}s_{kv})\): 388 tokens for Llama 3 8B and about 1,437 for Llama 3 70B on H100 (BF16). Beyond it, decode is memory-bound at any batch size.</li>
+<li>A roofline budget sums per-component times; for Llama 3 8B at batch 64 and 2k context, weights and cache each take about half of a ≈ 9.7 ms ideal step. The operating point is the largest batch that meets the TPOT target; an FP8 cache roughly doubles throughput at the same TPOT.</li>
+<li>MFU for compute-bound phases, MBU for memory-bound phases. Good values: 40–70% MFU in prefill, 60–85% MBU in decode.</li>
+<li>Profiling: check for idle gaps (overhead), then compare dominant kernels with their roofs; kernels below every roof are latency-bound.</li>
+<li>Outside the roofline: wave quantisation, launch and synchronisation latency, clock throttling, and communication latency.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+<div class="mcq" data-id="ch06-mcq-01" data-topic="§6.1 Roofline">
+<p class="q">On log–log axes, the memory-bound part of the roofline is a line of slope:</p>
+<ol class="opts"><li>0</li><li data-correct>1, at height \(I\beta\)</li><li>−1</li><li>2</li></ol>
+<div class="explain">\(\log(I\beta)=\log I+\log\beta\): slope one, offset by bandwidth.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-02" data-topic="§6.1 Roofline">
+<p class="q">The roofline is best described as:</p>
+<ol class="opts"><li>An exact model of kernel time</li><li data-correct>An upper bound on attainable FLOP/s (lower bound on time) from compute and bandwidth limits</li><li>A measure of power consumption</li><li>A scheduling algorithm</li></ol>
+<div class="explain">It is reached only with perfect overlap and enough parallelism; real kernels fall below it.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-03" data-topic="§6.1 Ceilings">
+<p class="q">On an H100, the FP8 tensor-core ridge point is about:</p>
+<ol class="opts"><li>148</li><li>295</li><li data-correct>590</li><li>1,180</li></ol>
+<div class="explain">1,979 TFLOP/s ÷ 3.35 TB/s ≈ 590 FLOPs/byte.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-04" data-topic="§6.1 Ceilings">
+<p class="q">Switching a memory-bound decode GEMM from BF16 compute to FP8 compute, <em>keeping BF16 weights in memory</em>, would:</p>
+<ol class="opts"><li>Double its speed</li><li data-correct>Barely change its speed, because it is limited by bytes, not FLOPs</li><li>Halve its speed</li><li>Make it compute-bound</li></ol>
+<div class="explain">FP8 inference helps decode because weights are <em>stored</em> in FP8, halving bytes moved.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-05" data-topic="§6.1 Ceilings">
+<p class="q">A kernel that cannot use tensor cores has intensity 40 FLOPs/byte on an H100. It is:</p>
+<ol class="opts"><li>Memory-bound</li><li data-correct>Compute-bound against the FP32-lane ceiling (ridge ≈ 18.5)</li><li>Compute-bound against the BF16 tensor ceiling</li><li>Overhead-bound by definition</li></ol>
+<div class="explain">The relevant ceiling is ≈ 62 TFLOP/s, whose ridge is at 62/3.35 ≈ 18.5.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-06" data-topic="§6.2 Hierarchical roofline">
+<p class="q">In a hierarchical roofline, the attainable performance of a kernel is:</p>
+<ol class="opts"><li>Determined by HBM alone</li><li data-correct>\(\min(\pi, \min_\ell I_\ell\beta_\ell)\) over all memory levels the kernel uses</li><li>The average over levels</li><li>Determined by the fastest level</li></ol>
+<div class="explain">Every level imposes its own bound; the weakest one binds.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-07" data-topic="§6.2 Hierarchical roofline">
+<p class="q">A tiled kernel has HBM intensity 2,000 but shared-memory intensity 20 on an H100 (shared memory ≈ 31 TB/s). It is likely limited by:</p>
+<ol class="opts"><li>HBM bandwidth</li><li data-correct>Shared-memory bandwidth (20 × 31 TB/s ≈ 620 TFLOP/s &lt; 989)</li><li>Tensor cores</li><li>PCIe</li></ol>
+<div class="explain">Its shared-memory roof is below the compute ceiling. Larger register tiles would raise \(I_{\text{SMEM}}\).</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-08" data-topic="§6.3 Operators">
+<p class="q">Which LLM operations are memory-bound on an H100 in typical serving? (select all that apply)</p>
+<ol class="opts"><li data-correct>Decode-time linear layers at batch 32</li><li data-correct>Decode attention</li><li>Prefill GEMMs on 4,096 tokens</li><li data-correct>RMSNorm and residual additions</li></ol>
+<div class="explain">Prefill GEMMs are compute-bound; the rest have intensities far below 295.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-09" data-topic="§6.3 Operators">
+<p class="q">Why does fusing RMSNorm into the neighbouring matmul save time even in compute-bound prefill?</p>
+<ol class="opts"><li>It reduces FLOPs</li><li data-correct>An unfused norm reads and writes the whole activation through HBM for a handful of FLOPs; fusion removes that round-trip</li><li>It improves accuracy</li><li>It allows FP4</li></ol>
+<div class="explain">Memory-bound kernels cost their bytes; eliminating the bytes eliminates the cost.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-10" data-topic="§6.3 Attention">
+<p class="q">With FlashAttention, the HBM intensity of causal prefill attention grows with sequence length \(T\) as:</p>
+<ol class="opts"><li>Constant</li><li data-correct>Linearly in \(T\)</li><li>Quadratically in \(T\)</li><li>As \(\log T\)</li></ol>
+<div class="explain">FLOPs ∝ \(T^2\), bytes ∝ \(T\) (Q, K, V, O read/written once), so intensity ∝ \(T\).</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-11" data-topic="§6.3 Drill">
+<p class="q">In a 4,096-token prefill of Llama 3 8B, unfused RMSNorms cost roughly what share of time relative to the linear layers?</p>
+<ol class="opts"><li>&lt; 0.1%</li><li data-correct>≈ 2%</li><li>≈ 20%</li><li>≈ 50%</li></ol>
+<div class="explain">≈ 1.3 ms of HBM traffic versus ≈ 62 ms of compute (Drill 6.1).</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-12" data-topic="§6.4 Critical batch">
+<p class="q">Ignoring the KV cache, the decode batch size at which a BF16 dense model becomes compute-bound on H100 is about:</p>
+<ol class="opts"><li>30</li><li data-correct>300</li><li>3,000</li><li>Never</li></ol>
+<div class="explain">\(B^{*}\approx I^{*}b/2\approx295\) for BF16 weights.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-13" data-topic="§6.4 Critical context">
+<p class="q">The critical context length \(t_{\text{crit}}=2N_{\text{mm}}/(I^{*}s_{kv})\) is the context beyond which:</p>
+<ol class="opts"><li>The KV cache no longer fits</li><li data-correct>Decode is memory-bound for every batch size, because each sequence's cache read takes longer than its compute</li><li>Prefill becomes memory-bound</li><li>Attention FLOPs exceed weight FLOPs</li></ol>
+<div class="explain">The denominator \(2N_{\text{mm}}/\pi-ts_{kv}/\beta\) of \(B^{*}(t)\) vanishes.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-14" data-topic="§6.4 Critical context">
+<p class="q">For Llama 3 8B on H100 with a BF16 cache, \(t_{\text{crit}}\) is about:</p>
+<ol class="opts"><li>40 tokens</li><li data-correct>390 tokens</li><li>4,000 tokens</li><li>40,000 tokens</li></ol>
+<div class="explain">\(2\times7.5\times10^9/(295\times131{,}072)\approx388\).</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-15" data-topic="§6.4 Critical context">
+<p class="q">Switching the KV cache from BF16 to FP8 changes \(t_{\text{crit}}\) by:</p>
+<ol class="opts"><li>No change</li><li data-correct>Doubling it</li><li>Halving it</li><li>Quadrupling it</li></ol>
+<div class="explain">\(t_{\text{crit}}\propto1/s_{kv}\), and FP8 halves \(s_{kv}\).</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-16" data-topic="§6.4 Critical context">
+<p class="q">Why does Llama 3 70B have a larger \(t_{\text{crit}}\) than Llama 3 8B?</p>
+<ol class="opts"><li>It has a smaller vocabulary</li><li data-correct>It has many more weight FLOPs per byte of cache per token (\(N_{\text{mm}}/s_{kv}\) is larger), helped by its larger GQA group</li><li>It uses FP8</li><li>It has fewer layers</li></ol>
+<div class="explain">\(69.5\text{B}/320\text{ KiB}\) versus \(7.5\text{B}/128\text{ KiB}\): about 3.7× larger.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-17" data-topic="§6.4 Levers">
+<p class="q">Which changes raise \(t_{\text{crit}}\), pushing decode back towards compute-bound? (select all that apply)</p>
+<ol class="opts"><li data-correct>Smaller KV cache per token (MLA, more aggressive GQA, quantised cache)</li><li data-correct>Hardware with a lower ridge point \(I^{*}\)</li><li>A larger vocabulary</li><li data-correct>Doing more useful FLOPs per cache read (e.g. verifying several speculative tokens per step)</li></ol>
+<div class="explain">From \(t_{\text{crit}}=2N_{\text{mm}}/(I^{*}s_{kv})\), plus algorithms that amortise cache reads over more tokens.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-18" data-topic="§6.7 MFU">
+<p class="q">MFU counts which FLOPs in the numerator?</p>
+<ol class="opts"><li>All FLOPs executed, including recomputation and padding</li><li data-correct>Only the FLOPs the model mathematically requires</li><li>Only attention FLOPs</li><li>Peak FLOPs</li></ol>
+<div class="explain">Counting wasted work would let inefficient implementations look better.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-19" data-topic="§6.7 MBU">
+<p class="q">A decode step reads 20 GB of necessary weights + cache in 8 ms on a 3.35 TB/s GPU. MBU is about:</p>
+<ol class="opts"><li>25%</li><li>50%</li><li data-correct>75%</li><li>100%</li></ol>
+<div class="explain">20 GB / 8 ms = 2.5 TB/s; 2.5/3.35 ≈ 75%.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-20" data-topic="§6.7 Interpretation">
+<p class="q">A team reports their decode step runs at 5% MFU and concludes the implementation is poor. The best response is:</p>
+<ol class="opts"><li>Agree</li><li data-correct>Decode is memory-bound; compute MBU instead, which may be near its limit</li><li>Switch to FP64</li><li>Increase the vocabulary</li></ol>
+<div class="explain">MFU is the wrong metric for a memory-bound phase.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-21" data-topic="§6.7 Typical values">
+<p class="q">Which pair of utilisation figures is typical of a well-optimised serving system?</p>
+<ol class="opts"><li>Prefill MBU 90%, decode MFU 70%</li><li data-correct>Prefill MFU 40–70%, decode MBU 60–85%</li><li>Both MFU 100%</li><li>Prefill MFU 5%, decode MBU 5%</li></ol>
+<div class="explain">Report each phase against its own binding resource.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-22" data-topic="§6.8 Profiling">
+<p class="q">A timeline shows short GPU kernels separated by idle gaps while the CPU is busy launching. The bottleneck is:</p>
+<ol class="opts"><li>HBM bandwidth</li><li>Tensor-core throughput</li><li data-correct>Overhead (launch, Python, scheduling)</li><li>Wave quantisation</li></ol>
+<div class="explain">Remedies: CUDA graphs, fusion, asynchronous scheduling.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-23" data-topic="§6.8 Tools">
+<p class="q">Which tool is designed to show a per-kernel roofline with achieved bandwidth at each memory level?</p>
+<ol class="opts"><li>Nsight Systems</li><li data-correct>Nsight Compute</li><li>nvidia-smi</li><li>The Python debugger</li></ol>
+<div class="explain">Nsight Systems shows the timeline; Nsight Compute dissects individual kernels.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-24" data-topic="§6.8 Diagnosis">
+<p class="q">A dominant kernel achieves 40% of the HBM roof and 3% of the compute roof, and the GPU has no idle gaps. Most likely it is:</p>
+<ol class="opts"><li>At its limit</li><li data-correct>Latency-bound (insufficient parallelism, synchronisation or poor tiling), so it can likely be improved within its algorithm</li><li>Compute-bound</li><li>PCIe-bound</li></ol>
+<div class="explain">Far below every roof means something other than bandwidth or compute limits it.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-25" data-topic="§6.9 Wave quantisation">
+<p class="q">A GEMM decomposes into 140 tiles on a 132-SM GPU, one tile per SM per wave. Its efficiency relative to perfect balance is about:</p>
+<ol class="opts"><li>95%</li><li data-correct>53%</li><li>25%</li><li>100%</li></ol>
+<div class="explain">2 waves are needed for 140 tiles: 140/264 ≈ 53%.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-26" data-topic="§6.9 Wave quantisation">
+<p class="q">Which techniques mitigate wave quantisation? (select all that apply)</p>
+<ol class="opts"><li data-correct>Choosing tile sizes so the tile count is close to a multiple of the SM count</li><li data-correct>Split-K: dividing the reduction dimension across more blocks</li><li data-correct>Persistent kernels that schedule tiles dynamically</li><li>Increasing the vocabulary</li></ol>
+<div class="explain">All three balance work across SMs.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-27" data-topic="§6.9 Throttling">
+<p class="q">Sustained tensor-core throughput may sit below the datasheet peak mainly because:</p>
+<ol class="opts"><li>HBM capacity is limited</li><li data-correct>The GPU lowers its clock at its power or thermal limit under dense load</li><li>Tensor cores wear out</li><li>Python is slow</li></ol>
+<div class="explain">Peak assumes the rated clock; measure achieved clocks during benchmarks.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-28" data-topic="§6.9 Communication">
+<p class="q">In tensor-parallel decode at small batch, the all-reduces are typically limited by:</p>
+<ol class="opts"><li>Their bandwidth, since messages are huge</li><li data-correct>Per-message latency, since messages are small (≈ \(B\times d\) values) and there are two per layer</li><li>HBM capacity</li><li>FP8 support</li></ol>
+<div class="explain">Small messages make latency, not bandwidth, the dominant cost (Chapter 17).</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-29" data-topic="§6.4 Operating point">
+<p class="q">Given that decode is memory-bound at realistic contexts, the decode batch size in production is chosen mainly by:</p>
+<ol class="opts"><li>The ridge point</li><li data-correct>KV-cache memory capacity and the TPOT (latency) target</li><li>The vocabulary size</li><li>The number of SMs</li></ol>
+<div class="explain">Throughput rises with batch until memory runs out or TPOT exceeds its SLO.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-30" data-topic="§6.1 Bound">
+<p class="q">A kernel performs \(10^{12}\) FLOPs and moves 10 GB on an H100. Its minimum time is about:</p>
+<ol class="opts"><li>1.0 ms</li><li data-correct>3.0 ms</li><li>0.3 ms</li><li>10 ms</li></ol>
+<div class="explain">\(\max(10^{12}/989\text{e}12,\ 10\text{e}9/3.35\text{e}12)=\max(1.0,\,2.99)\) ms. It is memory-bound (I = 100).</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-31" data-topic="§6.5 Budget">
+<p class="q">In the roofline budget for Llama 3 8B decode at batch 64 and 2k context, the two dominant components are:</p>
+<ol class="opts"><li>Norms and sampling</li><li data-correct>Weight reads and KV-cache reads, roughly half each</li><li>Embedding and LM head</li><li>Communication and overhead</li></ol>
+<div class="explain">15.0 GB of weights and 17.2 GB of cache, versus well under 1 GB for everything else.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-32" data-topic="§6.5 Amdahl">
+<p class="q">At batch 8 and 32k context, which optimisation gives the larger decode speed-up for Llama 3 8B?</p>
+<ol class="opts"><li>FP8 weights</li><li data-correct>FP8 KV cache</li><li>Faster sampling</li><li>Fusing RMSNorm</li></ol>
+<div class="explain">The cache is ≈ 70% of bytes (34.4 of 49.4 GB), so halving it saves ≈ 35%; FP8 weights save ≈ 15%.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-33" data-topic="§6.6 Operating point">
+<p class="q">With step time \((16.06+0.268B)/2.68\) ms, the largest batch meeting a 20 ms TPOT target is about:</p>
+<ol class="opts"><li>40</li><li data-correct>140</li><li>240</li><li>480</li></ol>
+<div class="explain">\(16.06+0.268B\le53.6\Rightarrow B\le140\).</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-34" data-topic="§6.6 Frontier">
+<p class="q">The right way to evaluate an inference optimisation is mainly:</p>
+<ol class="opts"><li>The speed-up of the kernel it touches</li><li data-correct>How far it moves the latency–throughput frontier, i.e. throughput at the required TPOT/TTFT targets</li><li>Its effect on MFU</li><li>The number of lines of code</li></ol>
+<div class="explain">Goodput at the SLO is what the business pays for.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-35" data-topic="§6.6 Request budget">
+<p class="q">For the 2,000-in / 500-out chat workload on Llama 3 8B (64 concurrent decodes), roughly what share of a request's GPU time is prefill?</p>
+<ol class="opts"><li>≈ 1%</li><li>≈ 10%</li><li data-correct>≈ 38%</li><li>≈ 90%</li></ol>
+<div class="explain">Prefill ≈ 63 ms; decode share ≈ 500 × 13 ms / 64 ≈ 102 ms. Prefill is small in latency but large in GPU time.</div>
+</div>
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+<details class="qa" data-id="ch06-qa-01">
+<summary><span class="lvl warm">Warm-up</span> Explain the roofline model and how you would use it before writing any code.</summary>
+<div class="answer">
+<p>Time ≥ max(FLOPs/π, bytes/β), equivalently attainable FLOP/s ≤ min(π, Iβ) with I = FLOPs/byte. Before coding: count the kernel's necessary FLOPs and HBM bytes, compute I, compare with the ridge π/β for the relevant ceiling (tensor cores at the chosen precision, or the FP32 lanes). If I is below the ridge, expected time ≈ bytes/β, so optimise bytes: quantisation, fusion, reuse. If above, time ≈ FLOPs/π, so optimise FLOPs or use faster units. This sets a target to compare against the profiler, and prevents optimising the wrong resource.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch06-qa-02">
+<summary><span class="lvl core">Core</span> At what batch size does Llama 3 70B decode become compute-bound on an H100?</summary>
+<div class="answer">
+<p>Weights alone: intensity ≈ B in BF16, so B ≈ ridge ≈ 295. With the cache: equate \(2N_{\text{mm}}B/\pi\) with \((Nb_w+Bts_{kv})/\beta\), giving \(B^{*}(t)=(Nb_w/\beta)/(2N_{\text{mm}}/\pi-ts_{kv}/\beta)\). For 70B (\(N_{\text{mm}}\approx69.5\)B, \(s_{kv}=320\) KiB), the denominator vanishes at \(t_{\text{crit}}=2N_{\text{mm}}/(I^{*}s_{kv})\approx1{,}437\) tokens (≈ 2,870 with an FP8 cache). At 1,000 tokens \(B^{*}\approx990\), already far beyond memory capacity on a few GPUs. For typical chat or reasoning contexts the answer is "never": decode is bandwidth-bound and the batch is chosen by memory capacity and the TPOT target. (With tensor parallelism both sides scale per GPU, so the conclusion is unchanged.)</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch06-qa-03">
+<summary><span class="lvl core">Core</span> Define MFU and MBU. Which do you report for prefill and for decode, and why?</summary>
+<div class="answer">
+<p>MFU = required model FLOPs per second ÷ peak FLOP/s. MBU = required bytes per second (weights + KV cache, read once each) ÷ peak bandwidth. Prefill is compute-bound, so MFU shows how close it is to its limit (40–70% is good). Decode is memory-bound, so its MFU is inherently low (a few percent) even when optimal, and MBU is the meaningful metric (60–85% is good). Report both per phase, at a stated batch size and context length, since both depend strongly on them.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch06-qa-04">
+<summary><span class="lvl core">Core</span> What is a hierarchical roofline and when does it change your conclusions?</summary>
+<div class="answer">
+<p>Compute intensity separately at each memory level (HBM, L2, shared memory, registers) using that level's traffic, and apply \(\min(\pi,\min_\ell I_\ell\beta_\ell)\). It changes conclusions for tiled kernels: tiling raises HBM intensity, but if tiles are small or re-read many times, shared-memory or L2 bandwidth can bind instead. Example: a GEMM with HBM intensity 2,000 but shared-memory intensity 20 is limited at ≈ 20 × 31 TB/s ≈ 620 TFLOP/s on H100. The fix is larger register tiles, or hardware such as Blackwell's tensor memory. It also explains FlashAttention's design choices: keep data in SRAM, but organise it so SRAM bandwidth is not the new limit.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch06-qa-05">
+<summary><span class="lvl core">Core</span> Place each Transformer operation on the roofline for both prefill and decode.</summary>
+<div class="answer">
+<ul>
+<li><strong>Linear layers:</strong> intensity ≈ number of tokens sharing the weights (BF16). Prefill (thousands): compute-bound. Decode (= B): memory-bound below ≈ 300.</li>
+<li><strong>Attention:</strong> prefill with FlashAttention has intensity ∝ T (compute-bound for long prompts); decode has \(2g/b\) (memory-bound always).</li>
+<li><strong>Norms, residual adds, activations, softmax:</strong> intensity ≈ 1, memory-bound in both phases, so fuse them.</li>
+<li><strong>Embedding:</strong> zero intensity, negligible bytes.</li>
+<li><strong>LM head:</strong> a linear layer; only last-position rows in prefill.</li>
+<li><strong>Sampling:</strong> memory-bound passes over \(B\times|\mathcal V|\) logits.</li>
+<li><strong>Collectives</strong> (multi-GPU): bytes/link bandwidth plus latency, with latency dominating in decode.</li>
+</ul>
+</div>
+</details>
+
+<details class="qa" data-id="ch06-qa-06">
+<summary><span class="lvl deep">Deep-dive</span> Derive the critical context length and discuss what it implies for hardware and model design.</summary>
+<div class="answer">
+<p>Per extra sequence in a decode batch: compute time \(2N_{\text{mm}}/\pi\), cache-read time \(ts_{kv}/\beta\). If the latter exceeds the former, increasing B adds more memory time than compute time, so the step can never become compute-bound. Hence \(t_{\text{crit}}=2N_{\text{mm}}\beta/(\pi s_{kv})=2N_{\text{mm}}/(I^{*}s_{kv})\). Implications: (1) hardware with a rising ridge point lowers \(t_{\text{crit}}\), so new GPUs make decode <em>more</em> memory-bound unless the cache shrinks; (2) model design should minimise \(s_{kv}\) relative to \(N_{\text{mm}}\) (GQA with larger groups, MLA, sliding windows, KV quantisation); (3) MoE models have small \(N_{\text{act}}\) per token, which lowers \(t_{\text{crit}}\) further, so their caches must be tiny (DeepSeek's MLA); (4) algorithms that raise FLOPs per cache read (speculative verification, multi-query batching of shared prefixes) are valuable.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch06-qa-07">
+<summary><span class="lvl core">Core</span> A benchmark shows decode at 8 ms/step for 32 sequences × 1k context, Llama 3 8B on H100. Is it well optimised?</summary>
+<div class="answer">
+<p>Necessary bytes: 16.06 GB weights + 32 × 1,024 × 128 KiB ≈ 4.3 GB cache ≈ 20.35 GB. Roofline time = 20.35 / 3.35 ≈ 6.1 ms. Achieved 8 ms gives MBU ≈ 76%, which is good. MFU ≈ 6%, irrelevant here. Remaining headroom might come from fusing small kernels, CUDA graphs, better attention kernels (to read the cache at full bandwidth) or overlapping sampling. Bigger wins require changing bytes: FP8 weights and cache would cut the roofline time to about 3 ms.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch06-qa-08">
+<summary><span class="lvl core">Core</span> Walk through how you would profile a slow decode step.</summary>
+<div class="answer">
+<p>(1) Predict: compute the roofline time from bytes and FLOPs. (2) Nsight Systems timeline: are there gaps on the GPU? If so, the step is overhead-bound (Python, launches, synchronisation, host–device copies, CPU sampling), so use CUDA graphs, fusion, asynchronous scheduling, and avoid <code>.item()</code>-style syncs. (3) If the GPU is busy, rank kernels by time. (4) For the top kernels, Nsight Compute: achieved DRAM bandwidth and FLOP/s versus roofs, occupancy, stall reasons, L2 hit rates. Near a roof means change the algorithm (quantise, fuse, better attention kernel); far below means latency-bound (wave quantisation, split-K, tile tuning, persistent kernels). (5) Check clocks and power throttling. (6) Multi-GPU: look at collective time and overlap. Re-measure after each change.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch06-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> What is wave quantisation, and why does it particularly affect decode?</summary>
+<div class="answer">
+<p>A kernel's tiles are processed in waves of (number of SMs × blocks per SM). If the tile count slightly exceeds a multiple of the wave size, the last wave runs nearly empty, and efficiency can drop by up to 50%. Decode GEMMs have small M (= B) and often small N per GPU under tensor parallelism, so they produce few tiles, and the quantisation effect is a large fraction of runtime. Mitigations: tile-size selection by autotuning per shape; split-K to create more parallel work along the reduction dimension; stream-K or persistent kernels that distribute work units dynamically; fusing several small GEMMs (e.g. Q, K, V) into one larger one.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch06-qa-10">
+<summary><span class="lvl core">Core</span> Why does moving to a GPU with a higher ridge point not always speed up your workload proportionally to its FLOP/s?</summary>
+<div class="answer">
+<p>Speed-up follows the binding resource. Memory-bound phases (decode, norms, decode attention) scale with bandwidth; compute-bound phases (prefill, large GEMMs) scale with FLOP/s. A higher ridge point means compute grew faster than bandwidth, so the memory-bound fraction of the workload grows, and the overall speed-up is a bandwidth-weighted average (Amdahl's law). Example: H100 → B200 gives about 2.3× BF16 FLOP/s but 2.4× bandwidth, so decode gains about 2.4×. H100 → H200 gives the same FLOP/s with 1.43× bandwidth, so decode gains about 1.4× and prefill about 1.0×.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch06-qa-11">
+<summary><span class="lvl design">Design</span> Using roofline reasoning, decide whether FP8 KV cache or FP8 weights help more for Llama 3 8B decode at batch 64 and 4k context.</summary>
+<div class="answer">
+<p>Bytes per step: weights 16.06 GB; cache 64 × 4,096 × 128 KiB ≈ 34.4 GB; total ≈ 50.4 GB, so about 15 ms at 3.35 TB/s. FP8 weights save 8 GB (−16%), giving 42.4 GB. An FP8 cache saves 17.2 GB (−34%), giving 33.2 GB, and doubles how many sequences fit. The cache is the larger lever at this context and batch; at batch 8 or short contexts weights would dominate. Both together give about 25 GB (≈ 2× faster). Check quality impact (KV quantisation error affects attention scores) and kernel support (attention kernels that read FP8 KV at full bandwidth). The roofline turns this into a two-line calculation.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch06-qa-12">
+<summary><span class="lvl warm">Warm-up</span> What is the difference between Nsight Systems and Nsight Compute?</summary>
+<div class="answer">
+<p>Nsight Systems is a system-wide timeline profiler: CPU threads, API calls, kernel launches, GPU kernels, memory copies, NCCL communication, NVTX ranges. Use it to find idle time, synchronisation, overlap problems and which kernels dominate. Nsight Compute profiles individual kernels in depth: achieved throughput at each memory level, FLOP/s, occupancy, warp-stall reasons, instruction mix and a roofline chart. Use it to optimise a specific kernel. Typical workflow: Systems first to find what matters, Compute second to fix it. The PyTorch profiler maps GPU time back to framework operators.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch06-qa-13">
+<summary><span class="lvl deep">Deep-dive</span> The roofline says a kernel should take 2 ms; it takes 5 ms with the GPU fully busy. List hypotheses and how to test each.</summary>
+<div class="answer">
+<ul>
+<li><strong>Wrong byte or FLOP count</strong> (e.g. a hidden re-read, poor caching, an extra copy): measure DRAM bytes in Nsight Compute against the expected figure.</li>
+<li><strong>A different memory level binds</strong> (shared memory, L2 thrashing): check hierarchical metrics and L2 hit rate.</li>
+<li><strong>Latency-bound:</strong> low occupancy, long dependency chains, synchronisation; look at stall reasons and achieved occupancy.</li>
+<li><strong>Wave quantisation:</strong> compare tile count with SM count; try other tile sizes or split-K.</li>
+<li><strong>Uncoalesced or misaligned access:</strong> check sectors per request.</li>
+<li><strong>Clock throttling:</strong> record clocks and power during the run.</li>
+<li><strong>Non-tensor-core path:</strong> verify tensor-core utilisation; dtype or layout may prevent it.</li>
+<li><strong>Bank conflicts</strong> in shared memory.</li>
+</ul>
+</div>
+</details>
+
+<details class="qa" data-id="ch06-qa-14">
+<summary><span class="lvl core">Core</span> How does the roofline extend to multi-GPU communication?</summary>
+<div class="answer">
+<p>Treat a collective as moving \(Q_{\text{comm}}\) bytes over links of bandwidth \(\beta_{\text{link}}\), with a per-message latency \(\alpha\): time ≈ \(\alpha\cdot(\text{number of steps})+Q_{\text{comm}}/\beta_{\text{link}}\) (the α–β model, Chapter 17). A "communication intensity" (FLOPs per byte communicated) tells you whether computation can hide communication. In prefill, messages are large and bandwidth-bound, and compute can overlap them. In decode, messages are tiny (\(B\times d\) values per all-reduce), so α dominates, and two all-reduces per layer × 80 layers can cost milliseconds. Mitigations: fewer, larger collectives, fusing communication into kernels, keeping tensor parallelism inside NVLink, or alternative parallelism.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch06-qa-15">
+<summary><span class="lvl design">Design</span> You have a fixed budget to improve decode throughput by 2×. Rank candidate investments using roofline reasoning.</summary>
+<div class="answer">
+<p>Start by measuring MBU and the weight/cache byte split at the production batch and context. Then: (1) if MBU is below 60%, fix overhead and kernels first (CUDA graphs, fusion, better attention kernels), cheap and often worth 1.3–1.8×. (2) Reduce bytes: FP8 weights (if weights dominate) and/or an FP8 cache (if the cache dominates); each can approach 2× on its share, with quality checks. (3) Increase effective batch by freeing memory (FP8 cache, paging; Chapter 10). (4) Speculative decoding, which raises useful tokens per byte read, roughly 1.5–3× at small batch but less at large batch. (5) Hardware with more bandwidth (H200/B200), about 1.4–2.4×, but at capital cost. Choose the combination that reaches 2× at the lowest cost per token while meeting TPOT and quality targets.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch06-qa-16">
+<summary><span class="lvl core">Core</span> Compare A100, H100, H200 and B200 for Llama 3 8B decode at batch 64 and 2k context, using a roofline budget.</summary>
+<div class="answer">
+<p>The step moves ≈ 32.5 GB (15 GB of weights, 17.2 GB of cache) and does ≈ \(10^{12}\) FLOPs. Ideal times ≈ bytes/β: A100 15.9 ms, H100 9.7 ms, H200 6.8 ms, B200 4.1 ms. Compute time is a small fraction on all of them (3.2 ms on A100, under 1 ms on the others), so all are memory-bound and the ranking follows bandwidth. Add capacity (the H200/B200 can hold far larger batches, moving the operating point right), achieved MBU (software maturity), and price per hour to get cost per token. A common surprise is how competitive an A100 or H200 is relative to its FLOP/s for decode-heavy traffic.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch06-qa-17">
+<summary><span class="lvl design">Design</span> Given a TPOT SLO of 20 ms, how do you choose the batch size and estimate throughput for a model on a GPU?</summary>
+<div class="answer">
+<p>Write the step time as \((Nb_w + B\bar t s_{kv})/(\text{MBU}\cdot\beta)\) (plus a compute term if near compute-bound, and overhead). Set it equal to the SLO and solve for \(B_{\max}^{\text{SLO}}\). Also compute \(B_{\max}^{\text{mem}}=(M_{\text{HBM}}-Nb_w-\text{workspace})/(\bar ts_{kv})\). Run at \(\min(B_{\max}^{\text{SLO}}, B_{\max}^{\text{mem}})\), with throughput ≈ \(B/\text{TPOT}\). Example: Llama 3 8B, 2k context, 80% MBU on an H100 gives \(B\le140\) from the SLO and ≈ 238 from memory, so B ≈ 140 and ≈ 7,000 tokens/s. Then account for prefill interference (chunked prefill or disaggregation), length variance (P99 TPOT, not the mean) and headroom, and validate with a load test measuring goodput.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-roofline">S. Williams, A. Waterman, D. Patterson. Roofline: An Insightful Visual Performance Model for Multicore Architectures. <em>Communications of the ACM</em>, 52(4), 2009.</li>
+<li id="r-hier">C. Yang, T. Kurth, S. Williams. Hierarchical Roofline Analysis for GPUs: Accelerating Performance Optimization for the NERSC-9 Perlmutter System. <em>Concurrency and Computation: Practice and Experience</em>, 2020. <a href="https://arxiv.org/abs/2009.05257">arXiv:2009.05257</a>.</li>
+<li id="r-palm">A. Chowdhery et al. PaLM: Scaling Language Modeling with Pathways. 2022 (definition of MFU). <a href="https://arxiv.org/abs/2204.02311">arXiv:2204.02311</a>.</li>
+<li>R. Pope et al. Efficiently Scaling Transformer Inference. <em>MLSys</em>, 2023. <a href="https://arxiv.org/abs/2211.05102">arXiv:2211.05102</a>.</li>
+<li>J. Austin et al. <em>How to Scale Your Model</em>, "All About Rooflines" and "All About Transformer Inference". Google DeepMind, 2025. <a href="https://jax-ml.github.io/scaling-book/">jax-ml.github.io/scaling-book</a>.</li>
+<li>Z. Yuan et al. LLM Inference Unveiled: Survey and Roofline Model Insights. 2024. <a href="https://arxiv.org/abs/2402.16363">arXiv:2402.16363</a>.</li>
+<li>H. He. Making Deep Learning Go Brrrr From First Principles. 2022. <a href="https://horace.io/brrr_intro.html">horace.io</a>.</li>
+<li>Databricks. LLM Inference Performance Engineering: Best Practices (introducing MBU). 2023.</li>
+<li>M. Osama, D. Merrill, C. Cecka, M. Garland, J. D. Owens. Stream-K: Work-centric Parallel Decomposition for Dense Matrix-Matrix Multiplication on the GPU. <em>PPoPP</em>, 2023. <a href="https://arxiv.org/abs/2301.03598">arXiv:2301.03598</a>.</li>
+<li>NVIDIA. Nsight Systems and Nsight Compute documentation; Matrix Multiplication Background User's Guide (wave quantisation).</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,686 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 14 · Quantisation — Introduction to LLM Engineering</title>
+<meta name="description" content="Chapter 14 of Introduction to LLM Engineering: why fewer bits speed up decode, number formats (FP8, FP4, MXFP4, NVFP4), the error of rounding and the crest factor, outliers and LLM.int8(), SmoothQuant, GPTQ, AWQ, rotations (QuaRot, SpinQuant) and quantisation in practice.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script defer src="/library/assets/book-shim.js" data-library="/library/" data-field="/library/AI_Engineering/" data-field-title="AI Engineering"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-chapter="ch14" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Part V · Making Models Smaller — Chapter 14</div>
+<h1 id="top">Quantisation</h1>
+<p class="lede">Decode reads every weight once per step, so its speed is set by the number of bytes in the model. This chapter asks how few bits per number a model can use without losing what it knows: the number formats, the error analysis, the outlier problem that made language models hard to quantise, the algorithms that solved it between 2022 and 2024, and what actually becomes faster on real hardware.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Part IV ended with a remark that is the starting point of Part V. Every serving technique we have studied works <em>around</em> the bytes of the model: batching shares each weight read among many sequences, paging packs caches tightly, disaggregation moves caches to where they are used. None of them reduces the bytes themselves. Yet decode is memory-bound (Chapter 6), so its time is close to the number of bytes read divided by the bandwidth, and Llama 3 8B in BF16 reads 16.06 GB per step however cleverly it is scheduled. Halve the bytes and, to first order, decode runs twice as fast, the model fits on half as many GPUs, and twice as much memory is left for the KV cache.</p>
+<p><strong>Quantisation</strong> represents weights, activations or caches with fewer bits per number: 8 instead of 16, or 4, or fewer. It is a lossy approximation, so the questions are how much accuracy is lost, how to lose as little as possible, and which of the savings in bytes turn into savings in time. Language models turned out to be unusually hard to quantise. In 2022, Dettmers and colleagues found that models above a few billion parameters develop a handful of activation features with enormous magnitudes, and that naive 8-bit quantisation destroys them<span class="cite"><a href="#r-llmint8">[1]</a></span>. The methods that followed, SmoothQuant, GPTQ, AWQ and rotation methods, each found a different way around this obstacle. By 2025, 8-bit floating point was the default for serving on Hopper GPUs, 4-bit weights were routine for latency-bound and local inference, and Blackwell GPUs had made 4-bit floating point a first-class format.</p>
+<p>The subject has a pleasing mathematical core. A quantiser is a map onto a lattice, its error has a simple statistical model, the effect of outliers can be computed exactly, the best-known weight quantiser is a greedy algorithm for a closest-vector problem, and the cure for outliers is an orthogonal change of basis. We develop each of these in turn, then return to engineering: which formats the hardware supports, what each scheme does to the roofline, and how to choose.</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Explain why quantisation speeds up decode, and predict from the roofline which schemes help at which batch sizes.</li>
+<li>Describe integer and floating-point formats, including FP8 (E4M3, E5M2), FP4 (E2M1) and the block-scaled MXFP4 and NVFP4 formats, and compute their bits per element.</li>
+<li>Derive the error of a uniform quantiser and the signal-to-quantisation-noise ratio, and explain how outliers and scale granularity determine accuracy.</li>
+<li>Explain the outlier problem and how LLM.int8(), SmoothQuant, AWQ and rotation methods (QuaRot, SpinQuant) address it.</li>
+<li>Derive the GPTQ update from a constrained quadratic minimisation, and relate it to lattice decoding.</li>
+<li>Choose a quantisation scheme for a given model, hardware and workload, and evaluate its accuracy properly.</li>
+</ol>
+<p class="small muted">Uses: Chapters 2, 3, 5, 6 and 8 (KV-cache quantisation, §8.6). Symbols: <a href="../notation.html">notation page</a>.</p>
+</div>
+
+<h2 id="s14-1">14.1 Why fewer bits means faster</h2>
+<p>Three kinds of number are candidates for quantisation, and they behave differently. <em>Weights</em> are fixed after training, can be analysed offline with as much computation as we like, and dominate the bytes read at small batch. <em>Activations</em>, the inputs to each matrix product, change with every token, must be quantised on the fly, and matter because quantising both operands of a matrix product lets the tensor cores run at a lower precision, which is faster. The <em>KV cache</em> is a stored activation, read at every decode step, and dominates bytes at large batch and long context (§8.6). A scheme is described by what it quantises and to how many bits: W4A16 means 4-bit weights with 16-bit activations, W8A8 means both operands in 8 bits, and a KV4 suffix adds a 4-bit cache.</p>
+<p>The two kinds of saving act on the two sides of the roofline. A decode step with \(B\) sequences reads the weights once and performs about \(2NB\) FLOPs, so with weight bytes \(N b_w\) and the hardware's peak compute \(\pi_x\) at the precision \(x\) of the matrix product, its time is roughly</p>
+\[ t_{\text{step}}\;\approx\;\max\!\Big(\frac{N\,b_w}{\beta},\;\frac{2NB}{\pi_x}\Big), \]
+<p>ignoring the cache for now. Weight-only quantisation reduces \(b_w\), the first term. Quantising activations as well lets the product run on lower-precision tensor cores, raising \(\pi_x\), the second term: on an H100, FP8 tensor cores deliver 1,979 TFLOP/s against 989 for BF16. The batch size at which a step turns compute-bound is \(B^{*}=\pi_x b_w/(2\beta)\), which for BF16 is the familiar 295.</p>
+
+<figure class="chart" id="fig-14-1">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Roofline decode throughput of Llama 3 8B on an H100 by quantisation scheme","height":340,
+ "x":{"label":"Batch size (log)","log":true,"min":1,"max":1024,"ticks":[1,4,16,64,256,1024]},
+ "y":{"label":"Output tokens per second (log)","log":true,"min":100,"max":200000,"ticks":[100,1000,10000,100000]},
+ "series":[
+  {"name":"BF16","color":"s2","points":[[1,209],[4,834],[16,3337],[64,13350],[128,26700],[256,53400],[512,61582],[1024,61582]]},
+  {"name":"W8A8 FP8","color":"s1","points":[[1,417],[4,1669],[16,6675],[64,26700],[128,53400],[256,106800],[512,123225],[1024,123225]]},
+  {"name":"W4A16 (4-bit weights, BF16 compute)","color":"s3","points":[[1,809],[4,3236],[16,12945],[64,51782],[128,61582],[256,61582],[512,61582],[1024,61582]]},
+  {"name":"W4A8 (4-bit weights, FP8 compute)","color":"s4","dash":true,"points":[[1,809],[4,3236],[16,12945],[64,51782],[128,103563],[256,123225],[512,123225],[1024,123225]]}
+ ]}
+</script>
+<figcaption><b>Figure 14.1 — Weight bits help at small batch; compute precision helps at large batch.</b> Ideal roofline throughput counting weight reads and matrix-product FLOPs only (short contexts; the KV cache is ignored). 4-bit weights give almost 4× at batch 1 but stop helping once the step is compute-bound, at batch ≈ 76; FP8 compute doubles the ceiling.</figcaption></figure>
+
+<p>Figure 14.1 plots this model for Llama 3 8B. At batch 1, throughput is set by weight bytes alone, so 4-bit weights (4.125 bits including their scales) run almost four times faster than BF16, and FP8 twice as fast. As the batch grows, each curve rises linearly until it meets its compute ceiling. The W4A16 curve meets the BF16 ceiling early, at a batch of about 76, because its weights are cheap to read but its arithmetic is still done in BF16. Beyond that point, 4-bit weights buy nothing in speed. W8A8 in FP8 doubles the ceiling, so it helps at every batch size. Combining 4-bit weights with FP8 compute gets the best of both, which is why NVIDIA's newest formats do exactly that. Real kernels fall short of these ideal curves, especially for 4-bit weights, which must be unpacked and converted before the tensor cores can use them, and real contexts add cache bytes that weight quantisation does not touch. But the picture is the right first approximation, and it already says something an interviewer will probe: weight-only 4-bit quantisation is a latency technique for small batches, while FP8 is a throughput technique.</p>
+<p>The memory savings are equally important. A model that fits on fewer GPUs needs less tensor parallelism and its communication, and memory freed from weights becomes KV cache, which raises the batch size that memory allows. Before we can choose a scheme, though, we need to know what an 8-bit or 4-bit number actually is.</p>
+
+<h2 id="s14-2">14.2 Number formats</h2>
+<p>A number format is a finite set of representable values together with an encoding. Two families matter. An <strong>integer</strong> format with \(n_b\) bits represents the \(2^{n_b}\) integers from \(-2^{n_b-1}\) to \(2^{n_b-1}-1\), and a real tensor is mapped onto them by a scale: \(x\approx\Delta\,(q-\zeta)\), where \(q\) is the stored integer, \(\Delta\) the step and \(\zeta\) an optional zero point. The representable values are equally spaced. A <strong>floating-point</strong> format splits its bits into a sign, an exponent field of \(e\) bits and a mantissa field of \(m\) bits, and represents \(\pm2^{E}\times(1.f)\), so its values are spaced uniformly within each power of two (a <em>binade</em>) and geometrically across binades. Relative precision is roughly constant, about \(2^{-m}\), over a range of about \(2^{2^e}\).</p>
+
+<figure class="diagram" id="fig-14-2">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-label="Bit layouts of floating-point formats">
+<text x="20" y="22" class="t-sm t-b">Bit layouts (sign | exponent | mantissa)</text>
+<g>
+<text x="20" y="52" class="t-xs">FP32</text><rect x="90" y="40" width="10" height="18" class="fill-s2"/><rect x="100" y="40" width="80" height="18" class="fill-acc"/><rect x="180" y="40" width="230" height="18" class="fill-s3"/><text x="420" y="53" class="t-xs">1 | 8 | 23 · max ≈ 3.4 × 10³⁸</text>
+<text x="20" y="80" class="t-xs">BF16</text><rect x="90" y="68" width="10" height="18" class="fill-s2"/><rect x="100" y="68" width="80" height="18" class="fill-acc"/><rect x="180" y="68" width="70" height="18" class="fill-s3"/><text x="420" y="81" class="t-xs">1 | 8 | 7 · FP32 range, 3 significant digits</text>
+<text x="20" y="108" class="t-xs">FP16</text><rect x="90" y="96" width="10" height="18" class="fill-s2"/><rect x="100" y="96" width="50" height="18" class="fill-acc"/><rect x="150" y="96" width="100" height="18" class="fill-s3"/><text x="420" y="109" class="t-xs">1 | 5 | 10 · max 65,504</text>
+<text x="20" y="136" class="t-xs">FP8 E4M3</text><rect x="90" y="124" width="10" height="18" class="fill-s2"/><rect x="100" y="124" width="40" height="18" class="fill-acc"/><rect x="140" y="124" width="30" height="18" class="fill-s3"/><text x="420" y="137" class="t-xs">1 | 4 | 3 · max 448 (weights, activations)</text>
+<text x="20" y="164" class="t-xs">FP8 E5M2</text><rect x="90" y="152" width="10" height="18" class="fill-s2"/><rect x="100" y="152" width="50" height="18" class="fill-acc"/><rect x="150" y="152" width="20" height="18" class="fill-s3"/><text x="420" y="165" class="t-xs">1 | 5 | 2 · max 57,344 (gradients)</text>
+<text x="20" y="192" class="t-xs">FP4 E2M1</text><rect x="90" y="180" width="10" height="18" class="fill-s2"/><rect x="100" y="180" width="20" height="18" class="fill-acc"/><rect x="120" y="180" width="10" height="18" class="fill-s3"/><text x="420" y="193" class="t-xs">1 | 2 | 1 · values 0, 0.5, 1, 1.5, 2, 3, 4, 6</text>
+</g>
+<rect x="90" y="210" width="10" height="10" class="fill-s2"/><text x="106" y="219" class="t-xs">sign</text><rect x="150" y="210" width="10" height="10" class="fill-acc"/><text x="166" y="219" class="t-xs">exponent</text><rect x="240" y="210" width="10" height="10" class="fill-s3"/><text x="256" y="219" class="t-xs">mantissa</text>
+</svg>
+<figcaption><b>Figure 14.2 — Floating-point formats used in LLM inference.</b> Each bit drawn 10 units wide. Exponent bits buy range and mantissa bits buy precision; BF16 keeps FP32's range, and the 8-bit and 4-bit formats trade almost all precision for a usable range.</figcaption></figure>
+
+<p>Figure 14.2 lays out the formats in use. BF16, the training and serving default since about 2020, keeps FP32's eight exponent bits and so its range, at the cost of precision: seven mantissa bits, about three significant decimal digits. The two 8-bit formats standardised in 2022<span class="cite"><a href="#r-fp8">[2]</a></span> make different trade-offs. E4M3 has three mantissa bits and a maximum of 448, and is used for weights and activations; E5M2 has the range of FP16 with only two mantissa bits, and is used for gradients in training. FP4 in its E2M1 form has just sixteen codes: zero and the seven magnitudes 0.5, 1, 1.5, 2, 3, 4 and 6, each with either sign.</p>
+<p>With so few values, a 4-bit or 8-bit format cannot cover the range of a whole tensor, so every practical scheme pairs the elements with <em>scales</em>: blocks of \(n_g\) consecutive elements share one higher-precision scale factor, and the stored element is the value divided by its block's scale. The scale granularity is part of the format. The Open Compute Project's <strong>microscaling</strong> (MX) specification of 2023<span class="cite"><a href="#r-mx">[3]</a></span> standardised block-scaled formats with \(n_g=32\) and an 8-bit power-of-two scale (E8M0); MXFP4 is E2M1 elements in such blocks, and MXFP8 and MXFP6 are analogous. NVIDIA's <strong>NVFP4</strong>, introduced with Blackwell, uses blocks of 16 E2M1 elements with an FP8 (E4M3) scale, plus one FP32 scale per tensor. The cost of the scales is easy to count: a block of \(n_g\) elements with an \(s\)-bit scale costs \(n_b+s/n_g\) bits per element, so MXFP4 costs \(4+8/32=4.25\) bits and NVFP4 \(4+8/16=4.5\).</p>
+
+<figure class="diagram" id="fig-14-3">
+<svg class="dg" viewBox="0 0 720 170" role="img" aria-label="INT4 and FP4 value grids">
+<text x="20" y="22" class="t-sm t-b">Representable magnitudes on [0, 6] (scale chosen so the block maximum maps to the top value)</text>
+<text x="20" y="62" class="t-xs">INT4 (×6/7)</text>
+<line x1="120" y1="58" x2="680" y2="58" class="ln"/>
+<circle cx="120" cy="58" r="4" class="fill-s2"/><circle cx="200" cy="58" r="4" class="fill-s2"/><circle cx="280" cy="58" r="4" class="fill-s2"/><circle cx="360" cy="58" r="4" class="fill-s2"/><circle cx="440" cy="58" r="4" class="fill-s2"/><circle cx="520" cy="58" r="4" class="fill-s2"/><circle cx="600" cy="58" r="4" class="fill-s2"/><circle cx="680" cy="58" r="4" class="fill-s2"/>
+<text x="400" y="84" text-anchor="middle" class="t-xs">eight equally spaced levels: the same absolute error everywhere</text>
+<text x="20" y="122" class="t-xs">FP4 E2M1</text>
+<line x1="120" y1="118" x2="680" y2="118" class="ln"/>
+<circle cx="120" cy="118" r="4" class="fill-acc"/><circle cx="166.7" cy="118" r="4" class="fill-acc"/><circle cx="213.3" cy="118" r="4" class="fill-acc"/><circle cx="260" cy="118" r="4" class="fill-acc"/><circle cx="306.7" cy="118" r="4" class="fill-acc"/><circle cx="400" cy="118" r="4" class="fill-acc"/><circle cx="493.3" cy="118" r="4" class="fill-acc"/><circle cx="680" cy="118" r="4" class="fill-acc"/>
+<text x="120" y="138" text-anchor="middle" class="t-xs">0</text><text x="166.7" y="138" text-anchor="middle" class="t-xs">0.5</text><text x="213.3" y="138" text-anchor="middle" class="t-xs">1</text><text x="260" y="138" text-anchor="middle" class="t-xs">1.5</text><text x="306.7" y="138" text-anchor="middle" class="t-xs">2</text><text x="400" y="138" text-anchor="middle" class="t-xs">3</text><text x="493.3" y="138" text-anchor="middle" class="t-xs">4</text><text x="680" y="138" text-anchor="middle" class="t-xs">6</text>
+<text x="400" y="160" text-anchor="middle" class="t-xs">levels crowd near zero, where most values of a bell-shaped distribution lie</text>
+</svg>
+<figcaption><b>Figure 14.3 — Where the levels are.</b> INT4 spaces its levels uniformly; FP4 spaces them geometrically. For bell-shaped or heavy-tailed data, most values are small, and FP4's finer resolution near zero gives lower error for the same number of bits.</figcaption></figure>
+
+<p>Figure 14.3 compares the two 4-bit grids over the same interval. Both have eight non-negative magnitudes, but INT4 spreads them evenly while FP4 concentrates them near zero and leaves a large gap between 4 and 6. Which is better depends on the distribution being quantised. For uniformly distributed values, INT4 is optimal; for the bell-shaped, heavy-tailed distributions of trained weights, where most values are small and a few are large, FP4's allocation matches the data better. To make "better" precise we need an error model.</p>
+
+<h2 id="s14-3">14.3 The error of rounding</h2>
+<p>Consider the simplest quantiser: a uniform grid of step \(\Delta\), with each value rounded to the nearest grid point. If the values are spread over many steps and are not aligned with the grid, the rounding error \(\epsilon=\hat x-x\) is well modelled as uniformly distributed on \([-\Delta/2,\Delta/2]\), independent of \(x\), with mean zero and variance</p>
+\[ \mathbb E[\epsilon^2]\;=\;\frac1\Delta\int_{-\Delta/2}^{\Delta/2}\epsilon^2\,d\epsilon\;=\;\frac{\Delta^2}{12}. \]
+<p>This is the classical model of quantisation noise from signal processing, and it is accurate except for very coarse grids. Now suppose a block of values with root-mean-square \(\sigma\) and maximum magnitude \(M\) is quantised symmetrically with \(n_b\) bits, using the <em>absmax</em> scale that maps \(\pm M\) to the ends of the grid. There are about \(2^{n_b}\) levels across a range of \(2M\), so \(\Delta\approx2M/2^{n_b}\), and the signal-to-quantisation-noise ratio is</p>
+\[ \text{SQNR}\;=\;\frac{\sigma^2}{\Delta^2/12}\;=\;\frac{3\cdot2^{2n_b}}{r_c^2},\qquad r_c=\frac{M}{\sigma}, \]
+<p>or, in decibels, \(\text{SQNR}\approx6.02\,n_b+4.77-20\log_{10}r_c\). Each extra bit buys about 6 dB, a factor of four in noise power. The second term is the crux of the whole subject. The quantity \(r_c\), the <strong>crest factor</strong> of the block, measures how far its largest value lies above its typical value, and every factor of ten in \(r_c\) costs 20 dB, more than three bits. For a block of 4,096 Gaussian values the maximum is about \(\sqrt{2\ln4096}\approx4.1\) standard deviations, so \(r_c\approx4\). A single value a hundred times the typical magnitude raises \(r_c\) to about 54 and costs 22 dB, almost four bits, of precision for <em>every other value in the block</em>, because the scale must accommodate the outlier and the step grows accordingly.</p>
+
+<figure class="chart" id="fig-14-4">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Signal-to-quantisation-noise ratio against crest factor","height":320,
+ "x":{"label":"Crest factor of the block, max / rms (log)","log":true,"min":2.5,"max":120,"ticks":[3,10,30,100]},
+ "y":{"label":"SQNR (dB)","min":-15,"max":45,"ticks":[-10,0,10,20,30,40]},
+ "hlines":[{"y":0,"text":"noise as large as the signal"}],
+ "vlines":[{"x":4.1,"text":"Gaussian, 4,096 values"}],
+ "series":[
+  {"name":"8 bits","color":"s1","points":[[3,40.4],[4,37.9],[10,29.9],[20,23.9],[50,16.0],[100,9.9]]},
+  {"name":"4 bits","color":"s2","points":[[3,19.3],[4,16.8],[10,8.8],[20,2.8],[50,-5.1],[100,-11.2]]}
+ ]}
+</script>
+<figcaption><b>Figure 14.4 — Outliers destroy precision for everyone.</b> \(\text{SQNR}\approx6.02\,n_b+4.77-20\log_{10}r_c\) for absmax uniform quantisation. A block with a 100× outlier quantised to 4 bits has more noise than signal; even 8 bits falls to about 10 dB.</figcaption></figure>
+
+<p>Figure 14.4 plots the formula for 8 and 4 bits. At the crest factor of well-behaved Gaussian data, 8 bits gives about 38 dB, a relative error near 1%, and 4 bits about 17 dB, near 14%. As the crest factor grows the lines fall together, and at \(r_c=100\) a 4-bit block is pure noise. The rest of this chapter can be read as a sequence of answers to one question: how do we keep the crest factor of whatever we quantise small?</p>
+<p>The first and simplest answer is <strong>granularity</strong>. The crest factor is a property of a block, so smaller blocks have smaller crest factors: an outlier spoils only its own block. A scale can be shared by a whole tensor (per-tensor), by each row or column (per-channel for weights, per-token for activations), or by each group of \(n_g\) consecutive elements (per-group or block-wise). Finer granularity means more scales to store and apply, and, for activations, scales that must be computed at run time.</p>
+
+<figure class="diagram" id="fig-14-5">
+<svg class="dg" viewBox="0 0 720 190" role="img" aria-label="Scale granularity">
+<text x="110" y="22" text-anchor="middle" class="t-sm t-b">per-tensor</text>
+<rect x="40" y="34" width="140" height="110" rx="4" class="bx2"/><text x="110" y="94" text-anchor="middle" class="t-xs">one scale</text>
+<text x="290" y="22" text-anchor="middle" class="t-sm t-b">per-channel (rows)</text>
+<rect x="220" y="34" width="140" height="22" class="bx2"/><rect x="220" y="56" width="140" height="22" class="bx3"/><rect x="220" y="78" width="140" height="22" class="bx2"/><rect x="220" y="100" width="140" height="22" class="bx3"/><rect x="220" y="122" width="140" height="22" class="bx2"/>
+<text x="290" y="160" text-anchor="middle" class="t-xs">one scale per output channel</text>
+<text x="470" y="22" text-anchor="middle" class="t-sm t-b">per-group (n<tspan dy="3" font-size="9">g</tspan><tspan dy="-3"> = 128)</tspan></text>
+<g>
+<rect x="400" y="34" width="35" height="22" class="bx2"/><rect x="435" y="34" width="35" height="22" class="bx3"/><rect x="470" y="34" width="35" height="22" class="bx2"/><rect x="505" y="34" width="35" height="22" class="bx3"/>
+<rect x="400" y="56" width="35" height="22" class="bx3"/><rect x="435" y="56" width="35" height="22" class="bx2"/><rect x="470" y="56" width="35" height="22" class="bx3"/><rect x="505" y="56" width="35" height="22" class="bx2"/>
+<rect x="400" y="78" width="35" height="22" class="bx2"/><rect x="435" y="78" width="35" height="22" class="bx3"/><rect x="470" y="78" width="35" height="22" class="bx2"/><rect x="505" y="78" width="35" height="22" class="bx3"/>
+<rect x="400" y="100" width="35" height="22" class="bx3"/><rect x="435" y="100" width="35" height="22" class="bx2"/><rect x="470" y="100" width="35" height="22" class="bx3"/><rect x="505" y="100" width="35" height="22" class="bx2"/>
+<rect x="400" y="122" width="35" height="22" class="bx2"/><rect x="435" y="122" width="35" height="22" class="bx3"/><rect x="470" y="122" width="35" height="22" class="bx2"/><rect x="505" y="122" width="35" height="22" class="bx3"/>
+</g>
+<text x="470" y="160" text-anchor="middle" class="t-xs">one scale per block of a row</text>
+<circle cx="515" cy="67" r="5" class="fill-s2"/><text x="560" y="71" class="t-xs">an outlier spoils</text><text x="560" y="85" class="t-xs">only its block</text>
+<text x="360" y="184" text-anchor="middle" class="t-xs">finer granularity: smaller crest factors, more scales to store and apply</text>
+</svg>
+<figcaption><b>Figure 14.5 — Scale granularity.</b> Shading marks elements sharing a scale. Per-tensor scaling lets one outlier set the step for every element; per-channel and per-group scaling confine its damage to a row or a block.</figcaption></figure>
+
+<p>Figure 14.5 shows the three granularities on a small weight matrix. The trade-off can be measured. We quantised a 512 × 4096 matrix of heavy-tailed values (Student's \(t\) with five degrees of freedom, a reasonable stand-in for trained weights) with absmax scales at various group sizes, and recorded the relative root-mean-square error.</p>
+
+<figure class="chart" id="fig-14-6">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Quantisation error against group size (simulation)","height":330,
+ "x":{"label":"Group size: elements per scale (log)","log":true,"min":12,"max":5000,"ticks":[16,32,64,128,512,4096]},
+ "y":{"label":"Relative RMS error","log":true,"min":0.004,"max":0.5,"ticks":[0.01,0.1]},
+ "series":[
+  {"name":"INT4 (absmax)","color":"s2","points":[[16,0.1006],[32,0.1224],[64,0.146],[128,0.1719],[512,0.2326],[4096,0.3561]]},
+  {"name":"FP4 E2M1 (exact scale)","color":"s1","points":[[16,0.0908],[32,0.1018],[64,0.1123],[128,0.1234],[512,0.151],[4096,0.218]]},
+  {"name":"INT8 (absmax)","color":"s3","points":[[16,0.0056],[32,0.0068],[64,0.0081],[128,0.0095],[512,0.0129],[4096,0.0202]]},
+  {"name":"MXFP4 (32, power-of-two scale)","color":"s4","line":false,"r":6,"points":[[32,0.1329,"MXFP4",{"dx":-8,"dy":-8,"a":"end"}]],"labels":true},
+  {"name":"NVFP4 (16, FP8 scale)","color":"s5","line":false,"r":6,"points":[[16,0.0923,"NVFP4",{"dx":8,"dy":16}]],"labels":true}
+ ]}
+</script>
+<figcaption><b>Figure 14.6 — Smaller groups and floating-point grids reduce error.</b> Simulated on 2 million Student-\(t_5\) values. Error grows with group size as larger blocks contain larger maxima. FP4 beats INT4 on heavy-tailed data at every group size. MXFP4's power-of-two scales cost accuracy relative to NVFP4's finer FP8 scales and smaller blocks.</figcaption></figure>
+
+<p>Figure 14.6 shows three regularities. Error grows steadily with group size, because a larger block is more likely to contain a large value; going from per-row scaling (4,096) to groups of 128 halves the INT4 error. FP4 is more accurate than INT4 at every group size on this heavy-tailed data, for the reason Figure 14.3 suggested. And the two block-scaled FP4 formats differ noticeably: MXFP4's scales are powers of two, so a block's maximum generally cannot be mapped exactly onto the top code and some range is wasted, while NVFP4's FP8 scales and smaller blocks bring it close to the exact-scale curve. These are the considerations behind the industry convention of INT4 weights in groups of 128 with FP16 scales (4.125 or 4.25 bits per weight with zero points) and behind NVIDIA's choices for NVFP4.</p>
+<div class="box example">
+<div class="box-title">Worked example — the size of Llama 3 8B in each format</div>
+<p>Count bits per weight including scales, then multiply by \(N=8.03\times10^{9}\). <strong>BF16:</strong> 16 bits, 16.06 GB. <strong>FP8 per-channel:</strong> 8 bits plus one scale per 4,096-element row, 8.03 GB. <strong>INT4, \(n_g=128\), FP16 scale:</strong> 4.125 bits, 4.14 GB; with an FP16 zero point as well, 4.25 bits, 4.27 GB. <strong>MXFP4:</strong> 4.25 bits, 4.27 GB. <strong>NVFP4:</strong> 4.5 bits, 4.52 GB. Embeddings and the LM head (about 1.05B parameters together) are often kept in higher precision because they are sensitive and cheap to keep, which adds about 1.6 GB to the 4-bit figures. At batch 1 the 4-bit model reads about a quarter of the bytes, and Figure 14.1's factor of four becomes something closer to 3× in practice.</p>
+</div>
+<p>Granularity tames moderate outliers in weights. It is much less help for activations, for a structural reason. A matrix product \(Y=XW\) sums over the shared inner dimension, so a scale can be factored out of the sum only if it is constant along that dimension: per-token scales for \(X\) (one per row) and per-output-channel scales for \(W\) (one per column) are free, because they become a rescaling of the output. A scale per <em>input channel</em> of \(X\), which is what an outlier feature would need, cannot be pulled out of the sum. As we now see, the outliers of language models live exactly in input channels.</p>
+
+<h2 id="s14-4">14.4 The outlier problem</h2>
+<p>In August 2022, Dettmers, Lewis, Belkada and Zettlemoyer published LLM.int8()<span class="cite"><a href="#r-llmint8">[1]</a></span>, the first method to quantise models of 175 billion parameters to 8 bits without degradation. Its most influential contribution was an empirical finding. In Transformers above about 6.7 billion parameters, a small number of hidden-state dimensions, the same few dimensions for almost every token and in most layers, carry values tens of times larger than the rest. These <strong>emergent outlier features</strong> appear abruptly with scale, and they are not noise: zeroing them devastates the model's perplexity. When the activation matrix \(X\) entering a linear layer is quantised per tensor or per token, these columns set the scale, the crest factor of every row is huge, and Figure 14.4 tells us what happens to everything else.</p>
+<p>LLM.int8()'s remedy was a <em>mixed-precision decomposition</em>. For each matrix product, the columns of \(X\) containing any value above a threshold (6 in the paper) are separated out, together with the corresponding rows of \(W\), and multiplied in FP16; the remaining columns, more than 99.9% of them, are quantised to INT8 with per-token scales for \(X\) and per-channel scales for \(W\), and multiplied in integer arithmetic. The two partial products are summed. This preserved accuracy at every scale tested and halved memory, which made 175B-parameter models runnable on a single server and opened large models to a generation of researchers. It was, however, slower than FP16 for inference, because splitting each product and gathering outlier columns is awkward on GPUs. The memory saving was real; the speed-up was not.</p>
+<p>Two asymmetries explain why outliers make activations hard and weights comparatively easy. First, weights are fixed, so their outliers can be found offline and handled by fine-grained grouping or special treatment at no run-time cost; activations change with every input, so their scales must be computed on the fly or calibrated in advance. Second, weight distributions are roughly bell-shaped with moderate crest factors, while activation outliers are systematic and concentrated in particular channels, the one place where per-element scaling is impossible. Later work traced the outliers to how trained Transformers implement "no-op" attention and very large residual-stream features, but for inference the important point is practical: activation outliers are channel-structured, predictable and very large. The methods of the next two sections exploit the first two properties.</p>
+
+<h2 id="s14-5">14.5 SmoothQuant: moving the difficulty</h2>
+<p>SmoothQuant (Xiao et al., 2022)<span class="cite"><a href="#r-smoothquant">[4]</a></span> starts from an observation about the matrix product. For any positive diagonal matrix \(D=\operatorname{diag}(u_1,\dots,u_k)\),</p>
+\[ Y\;=\;XW\;=\;\big(XD^{-1}\big)\big(DW\big). \]
+<p>Dividing column \(j\) of \(X\) by \(u_j\) and multiplying row \(j\) of \(W\) by \(u_j\) leaves the product unchanged. If channel \(j\) of the activations is an outlier, choosing \(u_j\) large shrinks it, at the price of enlarging row \(j\) of the weights. The difficulty of quantisation is transferred from the activations, which are hard to quantise, to the weights, which can absorb it. And the transformation is free at run time, because \(D^{-1}\) can be folded into the parameters of the normalisation layer that produces \(X\), and \(D\) into \(W\), both offline.</p>
+
+<figure class="diagram" id="fig-14-7">
+<svg class="dg" viewBox="0 0 720 200" role="img" aria-label="SmoothQuant migrates outliers from activations to weights">
+<text x="150" y="22" text-anchor="middle" class="t-sm t-b">before: |X| per input channel</text>
+<g>
+<rect x="40" y="130" width="16" height="20" class="fill-acc"/><rect x="60" y="126" width="16" height="24" class="fill-acc"/><rect x="80" y="40" width="16" height="110" class="fill-s2"/><rect x="100" y="128" width="16" height="22" class="fill-acc"/><rect x="120" y="132" width="16" height="18" class="fill-acc"/><rect x="140" y="125" width="16" height="25" class="fill-acc"/><rect x="160" y="60" width="16" height="90" class="fill-s2"/><rect x="180" y="129" width="16" height="21" class="fill-acc"/><rect x="200" y="131" width="16" height="19" class="fill-acc"/><rect x="220" y="127" width="16" height="23" class="fill-acc"/><rect x="240" y="130" width="16" height="20" class="fill-acc"/>
+</g>
+<line x1="35" y1="150" x2="265" y2="150" class="ln"/>
+<text x="150" y="170" text-anchor="middle" class="t-xs">two outlier channels set the scale for every token</text>
+<text x="360" y="95" text-anchor="middle" class="t-sm">X D⁻¹ · D W</text>
+<line x1="300" y1="105" x2="420" y2="105" class="ln" marker-end="url(#a147)"/>
+<defs><marker id="a147" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<text x="570" y="22" text-anchor="middle" class="t-sm t-b">after: |X D⁻¹| and |D W| (α = 0.5)</text>
+<g>
+<rect x="460" y="118" width="16" height="32" class="fill-acc"/><rect x="480" y="116" width="16" height="34" class="fill-acc"/><rect x="500" y="104" width="16" height="46" class="fill-s2"/><rect x="520" y="117" width="16" height="33" class="fill-acc"/><rect x="540" y="120" width="16" height="30" class="fill-acc"/><rect x="560" y="115" width="16" height="35" class="fill-acc"/><rect x="580" y="108" width="16" height="42" class="fill-s2"/><rect x="600" y="118" width="16" height="32" class="fill-acc"/><rect x="620" y="119" width="16" height="31" class="fill-acc"/><rect x="640" y="116" width="16" height="34" class="fill-acc"/><rect x="660" y="118" width="16" height="32" class="fill-acc"/>
+</g>
+<line x1="455" y1="150" x2="685" y2="150" class="ln"/>
+<text x="570" y="170" text-anchor="middle" class="t-xs">activation and weight ranges equalised per channel</text>
+<text x="360" y="194" text-anchor="middle" class="t-xs">the scales are folded offline into the preceding norm and into W: no run-time cost</text>
+</svg>
+<figcaption><b>Figure 14.7 — Smoothing.</b> Dividing each activation channel by \(u_j\) and multiplying the matching weight row by \(u_j\) leaves \(XW\) unchanged while flattening the activation outliers, so both operands can be quantised to 8 bits.</figcaption></figure>
+
+<p>Figure 14.7 shows the effect on a toy activation profile. How large should the \(u_j\) be? Let \(a_j=\max_t|X_{tj}|\) be the calibrated maximum of activation channel \(j\) and \(w_j=\max_i|W_{ji}|\) the maximum of the matching weight row. After smoothing, these become \(a_j/u_j\) and \(u_jw_j\). SmoothQuant sets</p>
+\[ u_j\;=\;\frac{a_j^{\alpha_s}}{w_j^{\,1-\alpha_s}}, \]
+<p>with a migration strength \(\alpha_s\in[0,1]\). With \(\alpha_s=0.5\) the two maxima become equal, \(a_j/u_j=u_jw_j=\sqrt{a_jw_j}\), so the difficulty is shared evenly between the operands; larger \(\alpha_s\) pushes more onto the weights, which is needed for models with especially severe activation outliers. The equalisation is per channel, so after smoothing, per-token scales for \(X\) and per-channel scales for \(W\) see moderate crest factors, and standard INT8 GEMMs apply. SmoothQuant quantised models up to 530 billion parameters to W8A8 with negligible accuracy loss and reported up to 1.56× speed-up and a halving of memory over FP16, and it became the standard recipe for INT8 inference on Ampere-class GPUs.</p>
+<p>Smoothing is a <em>diagonal</em> change of basis that rescales channels but cannot mix them. It works at 8 bits, where moderate crest factors are tolerable; at 4 bits, Figure 14.4 demands crest factors near the Gaussian value, and rescaling alone cannot get there. Before turning to the more powerful non-diagonal transformations that can, we look at the other half of the problem: quantising weights to 4 bits and below, where rounding itself must become smarter.</p>
+
+<h2 id="s14-6">14.6 GPTQ: rounding with error compensation</h2>
+<p>Round-to-nearest, quantising each weight independently, is optimal if the goal is to make \(\hat W\) close to \(W\). But that is not the goal. What matters is that the layer's <em>output</em> is preserved on the inputs it actually sees, and errors in different weights can cancel in the output. Consider one output neuron of a linear layer, with weight row \(w\in\mathbb R^{1\times k}\), and a calibration set of inputs stacked as the columns of \(X\in\mathbb R^{k\times m}\). The squared output error of a quantised row \(\hat w\) is</p>
+\[ \big\|wX-\hat wX\big\|^2\;=\;(w-\hat w)\,\Sigma\,(w-\hat w)^\top,\qquad\Sigma=XX^\top. \]
+<p>The geometry is that of a quadratic form: errors along directions in which the inputs vary strongly are expensive, errors along directions the inputs rarely visit are cheap. Choosing \(\hat w\) on the quantisation grid to minimise this form is a <em>closest-vector problem</em> in the lattice defined by \(\Sigma\), which is NP-hard in general. GPTQ (Frantar, Ashkboos, Hoefler and Alistarh, 2022)<span class="cite"><a href="#r-gptq">[5]</a></span> solves it approximately with a greedy procedure inherited from the Optimal Brain Surgeon pruning method of the early 1990s.</p>
+<p>The key step is this. Suppose we round coordinate \(q\) of \(w\) to its grid value, changing it by \(c=\operatorname{quant}(w_q)-w_q\), and we are free to adjust the not-yet-quantised coordinates to compensate. The best total change \(\delta\) solves</p>
+\[ \min_{\delta}\;\delta\,\Sigma\,\delta^\top\quad\text{subject to}\quad\delta e_q=c, \]
+<p>where \(e_q\) is the \(q\)-th unit column vector. A Lagrange multiplier gives \(2\Sigma\delta^\top=\mu e_q\), so \(\delta^\top\propto\Sigma^{-1}e_q\), and the constraint fixes the constant:</p>
+\[ \delta\;=\;\frac{c}{[\Sigma^{-1}]_{qq}}\;e_q^\top\Sigma^{-1},\qquad\text{with error}\quad\delta\Sigma\delta^\top=\frac{c^2}{[\Sigma^{-1}]_{qq}}. \]
+<p>The \(q\)-th component of \(\delta\) is \(c\), which performs the rounding, and the other components spread a compensating correction across the remaining weights, weighted by the inverse second-moment matrix. GPTQ applies this step to the columns in a fixed order, left to right, so that the same sequence of \(\Sigma^{-1}\) updates serves every row of the weight matrix at once; after each step, the quantised coordinate is removed and the inverse of the remaining submatrix is needed, which a Cholesky factorisation of \(\Sigma^{-1}\) provides directly and stably. Updates are applied lazily in blocks of 128 columns so that the work is done as matrix products, and a small multiple of the mean diagonal is added to \(\Sigma\) for numerical stability. The result quantised OPT-175B and BLOOM-176B to 3 or 4 bits in about four GPU-hours, with far smaller accuracy loss than round-to-nearest.</p>
+
+<figure class="diagram" id="fig-14-8">
+<svg class="dg" viewBox="0 0 720 180" role="img" aria-label="GPTQ processes columns in order">
+<text x="20" y="16" class="t-sm t-b">One GPTQ step on a weight matrix (rows: output neurons; columns: input channels)</text>
+<g>
+<rect x="60" y="40" width="40" height="100" class="bx3"/><rect x="100" y="40" width="40" height="100" class="bx3"/><rect x="140" y="40" width="40" height="100" class="bx3"/>
+<rect x="180" y="40" width="40" height="100" class="fill-s2"/>
+<rect x="220" y="40" width="40" height="100" class="bx2"/><rect x="260" y="40" width="40" height="100" class="bx2"/><rect x="300" y="40" width="40" height="100" class="bx2"/><rect x="340" y="40" width="40" height="100" class="bx2"/>
+</g>
+<text x="110" y="158" text-anchor="middle" class="t-xs">quantised (frozen)</text>
+<text x="200" y="158" text-anchor="middle" class="t-xs t-s2 t-b">column q</text>
+<text x="300" y="158" text-anchor="middle" class="t-xs">not yet quantised</text>
+<path d="M200,38 C230,28 300,28 330,38" class="ln" marker-end="url(#a148)"/>
+<defs><marker id="a148" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<text x="420" y="62" class="t-xs">1. round column q to the grid: error c per row</text>
+<text x="420" y="84" class="t-xs">2. add c × (row q of Σ⁻¹) ÷ (Σ⁻¹)qq</text>
+<text x="436" y="98" class="t-xs">to the columns on the right</text>
+<text x="420" y="120" class="t-xs">3. drop q; update Σ⁻¹ (via its Cholesky factor)</text>
+<text x="420" y="142" class="t-xs">same order for all rows → shared work</text>
+</svg>
+<figcaption><b>Figure 14.8 — GPTQ's sequential rounding.</b> Each column is rounded in turn, and its rounding error is compensated by adjusting the columns not yet quantised, in proportion to the input correlations encoded in \(\Sigma^{-1}\).</figcaption></figure>
+
+<p>Figure 14.8 shows one step. The procedure has a clean interpretation for the mathematically inclined: processing coordinates in order, rounding each and projecting the residual onto the remaining coordinates is the nearest-plane heuristic of lattice decoding (Babai's algorithm), applied to the lattice whose Gram matrix is \(\Sigma\). Like that algorithm it is greedy and not optimal, as Drill 14.2 shows, but it is fast and good. GPTQ needs only a few hundred calibration sequences and no gradients, and it produces standard group-wise INT4 weights that any W4A16 kernel can use. Its weakness is that it can overfit the calibration set, and its column order matters; the "act-order" variant quantises columns with the largest diagonal of \(\Sigma\), the most active input channels, first, while the most freedom to compensate remains.</p>
+
+<details class="drill">
+<summary>Drill 14.1 — Bits and bytes</summary>
+<p>Compute the bits per weight and the weight memory of Llama 3 70B (70.6B parameters) in INT4 with \(n_g=128\), an FP16 scale and an FP16 zero point; in MXFP4; and in NVFP4. How many H100s does each need for weights alone, compared with BF16?</p>
+<p><em>Solution.</em> INT4: \(4+32/128=4.25\) bits, \(70.6\times10^{9}\times4.25/8\approx37.5\) GB. MXFP4: 4.25 bits, 37.5 GB. NVFP4: 4.5 bits, 39.7 GB. Each fits on one 80 GB H100, leaving roughly 35–40 GB for cache and activations (NVFP4 needs Blackwell hardware to compute in that format, though). BF16 needs 141 GB, so two GPUs at least, and in practice four once the cache is included. Quantisation to 4 bits changes the deployment from a tensor-parallel group to a single GPU, which also removes all tensor-parallel communication.</p>
+</details>
+
+<details class="drill">
+<summary>Drill 14.2 — GPTQ by hand, and why greedy is not optimal</summary>
+<p>A two-input neuron has weights \(w=(0.6,\;0.65)\), the quantisation grid is the integers, and the calibration inputs have \(\Sigma=\begin{pmatrix}2&amp;1\\1&amp;2\end{pmatrix}\). Compare round-to-nearest, one pass of GPTQ (column 1 first), and the best grid point, using the error \(d\,\Sigma\,d^\top\) with \(d=\hat w-w\).</p>
+<p><em>Solution.</em> The error is \(2d_1^2+2d_1d_2+2d_2^2\). Round-to-nearest gives \((1,1)\), \(d=(0.4,0.35)\), error \(0.32+0.28+0.245=0.845\). GPTQ: \(\Sigma^{-1}=\tfrac13\begin{pmatrix}2&amp;-1\\-1&amp;2\end{pmatrix}\); rounding \(w_1\) to 1 gives \(c=0.4\) and \(\delta=\frac{0.4}{2/3}\cdot(\tfrac23,-\tfrac13)=(0.4,-0.2)\), so \(w_2\) becomes 0.45 and rounds to 0. The result \((1,0)\) has \(d=(0.4,-0.65)\) and error \(0.32-0.52+0.845=0.645\), better than round-to-nearest because the positively correlated inputs let the two errors partly cancel. But \((0,1)\) has \(d=(-0.6,0.35)\) and error \(0.72-0.42+0.245=0.545\), better still. GPTQ's greedy order committed to \(\hat w_1=1\) too early. Ordering heuristics and refinements such as later lattice-based methods try to close this gap.</p>
+</details>
+
+<h2 id="s14-7">14.7 AWQ: protecting the weights that matter</h2>
+<p>GPTQ treats all weights through the lens of \(\Sigma\), but a simpler observation captures much of the same information. Lin and colleagues (2023)<span class="cite"><a href="#r-awq">[6]</a></span> noticed that keeping just 1% of weight channels in FP16 recovered most of the accuracy lost by 4-bit round-to-nearest, but only if those channels were chosen by the magnitude of their <em>activations</em>, not their weights. A weight multiplying a large input contributes a large share of the output, so its rounding error is amplified. Mixed precision is unattractive in kernels, however, so <strong>activation-aware weight quantisation</strong> (AWQ) protects salient channels by scaling instead.</p>
+<p>Multiply input channel \(j\) of the weights by \(u_j&gt;1\) before quantising, and divide the corresponding activation by \(u_j\): the product \(Q(w_ju_j)\,x_j/u_j\) is the same as before up to rounding. If scaling one channel does not change its group's maximum much, the step \(\Delta\) stays about the same, so the rounding error of \(w_ju_j\) is about the same in absolute terms, and after division by \(u_j\) its contribution to the output shrinks by a factor \(u_j\). Large-activation channels are thus quantised relatively more finely, at the cost of slightly coarser steps for others when a scaled weight becomes the group maximum. AWQ chooses \(u_j=\bar a_j^{\,\alpha}\), where \(\bar a_j\) is the mean activation magnitude of channel \(j\) on calibration data, and searches the single exponent \(\alpha\in[0,1]\) per layer to minimise the output error. The division by \(u_j\) is folded into the previous layer, exactly as in SmoothQuant, whose formula this resembles. The difference is the purpose: SmoothQuant moves difficulty onto the weights so that activations can be quantised, while AWQ uses activation statistics to decide which weights deserve precision.</p>
+<p>AWQ needs no backpropagation and no reconstruction of weights, only activation statistics and a small grid search, so it generalises well beyond its calibration data and works for instruction-tuned and multimodal models. It received the MLSys 2024 best paper award, and with its kernels (and the later Marlin kernels<span class="cite"><a href="#r-marlin">[7]</a></span>, which reach close to the ideal 4× speed-up of 4-bit weights at batch sizes up to about 16–32 on Ampere and Hopper) it became, with GPTQ, the standard way to produce 4-bit weight-only checkpoints for local and latency-bound serving. Both methods, though, stop at the weights. To quantise activations and caches to 4 bits, the outliers themselves must go.</p>
+
+<h2 id="s14-8">14.8 Rotations: removing outliers by a change of basis</h2>
+<p>SmoothQuant's identity \(XW=(XD^{-1})(DW)\) holds for any invertible \(D\), not only diagonal ones. Take \(D^{-1}=R\) orthogonal, so that \(XW=(XR)(R^\top W)\). An orthogonal transformation preserves Euclidean norms but can redistribute a vector's energy across coordinates. A vector with one huge coordinate, \(x=(100,\epsilon_2,\dots,\epsilon_d)\), has a large crest factor; after multiplication by a random orthogonal matrix, or by a normalised Hadamard matrix \(\mathcal H_d/\sqrt d\) whose entries are all \(\pm1/\sqrt d\), every coordinate receives a share of the outlier, and the result looks like a Gaussian vector with the same norm. Rotation does not shrink the outlier; it dissolves it.</p>
+<div class="box example">
+<div class="box-title">Worked example — the crest factor before and after a Hadamard rotation</div>
+<p>Let \(x\in\mathbb R^{4096}\) have one coordinate equal to 100 and the others independent standard normals. Then \(\|x\|^2\approx10^4+4095\), so \(\|x\|\approx118.8\) and \(\operatorname{rms}(x)=\|x\|/\sqrt{4096}\approx1.86\). Before rotation \(r_c\approx100/1.86\approx54\). After \(x\mapsto x\mathcal H_d/\sqrt d\), each coordinate is \(\pm100/64\) plus a sum of 4,095 terms \(\pm\epsilon_j/64\), approximately Gaussian with standard deviation about 1.0, so the rotated coordinates are near-Gaussian with rms 1.86 and maximum about \(4.1\times1.86\approx7.6\): \(r_c\approx4\). The gain is \(20\log_{10}(54/4)\approx23\) dB, nearly four bits of SQNR, from a transformation that costs \(O(d\log d)\) operations with a fast Walsh–Hadamard transform.</p>
+</div>
+
+<figure class="diagram" id="fig-14-9">
+<svg class="dg" viewBox="0 0 720 190" role="img" aria-label="Rotation spreads an outlier across coordinates">
+<text x="160" y="22" text-anchor="middle" class="t-sm t-b">x (one outlier)</text>
+<g>
+<rect x="40" y="128" width="12" height="12" class="fill-acc"/><rect x="56" y="132" width="12" height="8" class="fill-acc"/><rect x="72" y="130" width="12" height="10" class="fill-acc"/><rect x="88" y="40" width="12" height="100" class="fill-s2"/><rect x="104" y="131" width="12" height="9" class="fill-acc"/><rect x="120" y="128" width="12" height="12" class="fill-acc"/><rect x="136" y="133" width="12" height="7" class="fill-acc"/><rect x="152" y="129" width="12" height="11" class="fill-acc"/><rect x="168" y="131" width="12" height="9" class="fill-acc"/><rect x="184" y="130" width="12" height="10" class="fill-acc"/><rect x="200" y="132" width="12" height="8" class="fill-acc"/><rect x="216" y="128" width="12" height="12" class="fill-acc"/><rect x="232" y="131" width="12" height="9" class="fill-acc"/><rect x="248" y="130" width="12" height="10" class="fill-acc"/><rect x="264" y="129" width="12" height="11" class="fill-acc"/>
+</g>
+<line x1="35" y1="140" x2="285" y2="140" class="ln"/>
+<text x="160" y="160" text-anchor="middle" class="t-xs">crest factor ≈ 54</text>
+<text x="360" y="92" text-anchor="middle" class="t-sm">× H/√d (Hadamard)</text>
+<line x1="310" y1="102" x2="410" y2="102" class="ln" marker-end="url(#a149)"/>
+<defs><marker id="a149" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<text x="570" y="22" text-anchor="middle" class="t-sm t-b">x H/√d (energy spread out)</text>
+<g>
+<rect x="450" y="116" width="12" height="24" class="fill-acc"/><rect x="466" y="110" width="12" height="30" class="fill-acc"/><rect x="482" y="120" width="12" height="20" class="fill-acc"/><rect x="498" y="106" width="12" height="34" class="fill-acc"/><rect x="514" y="118" width="12" height="22" class="fill-acc"/><rect x="530" y="112" width="12" height="28" class="fill-acc"/><rect x="546" y="122" width="12" height="18" class="fill-acc"/><rect x="562" y="108" width="12" height="32" class="fill-acc"/><rect x="578" y="117" width="12" height="23" class="fill-acc"/><rect x="594" y="111" width="12" height="29" class="fill-acc"/><rect x="610" y="119" width="12" height="21" class="fill-acc"/><rect x="626" y="109" width="12" height="31" class="fill-acc"/><rect x="642" y="115" width="12" height="25" class="fill-acc"/><rect x="658" y="113" width="12" height="27" class="fill-acc"/><rect x="674" y="118" width="12" height="22" class="fill-acc"/>
+</g>
+<line x1="445" y1="140" x2="690" y2="140" class="ln"/>
+<text x="570" y="160" text-anchor="middle" class="t-xs">crest factor ≈ 4 (near-Gaussian), same norm</text>
+<text x="360" y="184" text-anchor="middle" class="t-xs">XW = (XR)(RᵀW): the rotation is absorbed into neighbouring weights, so the model is unchanged</text>
+</svg>
+<figcaption><b>Figure 14.9 — Rotation dissolves outliers.</b> An orthogonal change of basis preserves the vector's norm and the layer's output, but spreads a single large coordinate across all coordinates, bringing the crest factor down to that of a Gaussian vector.</figcaption></figure>
+
+<p>Figure 14.9 makes the point visually. The remaining question is where the rotations go, since applying \(R\) at run time to every activation would cost a matrix product per layer. QuaRot (Ashkboos et al., 2024)<span class="cite"><a href="#r-quarot">[8]</a></span> observed that most of them can be folded into the weights offline, thanks to a property it called <em>computational invariance</em>. RMSNorm divides a vector by its norm, and orthogonal transformations preserve norms, so \(\operatorname{RMSNorm}(xR)=\operatorname{RMSNorm}(x)\,R\) once the norm's learned gain is folded into the next weight matrix. Rotating the entire residual stream by one \(R\), by multiplying the embedding table by \(R\), the input weights of every block by \(R^\top\) on the left and the output weights by \(R\) on the right, therefore leaves the network's function exactly unchanged while every activation entering a linear layer is rotated. A few places, such as the input to the FFN's down projection and the keys and values for cache quantisation, need small online Hadamard transforms, which fast kernels make cheap. With rotated activations of near-Gaussian crest factor, QuaRot quantised weights, activations and KV cache all to 4 bits (W4A4KV4) with modest accuracy loss on Llama 2 models. SpinQuant (Liu et al., 2024)<span class="cite"><a href="#r-spinquant">[9]</a></span> went further and <em>learned</em> the rotations, optimising \(R\) over the orthogonal group (with the Cayley parametrisation, an elegant use of manifold optimisation) to minimise the quantised network's loss, and found that learned rotations beat random Hadamard ones substantially at 4 bits.</p>
+<p>Rotations completed the theoretical picture: outliers are a property of the basis, not of the model, and an orthogonal change of basis that the network does not notice can remove them. In practice, though, the most widely deployed low-precision serving of 2025 did not use 4-bit activations on Hopper GPUs, because Hopper has no 4-bit tensor cores and the gains would not appear. What hardware supports decides what is worth doing.</p>
+
+<h2 id="s14-9">14.9 Quantisation in practice</h2>
+<p>By 2025 a fairly stable set of practices had emerged, organised by hardware generation. On <strong>Hopper</strong> (H100, H200), <strong>FP8 W8A8</strong> is the default for serving large models: E4M3 weights with per-channel or block scales, and E4M3 activations with per-token or per-tensor scales computed on the fly, running on FP8 tensor cores at twice BF16 throughput. Because E4M3 is a floating-point format, its relative precision is nearly uniform across its range, so moderate outliers are tolerated without smoothing. A large evaluation by Kurtic and colleagues (2024), covering hundreds of thousands of model evaluations<span class="cite"><a href="#r-kurtic">[10]</a></span>, found FP8 W8A8 essentially lossless across tasks and model sizes, INT8 W8A8 within one to three per cent when carefully tuned, and 4-bit weight-only quantisation competitive for most tasks, with the best choice depending on deployment. DeepSeek-V3 was <em>trained</em> in FP8 with fine-grained scaling, 1 × 128 tiles for activations and 128 × 128 blocks for weights, so it is served in FP8 natively<span class="cite"><a href="#r-dsv3">[11]</a></span>.</p>
+<p><strong>W4A16</strong> (GPTQ or AWQ weights with Marlin-style kernels) is the choice when latency at small batch matters most, or when memory is the binding constraint, as in local inference on a single consumer GPU or a laptop (Chapter 29). As Figure 14.1 predicts, its advantage fades at large batch, where FP8 overtakes it. On <strong>Blackwell</strong> (B200, GB200), FP4 tensor cores double FP8 throughput again, and MXFP4 and NVFP4 become formats for both weights and activations. Accuracy at 4 bits is harder to keep than at 8, so models are increasingly trained or fine-tuned with FP4 in the loop (quantisation-aware training) rather than quantised after the fact. OpenAI's gpt-oss models of 2025, for example, were released with their MoE weights in MXFP4. For the <strong>KV cache</strong>, FP8 is common and nearly free in accuracy, doubling cache capacity (§8.6), with 4-bit caches in more specialised settings.</p>
+
+<div class="table-wrap"><table>
+<caption>Common quantisation schemes for LLM serving (2025).</caption>
+<thead><tr><th>Scheme</th><th>Bits/weight</th><th>Compute</th><th>Typical method</th><th>Best for</th></tr></thead>
+<tbody>
+<tr><td>BF16</td><td>16</td><td>BF16</td><td>none</td><td>reference; training</td></tr>
+<tr><td>W8A8 FP8</td><td>8</td><td>FP8 (Hopper+)</td><td>per-channel/block weights, dynamic per-token activations</td><td>throughput serving on H100/H200; near-lossless</td></tr>
+<tr><td>W8A8 INT8</td><td>8</td><td>INT8 (Ampere+)</td><td>SmoothQuant</td><td>A100 and older; CPUs</td></tr>
+<tr><td>W4A16</td><td>4.125–4.25</td><td>BF16/FP16</td><td>GPTQ, AWQ (groups of 128)</td><td>low-batch latency; local and edge; memory-bound deployments</td></tr>
+<tr><td>W4A4 (rotated)</td><td>4–4.5</td><td>INT4/FP4</td><td>QuaRot, SpinQuant</td><td>research; FP4-capable hardware</td></tr>
+<tr><td>MXFP4 / NVFP4</td><td>4.25 / 4.5</td><td>FP4 (Blackwell)</td><td>block scaling; often quantisation-aware training</td><td>throughput and memory on Blackwell</td></tr>
+</tbody></table></div>
+
+<p>Two lessons of practice are as important as any algorithm. The first is about <strong>evaluation</strong>. Perplexity on a generic corpus is a blunt instrument: a quantised model can match its perplexity closely and still fail more often on long-context retrieval, multi-step reasoning, code or less common languages, where small errors compound over many tokens. A credible evaluation compares the quantised and reference models on the tasks the product needs, with enough samples to resolve differences of a point or two, and checks per-task rather than averaged scores, using the teacher-forced divergence tests of §12.9 to separate implementation bugs from genuine quantisation error. The second is about <strong>what is quantised</strong>. Embeddings, the LM head, normalisation parameters and sometimes the first and last blocks are sensitive and contribute little to bytes per step, so they are usually kept in higher precision; MoE experts, which dominate parameter count but are each read only when routed to, are the most profitable targets.</p>
+<div class="box example">
+<div class="box-title">Worked example — choosing a scheme for Llama 3 70B</div>
+<p>Serve Llama 3 70B for chat on H100s with a 20 ms TPOT target. <strong>BF16, TP = 4:</strong> 35.3 GB of weights per GPU; the TPOT-limited batch is about 140–270 (Drill 12.2). <strong>FP8 W8A8, TP = 2:</strong> 35.3 GB of weights per GPU again, now on half as many GPUs, so twice the throughput per GPU at the same per-GPU bytes; with an FP8 cache (160 KiB per token), about 34 GB per GPU of cache, roughly 415k tokens per replica. Accuracy is essentially unchanged. <strong>W4A16, TP = 1:</strong> about 37.5 GB of weights on one GPU, leaving about 31 GB for an FP8 cache (about 190k tokens), with no tensor-parallel communication; per-step weight bytes are about the same as the FP8 TP = 2 configuration on each of its GPUs, but the arithmetic runs in BF16 on one GPU, so the step becomes compute-bound at a batch of about 78. <strong>Decision:</strong> FP8 at TP = 2 for throughput-oriented serving; W4A16 on one GPU for low-concurrency, latency-sensitive or cost-constrained deployments, after validating accuracy on the product's tasks.</p>
+</div>
+<p>The example illustrates the general method: compute the bytes per step and the compute ceiling for each candidate, check what fits in memory and how much cache remains, and only then compare accuracy on the workload. Quantisation is rarely a single decision; it interacts with parallelism, batch size, cache precision and hardware, which is why every chapter of Part IV has quantisation knobs among its configuration options.</p>
+
+<details class="drill">
+<summary>Drill 14.3 — Where does W4A16 stop helping?</summary>
+<p>For Llama 3 8B on an H100, at what batch size does a W4A16 decode step become compute-bound (weights only), and what is the speed-up over BF16 at batch 32 and at batch 512?</p>
+<p><em>Solution.</em> With \(b_w=4.125/8\) bytes and BF16 compute, \(B^{*}=\pi b_w/(2\beta)=989\times10^{12}\times0.516/(2\times3.35\times10^{12})\approx76\). At batch 32 both are memory-bound: BF16 takes \(16.06/3.35=4.8\) ms and W4A16 \(4.14/3.35=1.24\) ms, a 3.9× speed-up in the ideal model. At batch 512 both are compute-bound at \(2\times8.03\times10^{9}\times512/989\times10^{12}\approx8.3\) ms, so the speed-up is 1×, and in practice W4A16 is slightly slower because of dequantisation work. FP8 W8A8 would take about 4.2 ms at batch 512.</p>
+</details>
+
+<h2 id="looking-ahead" class="unnumbered">Looking ahead</h2>
+<p>Quantisation keeps every parameter and stores it more cheaply. Its error is spread thinly over all weights, and the analysis of this chapter shows that below about four bits the noise grows quickly however cleverly we round. A different way to shrink a model is to remove parts of it altogether: individual weights, structured blocks of weights, attention heads, whole layers, or, most radically, to train a smaller model to imitate the large one. Each of these trades accuracy for bytes and FLOPs in a different way, and only some of them translate into speed on GPUs. Chapter 15 takes up pruning, sparsity and distillation, asks which kinds of sparsity the hardware can exploit, and explains why distillation has become the way small models are made.</p>
+
+<h2 id="summary">Chapter summary</h2>
+<ul>
+<li>Decode time is about bytes per step over bandwidth. Weight-only quantisation reduces bytes and helps at small batch; quantising activations too raises the compute ceiling (FP8 tensor cores: 1,979 vs 989 TFLOP/s on H100) and helps at large batch. W4A16 becomes compute-bound at \(B^{*}=\pi b_w/(2\beta)\approx76\) for Llama 3 8B.</li>
+<li>Formats: INT (uniform levels) and FP (geometric levels); BF16 (1|8|7), FP8 E4M3 (max 448) and E5M2, FP4 E2M1 (0, 0.5, 1, 1.5, 2, 3, 4, 6). Block-scaled MXFP4 (32 elements, power-of-two scale, 4.25 bits) and NVFP4 (16 elements, FP8 scale, 4.5 bits).</li>
+<li>Rounding error has variance \(\Delta^2/12\); \(\text{SQNR}\approx6.02\,n_b+4.77-20\log_{10}r_c\). The crest factor \(r_c\) is the enemy: one 100× outlier costs almost four bits for its whole block. Finer groups reduce \(r_c\); FP grids suit heavy-tailed data.</li>
+<li>LLM.int8() (2022) found emergent outlier features in a few activation channels above ≈ 6.7B parameters and kept them in FP16; per-input-channel scales cannot be factored out of a matrix product, so activation outliers are hard.</li>
+<li>SmoothQuant: \(XW=(XD^{-1})(DW)\) with \(u_j=a_j^{\alpha_s}/w_j^{1-\alpha_s}\) migrates difficulty to the weights; W8A8 INT8 with folded scales.</li>
+<li>GPTQ minimises \((w-\hat w)\Sigma(w-\hat w)^\top\), rounding columns in order with the update \(\delta=c\,e_q^\top\Sigma^{-1}/[\Sigma^{-1}]_{qq}\); a greedy nearest-plane method for a closest-vector problem. AWQ scales salient input channels, chosen by activation magnitude, before rounding.</li>
+<li>Rotations (QuaRot, SpinQuant): \(XW=(XR)(R^\top W)\) with orthogonal \(R\), folded into weights via RMSNorm's computational invariance, dissolve outliers to near-Gaussian crest factors and enable W4A4KV4.</li>
+<li>Practice: FP8 W8A8 on Hopper (near-lossless), W4A16 for low-batch latency and local inference, MXFP4/NVFP4 with quantisation-aware training on Blackwell, FP8 KV caches. Evaluate on the product's tasks, not perplexity alone; keep sensitive, small components in higher precision.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+<div class="mcq" data-id="ch14-mcq-01" data-topic="§14.1 Why bits matter">
+<p class="q">Why does halving the bytes per weight roughly halve decode time at small batch?</p>
+<ol class="opts"><li>Because FLOPs halve</li><li data-correct>Because small-batch decode is memory-bound, so step time is about bytes read divided by bandwidth</li><li>Because the KV cache disappears</li><li>Because kernels launch faster</li></ol>
+<div class="explain">Weights dominate bytes read at small batch.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-02" data-topic="§14.1 Why bits matter">
+<p class="q">W4A16 denotes:</p>
+<ol class="opts"><li>4-bit activations, 16-bit weights</li><li data-correct>4-bit weights with 16-bit activations and compute</li><li>4 GPUs and 16 layers</li><li>A 4:16 sparsity pattern</li></ol>
+<div class="explain">Weight-only quantisation; the product runs in BF16/FP16.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-03" data-topic="§14.1 Roofline">
+<p class="q">For Llama 3 8B on an H100, a W4A16 decode step (weights only) becomes compute-bound at a batch of about:</p>
+<ol class="opts"><li>8</li><li data-correct>76</li><li>295</li><li>1,000</li></ol>
+<div class="explain">\(B^{*}=\pi b_w/(2\beta)\) with \(b_w\approx0.52\) bytes.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-04" data-topic="§14.1 Roofline">
+<p class="q">Which scheme raises the compute ceiling of decode on an H100?</p>
+<ol class="opts"><li>W4A16</li><li data-correct>W8A8 in FP8</li><li>An FP8 KV cache alone</li><li>INT4 embeddings</li></ol>
+<div class="explain">FP8 tensor cores deliver about 1,979 TFLOP/s against 989 for BF16.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-05" data-topic="§14.2 Formats">
+<p class="q">FP8 E4M3 has a maximum finite value of:</p>
+<ol class="opts"><li>127</li><li data-correct>448</li><li>57,344</li><li>65,504</li></ol>
+<div class="explain">E5M2 reaches 57,344; FP16 65,504.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-06" data-topic="§14.2 Formats">
+<p class="q">Which values can FP4 E2M1 represent (magnitudes)?</p>
+<ol class="opts"><li>0–7 in steps of 1</li><li data-correct>0, 0.5, 1, 1.5, 2, 3, 4, 6</li><li>Powers of two only</li><li>0, 0.25, 0.5, 0.75</li></ol>
+<div class="explain">Sixteen codes in all, with sign.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-07" data-topic="§14.2 Formats">
+<p class="q">BF16 differs from FP16 by having:</p>
+<ol class="opts"><li>More mantissa bits</li><li data-correct>FP32's exponent range with fewer mantissa bits</li><li>No sign bit</li><li>Integer encoding</li></ol>
+<div class="explain">1|8|7 versus 1|5|10.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-08" data-topic="§14.2 Block scaling">
+<p class="q">MXFP4 stores blocks of 32 E2M1 elements with an 8-bit power-of-two scale. Its bits per element are:</p>
+<ol class="opts"><li>4</li><li data-correct>4.25</li><li>4.5</li><li>5</li></ol>
+<div class="explain">\(4+8/32\).</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-09" data-topic="§14.2 Block scaling">
+<p class="q">NVFP4 differs from MXFP4 by using:</p>
+<ol class="opts"><li>Larger blocks of 64</li><li data-correct>Blocks of 16 with an FP8 E4M3 scale (plus a per-tensor FP32 scale)</li><li>Integer elements</li><li>No scales</li></ol>
+<div class="explain">4.5 bits per element; finer scales reduce error.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-10" data-topic="§14.2 Grids">
+<p class="q">Why does FP4 usually beat INT4 on trained weights?</p>
+<ol class="opts"><li>It has more levels</li><li data-correct>Its levels concentrate near zero, matching bell-shaped and heavy-tailed distributions</li><li>It needs no scale</li><li>It is faster on Hopper</li></ol>
+<div class="explain">Same number of codes, better allocation.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-11" data-topic="§14.3 Error model">
+<p class="q">Under the uniform-error model, rounding to a grid of step \(\Delta\) has error variance:</p>
+<ol class="opts"><li>\(\Delta\)</li><li>\(\Delta^2/4\)</li><li data-correct>\(\Delta^2/12\)</li><li>\(\Delta/2\)</li></ol>
+<div class="explain">Variance of a uniform distribution on \([-\Delta/2,\Delta/2]\).</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-12" data-topic="§14.3 SQNR">
+<p class="q">Each additional bit of a uniform quantiser improves SQNR by about:</p>
+<ol class="opts"><li>1 dB</li><li>3 dB</li><li data-correct>6 dB</li><li>20 dB</li></ol>
+<div class="explain">A factor of four in noise power.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-13" data-topic="§14.3 Crest factor">
+<p class="q">Raising a block's crest factor from 4 to 40 costs about how much SQNR?</p>
+<ol class="opts"><li>2 dB</li><li>6 dB</li><li data-correct>20 dB</li><li>40 dB</li></ol>
+<div class="explain">\(20\log_{10}10=20\) dB, more than three bits.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-14" data-topic="§14.3 Granularity">
+<p class="q">Why does a smaller group size reduce quantisation error?</p>
+<ol class="opts"><li>It uses more bits per element</li><li data-correct>Smaller blocks have smaller maxima relative to their rms (smaller crest factors)</li><li>It removes rounding</li><li>It changes the format</li></ol>
+<div class="explain">An outlier spoils only its own block.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-15" data-topic="§14.3 Granularity">
+<p class="q">Which activation scale can be factored out of \(Y=XW\) at no cost?</p>
+<ol class="opts"><li>One scale per input channel of \(X\)</li><li data-correct>One scale per token (row) of \(X\)</li><li>One scale per element</li><li>None</li></ol>
+<div class="explain">A per-row scale of \(X\) becomes a per-row scale of \(Y\); per-input-channel scales sit inside the sum.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-16" data-topic="§14.4 Outliers">
+<p class="q">LLM.int8() observed that above about 6.7B parameters:</p>
+<ol class="opts"><li>Weights become sparse</li><li data-correct>A few activation dimensions carry values tens of times larger than the rest, systematically across tokens</li><li>Attention becomes linear</li><li>Perplexity stops improving</li></ol>
+<div class="explain">Emergent outlier features.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-17" data-topic="§14.4 LLM.int8()">
+<p class="q">LLM.int8() handles outliers by:</p>
+<ol class="opts"><li>Clipping them</li><li data-correct>Multiplying outlier columns (and matching weight rows) in FP16 and the rest in INT8</li><li>Retraining the model</li><li>Rotating activations</li></ol>
+<div class="explain">Mixed-precision decomposition; it saved memory but was not faster.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-18" data-topic="§14.4 Outliers">
+<p class="q">Why are activation outliers harder than weight outliers?</p>
+<ol class="opts"><li>Activations are larger tensors</li><li data-correct>They vary per input, must be quantised on the fly, and sit in input channels where per-element scales cannot be factored out</li><li>They are stored in FP32</li><li>They are always negative</li></ol>
+<div class="explain">Weights are fixed and can be handled offline with fine groups.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-19" data-topic="§14.5 SmoothQuant">
+<p class="q">SmoothQuant relies on the identity:</p>
+<ol class="opts"><li>\(XW=(XR)(R^\top W)\)</li><li data-correct>\(XW=(XD^{-1})(DW)\) for positive diagonal \(D\)</li><li>\(XW=WX\)</li><li>\(XW=X+W\)</li></ol>
+<div class="explain">Difficulty migrates from activations to weights.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-20" data-topic="§14.5 SmoothQuant">
+<p class="q">With migration strength \(\alpha_s=0.5\), the smoothed per-channel maxima of activations and weights become:</p>
+<ol class="opts"><li data-correct>Both equal to \(\sqrt{a_jw_j}\)</li><li>\(a_j\) and \(w_j\)</li><li>1 and 1</li><li>\(a_j^2\) and \(w_j^2\)</li></ol>
+<div class="explain">\(u_j=\sqrt{a_j/w_j}\).</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-21" data-topic="§14.5 SmoothQuant">
+<p class="q">Where is SmoothQuant's \(D^{-1}\) applied at run time?</p>
+<ol class="opts"><li>In a separate kernel</li><li data-correct>Nowhere: it is folded offline into the preceding normalisation's parameters</li><li>On the CPU</li><li>In the sampler</li></ol>
+<div class="explain">And \(D\) is folded into \(W\).</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-22" data-topic="§14.6 GPTQ">
+<p class="q">GPTQ minimises, for each output neuron:</p>
+<ol class="opts"><li>\(\|w-\hat w\|^2\)</li><li data-correct>\((w-\hat w)\Sigma(w-\hat w)^\top\) with \(\Sigma=XX^\top\) from calibration inputs</li><li>The training loss</li><li>The number of non-zero weights</li></ol>
+<div class="explain">Output error on the calibration set.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-23" data-topic="§14.6 GPTQ">
+<p class="q">After rounding coordinate \(q\) with error \(c\), the optimal compensating change of the remaining weights is proportional to:</p>
+<ol class="opts"><li>\(\Sigma e_q\)</li><li data-correct>\(\Sigma^{-1}e_q\)</li><li>\(e_q\)</li><li>The gradient of the loss</li></ol>
+<div class="explain">\(\delta=c\,e_q^\top\Sigma^{-1}/[\Sigma^{-1}]_{qq}\).</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-24" data-topic="§14.6 GPTQ">
+<p class="q">Why does GPTQ quantise columns in the same order for every row?</p>
+<ol class="opts"><li>It is required for correctness</li><li data-correct>So the sequence of \(\Sigma^{-1}\) updates is shared across all rows, making the algorithm fast</li><li>To reduce memory</li><li>To enable sparsity</li></ol>
+<div class="explain">Plus lazy block updates and a Cholesky factorisation.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-25" data-topic="§14.6 GPTQ">
+<p class="q">In lattice terms, GPTQ's sequential rounding is:</p>
+<ol class="opts"><li>An exact closest-vector solver</li><li data-correct>A greedy nearest-plane (Babai-style) heuristic</li><li>Random rounding</li><li>Gradient descent</li></ol>
+<div class="explain">Drill 14.2 shows it can miss the best grid point.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-26" data-topic="§14.7 AWQ">
+<p class="q">AWQ identifies salient weight channels by:</p>
+<ol class="opts"><li>Weight magnitude</li><li data-correct>Activation magnitude of the corresponding input channel</li><li>Gradient norm</li><li>Random sampling</li></ol>
+<div class="explain">Weights multiplying large inputs matter most.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-27" data-topic="§14.7 AWQ">
+<p class="q">Scaling a salient channel's weights by \(u_j\) before quantisation (and dividing its activation by \(u_j\)) reduces that channel's output error by about:</p>
+<ol class="opts"><li>\(u_j^2\)</li><li data-correct>\(u_j\), if the group's step size is roughly unchanged</li><li>Nothing</li><li>\(\sqrt{u_j}\)</li></ol>
+<div class="explain">Same absolute rounding error, divided by \(u_j\).</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-28" data-topic="§14.8 Rotations">
+<p class="q">An orthogonal rotation \(R\) helps quantisation because it:</p>
+<ol class="opts"><li>Shrinks the norm of activations</li><li data-correct>Preserves norms and the layer's output while spreading an outlier's energy across coordinates</li><li>Removes the need for scales</li><li>Sparsifies weights</li></ol>
+<div class="explain">Crest factors approach the Gaussian value.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-29" data-topic="§14.8 Rotations">
+<p class="q">A Hadamard rotation of a 4,096-vector with one 100σ outlier reduces its crest factor from about 54 to about:</p>
+<ol class="opts"><li>50</li><li>20</li><li data-correct>4</li><li>1</li></ol>
+<div class="explain">A gain of about 23 dB.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-30" data-topic="§14.8 QuaRot">
+<p class="q">Computational invariance in QuaRot rests on the fact that:</p>
+<ol class="opts"><li>Softmax is linear</li><li data-correct>RMSNorm commutes with orthogonal rotations once its gain is folded into the next weights</li><li>Attention is permutation-invariant</li><li>Residual connections can be removed</li></ol>
+<div class="explain">So residual-stream rotations can be folded into the weights.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-31" data-topic="§14.8 SpinQuant">
+<p class="q">SpinQuant improves on random Hadamard rotations by:</p>
+<ol class="opts"><li>Using larger groups</li><li data-correct>Learning the rotation by optimisation over the orthogonal group</li><li>Skipping attention</li><li>Using INT8</li></ol>
+<div class="explain">For example with a Cayley parametrisation.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-32" data-topic="§14.9 Practice">
+<p class="q">On H100 serving, the near-lossless default for large models in 2025 is:</p>
+<ol class="opts"><li>W4A4 INT4</li><li data-correct>W8A8 FP8</li><li>W2A16</li><li>BF16 only</li></ol>
+<div class="explain">Kurtic et al. found FP8 W8A8 essentially lossless.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-33" data-topic="§14.9 Practice">
+<p class="q">Why is perplexity alone a poor test of a quantised model?</p>
+<ol class="opts"><li>It is too expensive</li><li data-correct>Small errors can compound on long-context, reasoning or code tasks while generic perplexity barely changes</li><li>It is always zero</li><li>It ignores the tokenizer</li></ol>
+<div class="explain">Evaluate on the product's tasks, per task.</div>
+</div>
+
+<div class="mcq" data-id="ch14-mcq-34" data-topic="§14.9 Practice">
+<p class="q">Which components are usually kept in higher precision? (select all that apply)</p>
+<ol class="opts"><li data-correct>Embeddings and the LM head</li><li data-correct>Normalisation parameters</li><li data-correct>Sometimes the first and last blocks</li><li>All MoE experts</li></ol>
+<div class="explain">MoE experts are the most profitable targets for quantisation.</div>
+</div>
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+<details class="qa" data-id="ch14-qa-01">
+<summary><span class="lvl warm">Warm-up</span> Why does quantisation speed up LLM decode? When does it not?</summary>
+<div class="answer">
+<p>Decode at small and moderate batch is memory-bound: each step reads all weights (and the KV cache) once, so step time is about bytes divided by HBM bandwidth. Storing weights in 8 or 4 bits reads 2× or almost 4× fewer bytes. It does not speed things up when the step is compute-bound: at large batch, weight-only 4-bit quantisation still multiplies in BF16, so beyond \(B^{*}=\pi b_w/(2\beta)\) (about 76 for Llama 3 8B on H100) it is no faster, and dequantisation adds overhead. Quantising activations as well (W8A8 FP8) raises the compute ceiling, so it helps at large batch too. Quantising weights also does nothing for cache bytes, which dominate at long contexts; that needs KV quantisation. Separately, smaller models fit on fewer GPUs and leave more memory for cache, which helps throughput indirectly.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch14-qa-02">
+<summary><span class="lvl warm">Warm-up</span> Explain FP8 E4M3 versus E5M2 and where each is used.</summary>
+<div class="answer">
+<p>Both are 8-bit floating-point formats from the 2022 FP8 specification. E4M3 has 4 exponent bits and 3 mantissa bits, a maximum of 448 and relative precision of about 1/8 per binade; it is used for weights and activations in inference (and forward passes in training), where precision matters more than range. E5M2 has 5 exponent bits and 2 mantissa bits, the range of FP16 (max 57,344) but coarser precision; it is used for gradients in training, which span a wide dynamic range. Both are used with scales (per-tensor, per-channel, per-token or per-block) to map tensors into range. Hopper and Blackwell tensor cores execute FP8 products at about twice BF16 throughput.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch14-qa-03">
+<summary><span class="lvl core">Core</span> Derive the SQNR of a uniform quantiser and explain the role of the crest factor.</summary>
+<div class="answer">
+<p>With step \(\Delta\) and values not aligned to the grid, rounding error is approximately uniform on \([-\Delta/2,\Delta/2]\), so its variance is \(\Delta^2/12\). An absmax scale over a block with maximum \(M\) and rms \(\sigma\), using \(2^{n_b}\) levels over \([-M,M]\), gives \(\Delta\approx2M/2^{n_b}\). Then \(\text{SQNR}=\sigma^2/(\Delta^2/12)=3\cdot2^{2n_b}/r_c^2\) with \(r_c=M/\sigma\), or \(6.02n_b+4.77-20\log_{10}r_c\) dB. Bits buy 6 dB each; the crest factor costs 20 dB per decade. A Gaussian block of 4,096 values has \(r_c\approx4\); one 100× outlier raises it to about 54, costing almost four bits for every value in the block, because the scale must stretch to cover the outlier. Hence the whole field's focus on reducing crest factors: finer groups, smoothing, rotations, and mixed precision for outliers.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch14-qa-04">
+<summary><span class="lvl core">Core</span> What are emergent outlier features, and why do they make activation quantisation hard?</summary>
+<div class="answer">
+<p>Dettmers et al. (LLM.int8(), 2022) found that Transformers above roughly 6.7B parameters develop a few hidden dimensions whose values are tens of times larger than typical, consistently across tokens and in most layers; removing them destroys performance. In a matrix product \(Y=XW\) these are input channels of \(X\). Per-token scales (rows of \(X\)) and per-output-channel scales (columns of \(W\)) can be factored out of the sum, but per-input-channel scales cannot, so one outlier channel inflates the scale of every token's row and crushes the precision of the other channels. Weights do not have this problem to the same extent: they are fixed, roughly bell-shaped and can be quantised offline with fine groups. Remedies: keep outlier channels in high precision (LLM.int8()), move the range into the weights (SmoothQuant), or rotate the basis to dissolve them (QuaRot, SpinQuant); FP8's floating-point grid also tolerates moderate outliers.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch14-qa-05">
+<summary><span class="lvl core">Core</span> Explain SmoothQuant and derive its choice of scales.</summary>
+<div class="answer">
+<p>For any positive diagonal \(D\), \(XW=(XD^{-1})(DW)\). Choosing \(D=\operatorname{diag}(u_j)\) divides activation channel \(j\) by \(u_j\) and multiplies weight row \(j\) by \(u_j\). With calibrated maxima \(a_j\) (activations) and \(w_j\) (weights), the new maxima are \(a_j/u_j\) and \(u_jw_j\). SmoothQuant sets \(u_j=a_j^{\alpha_s}/w_j^{1-\alpha_s}\); with \(\alpha_s=0.5\) both become \(\sqrt{a_jw_j}\), splitting the difficulty evenly; larger \(\alpha_s\) moves more onto the weights for models with severe activation outliers. \(D^{-1}\) is folded into the preceding LayerNorm/RMSNorm gain and \(D\) into \(W\) offline, so there is no run-time cost, and standard INT8 GEMMs with per-token and per-channel scales apply. It enabled accurate W8A8 up to 530B parameters, with up to 1.56× speed-up and half the memory. Its limit: a diagonal transformation cannot mix channels, so it is not enough for 4-bit activations.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch14-qa-06">
+<summary><span class="lvl core">Core</span> Compare GPTQ and AWQ.</summary>
+<div class="answer">
+<p>Both produce 4-bit (or 3-bit) group-wise weight-only checkpoints from a small calibration set, without retraining. GPTQ minimises each layer's output error \((w-\hat w)\Sigma(w-\hat w)^\top\), quantising columns in order and compensating each rounding error by adjusting remaining weights with the Optimal-Brain-Surgeon update \(\delta=c\,e_q^\top\Sigma^{-1}/[\Sigma^{-1}]_{qq}\), using a Cholesky factorisation and blocked updates; it is a second-order, error-feedback method and can overfit calibration data. AWQ observes that weights multiplying large activations matter most, and scales those input channels up by \(u_j=\bar a_j^{\alpha}\) before round-to-nearest (folding \(1/u_j\) into the previous layer), choosing \(\alpha\) per layer by grid search; it uses only activation statistics, so it generalises well and is cheap. In accuracy they are close; they can even be combined. Both serve the W4A16 use case with fast kernels such as Marlin.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch14-qa-07">
+<summary><span class="lvl core">Core</span> How do block-scaled formats like MXFP4 and NVFP4 work, and how do they differ?</summary>
+<div class="answer">
+<p>Elements are stored in a tiny format (FP4 E2M1: magnitudes 0, 0.5, 1, 1.5, 2, 3, 4, 6), and each block of \(n_g\) consecutive elements shares a scale, so the block's values are mapped into the element format's range. MXFP4 (OCP Microscaling, 2023) uses blocks of 32 and an 8-bit power-of-two (E8M0) scale: 4.25 bits per element, cheap to apply (an exponent add) but coarse, since a block maximum generally cannot map exactly to the top code. NVFP4 (Blackwell) uses blocks of 16 with an FP8 E4M3 scale and a per-tensor FP32 scale: 4.5 bits per element, with smaller blocks and finer scales, hence lower error (about 9% versus 13% relative RMS error in our heavy-tailed simulation). Blackwell tensor cores multiply such blocks directly at about twice FP8 throughput, so these formats serve both weights and activations.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch14-qa-08">
+<summary><span class="lvl deep">Deep-dive</span> Derive the GPTQ update from first principles.</summary>
+<div class="answer">
+<p>For weight row \(w\) and calibration inputs \(X\) (columns), the output error of \(\hat w\) is \(\|(w-\hat w)X\|^2=(w-\hat w)\Sigma(w-\hat w)^\top\), \(\Sigma=XX^\top\). Suppose we fix coordinate \(q\) to its grid value, i.e. change it by \(c=\operatorname{quant}(w_q)-w_q\), and may change other unquantised coordinates freely. Minimise \(\delta\Sigma\delta^\top\) subject to \(\delta e_q=c\). The Lagrangian \(\delta\Sigma\delta^\top-\mu(\delta e_q-c)\) gives \(2\Sigma\delta^\top=\mu e_q\), so \(\delta^\top=(\mu/2)\Sigma^{-1}e_q\); the constraint gives \(\mu/2=c/[\Sigma^{-1}]_{qq}\). Hence \(\delta=c\,e_q^\top\Sigma^{-1}/[\Sigma^{-1}]_{qq}\), with error increase \(c^2/[\Sigma^{-1}]_{qq}\). After fixing \(q\), the problem restricts to the remaining coordinates, whose relevant inverse is the Schur-complement update of \(\Sigma^{-1}\); GPTQ obtains all of these at once from the Cholesky factor of \(\Sigma^{-1}\), processes columns in a fixed order shared by all rows, applies updates lazily in blocks of 128, and dampens \(\Sigma\) by adding a small multiple of its mean diagonal. This is the nearest-plane heuristic for a closest-vector problem with Gram matrix \(\Sigma\).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch14-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> How do rotation methods (QuaRot, SpinQuant) enable 4-bit activations, and where do the rotations go?</summary>
+<div class="answer">
+<p>For orthogonal \(R\), \(XW=(XR)(R^\top W)\). Rotating preserves norms but spreads a large coordinate across all coordinates: a 4,096-vector with one 100× outlier goes from crest factor about 54 to about 4, gaining about 23 dB, which 4-bit quantisation needs. Placement: RMSNorm commutes with orthogonal maps (\(\|xR\|=\|x\|\)) once its gain is folded into the following weights, so the whole residual stream can be rotated by one \(R\), absorbed offline by multiplying the embedding by \(R\), each block's input projections by \(R^\top\) and output projections by \(R\); the network computes exactly the same function. A few places need online Hadamard transforms (input to the FFN down-projection; keys and values for 4-bit KV), implemented with fast Walsh–Hadamard kernels at \(O(d\log d)\). QuaRot used random Hadamard rotations to reach W4A4KV4; SpinQuant learned \(R\) on the orthogonal manifold (Cayley optimisation) and improved 4-bit accuracy substantially. Benefit requires 4-bit tensor cores, which Hopper lacks.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch14-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> Why did FP8 rather than INT8 become the default 8-bit inference format on Hopper?</summary>
+<div class="answer">
+<p>Accuracy: FP8 E4M3 has roughly constant relative precision across its range, so moderate outliers and wide distributions are represented well without smoothing; INT8 has uniform absolute precision and needs per-channel/per-token scales plus SmoothQuant to cope with activation outliers. Large evaluations found FP8 W8A8 essentially lossless and INT8 within 1–3% when tuned. Hardware: Hopper's tensor cores run FP8 at the same rate as INT8 (about 2× BF16), and FP8 integrates naturally with BF16 accumulation and with FP8 training (DeepSeek-V3 was trained in FP8 with fine-grained scales). Engineering: dynamic per-token activation scales are cheap, calibration is simpler, and the same format serves the KV cache. INT8 remains relevant on Ampere and CPUs.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch14-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> When is W4A16 slower than FP8 W8A8, and why?</summary>
+<div class="answer">
+<p>W4A16 reads about 4.1 bits per weight but performs the matrix product in BF16 after dequantising in registers. At small batch, decode is memory-bound and W4A16 reads half the bytes of FP8, so it is faster (up to about 2× over FP8, 4× over BF16, ideal). As batch grows, arithmetic grows linearly while weight bytes are fixed; W4A16 becomes compute-bound at \(B^{*}\approx\pi_{\text{BF16}}b_w/(2\beta)\approx76\) for Llama 3 8B on H100, whereas FP8 W8A8 becomes compute-bound at about 295 and its compute ceiling is twice as high. Above roughly 150 sequences FP8 is faster, and at 512 it is about twice as fast. Dequantisation (unpacking, scale multiply, layout shuffles) adds overhead that grows with batch. Long contexts also shift bytes to the KV cache, which weight quantisation does not reduce.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch14-qa-12">
+<summary><span class="lvl deep">Deep-dive</span> How would you evaluate whether a quantised model is good enough to ship?</summary>
+<div class="answer">
+<p>Reference: the unquantised model with identical serving settings. Implementation checks first: teacher-forced per-token KL or log-prob differences on held-out text, and greedy-prefix agreement, to catch kernel or packing bugs (§12.9). Then task evaluation on what the product uses: instruction following, reasoning (GSM8K, MATH-style), code (pass@k), long-context retrieval, multilingual, tool calling and structured output validity, with enough samples for confidence intervals of about a point, and per-task results rather than an average. Check generation-level behaviour: answer length, refusals, repetition; long generations, where errors compound; and the tails (worst-case prompts). Compare at realistic sampling settings and also greedy. Include latency and throughput on the target batch sizes, since a quantisation that does not speed up the actual workload is not worth its risk. Finally, run an online A/B or shadow test where possible.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch14-qa-13">
+<summary><span class="lvl design">Design</span> Choose a quantisation strategy for serving a 70B dense model on 8×H100 for high-throughput chat, and for the same model on a single 48 GB workstation GPU.</summary>
+<div class="answer">
+<p>8×H100, throughput: FP8 W8A8 (per-channel weights, dynamic per-token activations) with an FP8 KV cache. Weights are 70.6 GB, so TP = 2 replicas (four of them) each have about 34 GB per GPU for cache, high batch sizes and FP8's doubled compute ceiling; accuracy is essentially unchanged. Keep embeddings and LM head in BF16. Optionally test FP8 attention and speculative decoding. Avoid W4A16 here: at large batch it is compute-bound in BF16 and slower than FP8. Single 48 GB GPU, latency: 4-bit weights (AWQ or GPTQ, groups of 128, about 37.5 GB) leave about 8 GB for cache and activations, so use an FP8 or 4-bit KV cache and modest context; batch is small, so W4A16 kernels (Marlin) give close to the memory-bound ideal. Validate accuracy on the target tasks; if quality is short, try mixed precision (keep sensitive layers at 8 bits) or a smaller model distilled for the task (Chapter 15).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch14-qa-14">
+<summary><span class="lvl design">Design</span> Design a quantisation pipeline for a model provider that releases new models monthly.</summary>
+<div class="answer">
+<p>Inputs: BF16 checkpoint, target hardware (Hopper, Blackwell, consumer GPUs), target formats (FP8, NVFP4/MXFP4, INT4 W4A16). Steps: (1) calibration data representative of real traffic (chat, code, long documents, multilingual), a few hundred to a few thousand sequences; (2) per-format recipes: FP8 with per-channel weight scales and dynamic activation scales; INT4 with AWQ or GPTQ, groups of 128, act-order; FP4 with block scales, rotations where activations are quantised, and quantisation-aware fine-tuning when PTQ loses too much; (3) layer sensitivity analysis to keep sensitive layers (embeddings, LM head, some attention projections) at higher precision; (4) automated evaluation against BF16 on a fixed suite with confidence intervals and per-task gates, plus KL on held-out text; (5) kernel and engine compatibility tests (vLLM, SGLang, TensorRT-LLM, llama.cpp formats) and performance benchmarks at several batch sizes; (6) publish checkpoints with metadata (format, scales, calibration set, measured deltas). Automate end to end so each release ships quantised variants within days.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch14-qa-15">
+<summary><span class="lvl design">Design</span> Your team wants to run DeepSeek-V3-class MoE models cheaply. Where would you apply quantisation, and why?</summary>
+<div class="answer">
+<p>MoE parameters are dominated by experts, each read only when routed, so expert weights are the most profitable target: FP8 (the model's native training format) at minimum, and 4-bit experts (MXFP4/NVFP4 on Blackwell, or W4A16-style on Hopper at small expert batches) to cut memory, which lets the model fit on fewer GPUs and reduces expert-parallel communication volume. Attention and shared layers are small and sensitive, so keep them in FP8 or BF16. The KV cache is already compact with MLA but can be FP8. Because expert batch sizes per GPU are often small in decode, expert GEMMs are memory-bound, which is exactly where 4-bit weights pay. Validate carefully: routing can be sensitive to small numerical changes in gate logits, so keep the router in high precision and check load balance and accuracy.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch14-qa-16">
+<summary><span class="lvl core">Core</span> What is quantisation-aware training, and when is it necessary?</summary>
+<div class="answer">
+<p>Post-training quantisation (PTQ) quantises a trained model using a small calibration set (GPTQ, AWQ, SmoothQuant, FP8 scaling). Quantisation-aware training (QAT) instead simulates quantisation during training or fine-tuning: the forward pass uses quantised weights (and possibly activations), and gradients flow through the rounding with a straight-through estimator (treating rounding as identity in the backward pass), so the network learns weights that are robust to the grid. It costs training compute and data, but recovers accuracy that PTQ cannot, and is increasingly necessary at 4 bits for weights and activations (FP4 on Blackwell) or below. Model providers increasingly release QAT checkpoints (for example 4-bit variants of open models), and some models are trained natively in low precision (DeepSeek-V3 in FP8, gpt-oss MoE weights released in MXFP4).</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-llmint8">T. Dettmers, M. Lewis, Y. Belkada, L. Zettlemoyer. LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale. <em>NeurIPS</em>, 2022. <a href="https://arxiv.org/abs/2208.07339">arXiv:2208.07339</a>.</li>
+<li id="r-fp8">P. Micikevicius et al. FP8 Formats for Deep Learning. 2022. <a href="https://arxiv.org/abs/2209.05433">arXiv:2209.05433</a>.</li>
+<li id="r-mx">Open Compute Project. OCP Microscaling Formats (MX) Specification v1.0. 2023; B. D. Rouhani et al. Microscaling Data Formats for Deep Learning. 2023. <a href="https://arxiv.org/abs/2310.10537">arXiv:2310.10537</a>.</li>
+<li id="r-smoothquant">G. Xiao, J. Lin, M. Seznec, H. Wu, J. Demouth, S. Han. SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models. <em>ICML</em>, 2023. <a href="https://arxiv.org/abs/2211.10438">arXiv:2211.10438</a>.</li>
+<li id="r-gptq">E. Frantar, S. Ashkboos, T. Hoefler, D. Alistarh. GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers. <em>ICLR</em>, 2023. <a href="https://arxiv.org/abs/2210.17323">arXiv:2210.17323</a>.</li>
+<li id="r-awq">J. Lin et al. AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration. <em>MLSys</em>, 2024. <a href="https://arxiv.org/abs/2306.00978">arXiv:2306.00978</a>.</li>
+<li id="r-marlin">E. Frantar, R. L. Castro, J. Chen, T. Hoefler, D. Alistarh. MARLIN: Mixed-Precision Auto-Regressive Parallel Inference on Large Language Models. 2024. <a href="https://arxiv.org/abs/2408.11743">arXiv:2408.11743</a>.</li>
+<li id="r-quarot">S. Ashkboos et al. QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs. <em>NeurIPS</em>, 2024. <a href="https://arxiv.org/abs/2404.00456">arXiv:2404.00456</a>.</li>
+<li id="r-spinquant">Z. Liu et al. SpinQuant: LLM Quantization with Learned Rotations. 2024. <a href="https://arxiv.org/abs/2405.16406">arXiv:2405.16406</a>.</li>
+<li id="r-kurtic">E. Kurtic et al. "Give Me BF16 or Give Me Death"? Accuracy-Performance Trade-Offs in LLM Quantization. 2024. <a href="https://arxiv.org/abs/2411.02355">arXiv:2411.02355</a>.</li>
+<li id="r-dsv3">DeepSeek-AI. DeepSeek-V3 Technical Report (§3.3, FP8 training). 2024. <a href="https://arxiv.org/abs/2412.19437">arXiv:2412.19437</a>.</li>
+<li>B. Hassibi, D. G. Stork. Second Order Derivatives for Network Pruning: Optimal Brain Surgeon. <em>NeurIPS</em>, 1992.</li>
+<li>L. Babai. On Lovász' Lattice Reduction and the Nearest Lattice Point Problem. <em>Combinatorica</em> 6, 1986.</li>
+<li>T. Dettmers, A. Pagnoni, A. Holtzman, L. Zettlemoyer. QLoRA: Efficient Finetuning of Quantized LLMs. 2023. <a href="https://arxiv.org/abs/2305.14314">arXiv:2305.14314</a>.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

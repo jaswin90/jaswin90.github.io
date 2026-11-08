@@ -1,0 +1,18 @@
+/* Homepage and library pages; builds on site.css (the books' shared stylesheet). */
+body { background: var(--bg); }
+main.site { max-width: 60rem; margin: 0 auto; padding: 1rem 16px 3rem; }
+.site h1 { font-size: clamp(2rem, 6vw, 3.2rem); margin: .4rem 0; }
+.site h2 { margin-top: 2.2rem; }
+.hero { padding: 1.5rem 0 .5rem; }
+.hero .sub { font-size: 1.2rem; color: var(--fg-2); max-width: 44rem; }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr)); gap: 1rem; margin-top: 1rem; }
+.card { display: block; padding: 1rem 1.1rem; border: 1px solid var(--border); border-radius: 12px; color: var(--fg); text-decoration: none; background: var(--bg); }
+.card:hover { border-color: var(--accent); }
+.card h3 { margin: 0 0 .4rem; color: var(--accent); }
+.card p { margin: .3rem 0; }
+.crumbs a { color: var(--fg-2); }
+.account { border: 1px solid var(--border); border-radius: 12px; padding: .2rem 1.1rem 1rem; margin-top: 1.5rem; }
+.account h2 { margin-top: .8rem; border: 0; padding: 0; }
+.lib-progress { padding-left: 1.2rem; }
+.topbar nav a[aria-current="page"] { color: var(--accent); }
+.site-foot { max-width: 60rem; margin: 0 auto; padding: 1rem 16px 2rem; border-top: 1px solid var(--border); }

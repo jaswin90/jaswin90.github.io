@@ -1,0 +1,598 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 25 · Reinforcement Learning with Verifiable Rewards — Introduction to LLM Engineering</title>
+<meta name="description" content="Chapter 25 of Introduction to LLM Engineering: verifiable rewards, when groups of samples carry signal, GRPO derived and related to RLOO, the Dr. GRPO and DAPO fixes, entropy collapse, outcome versus process rewards, what RLVR teaches (DeepSeek-R1, pass@k, distillation) and the rollout systems that make it affordable.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script defer src="/library/assets/book-shim.js" data-library="/library/" data-field="/library/AI_Engineering/" data-field-title="AI Engineering"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-chapter="ch30" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Part VIII · Post-Training and Reasoning — Chapter 25</div>
+<h1 id="top">Reinforcement Learning with Verifiable Rewards</h1>
+<p class="lede">When the answer to a problem can be checked, the reward needs no human and no reward model: it is simply right or wrong. Reinforcement learning with such rewards produced the reasoning models of 2025. This chapter derives GRPO, the critic-free algorithm behind DeepSeek-R1, from the baselines of Chapter 23, examines the flaws that later work found and fixed in it, compares outcome and process rewards, and shows why training on verifiable rewards is, above all, a problem of generating very long responses efficiently.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Chapter 24 ended with the weakness shared by every preference method: its reward is a model of human judgement, accurate about 70% of the time and exploitable when optimised hard. Some tasks need no such model. A mathematics problem with a numerical answer can be checked by comparing the model's final answer with the reference. A programming problem can be checked by running unit tests. A logic puzzle can be checked by a solver, an instruction such as "answer in exactly three bullet points" by a parser. For these tasks the reward is <em>verifiable</em>: computed by a program, essentially free of noise, and very hard to fool if the checker is sound.</p>
+<p>The idea of training on checked answers is older than reasoning models. STaR (2022) fine-tuned models<span class="cite"><a href="#r-star">[5]</a></span> on their own correct rationales, which is REINFORCE with a 0/1 reward (§23.2). OpenAI's "Let's verify step by step" (2023)<span class="cite"><a href="#r-prm">[6]</a></span> studied rewards on intermediate steps. The turning point came in three steps. In February 2024, DeepSeekMath introduced <strong>GRPO</strong><span class="cite"><a href="#r-dsmath">[1]</a></span>, a variant of PPO without a critic, which estimates baselines from groups of samples. In September 2024, OpenAI's o1 showed<span class="cite"><a href="#r-o1">[3]</a></span> that large-scale RL on verifiable problems produced a model whose accuracy grew with how long it thought. In January 2025, DeepSeek-R1 reproduced the result openly<span class="cite"><a href="#r-r1">[2]</a></span> and showed, with R1-Zero, that RL with only an accuracy reward and a format reward, applied directly to a base model, made the model learn to reason at length, check its work and backtrack, with no human demonstrations of reasoning at all. AI2's Tülu 3 (November 2024) named the approach<span class="cite"><a href="#r-tulu3">[4]</a></span> <strong>reinforcement learning with verifiable rewards</strong> (RLVR), and within months the open literature had produced a series of corrections to GRPO, of which Dr. GRPO and DAPO are the best known.</p>
+<p>This chapter completes the training side of Part VIII. For the inference engineer it has a particular significance: an RLVR step generates many long samples per prompt, and generation is more than half of its cost. The algorithms are short; the systems that run them are among the largest inference deployments that exist.</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Describe verifiable rewards for mathematics, code and instruction following, their failure modes, and the format reward of R1-Zero.</li>
+<li>Compute when a group of samples carries learning signal, as a function of the pass rate and group size, and explain dynamic sampling and curricula.</li>
+<li>Derive GRPO's group-relative advantage from REINFORCE with a baseline, prove its relation to RLOO, and write the full GRPO objective.</li>
+<li>Explain the length and difficulty biases identified by Dr. GRPO, and DAPO's clip-higher, dynamic sampling, token-level loss and overlong shaping.</li>
+<li>Compare outcome and process reward models, and explain why large-scale RLVR has mostly used outcome rewards.</li>
+<li>Summarise what RLVR changes in a model (pass@1 versus pass@\(k\), length growth, entropy collapse) and the role of distillation.</li>
+<li>Estimate the rollout and training time of an RLVR step, and explain the systems techniques that keep GPUs busy: length caps, over-sampling, partial and asynchronous rollouts.</li>
+</ol>
+<p class="small muted">Uses: Chapter 23 (§23.3 baselines, §23.6 PPO, §23.8 sampler mismatch), Chapter 24, and Chapters 3 and 11 for decode costs. Symbols: <a href="../notation.html">notation page</a>.</p>
+</div>
+
+<h2 id="s25-1">25.1 Rewards that can be checked</h2>
+<p>A verifiable reward is a function \(\mathcal R(x,y)\) computed by a program from the prompt, the response and, usually, a reference answer or test suite. The commonest kinds are three. For <strong>mathematics</strong>, the checker extracts the final answer from the response, conventionally from a delimited box, and tests it for equivalence with the reference. Equivalence is harder than it sounds, since \(\tfrac12\), \(0.5\) and \(\frac{2}{4}\) must all match, so checkers normalise expressions and often test symbolic equality with a computer-algebra system. For <strong>code</strong>, the checker runs the program against unit tests in a sandbox and rewards passing all of them, or a fraction. For <strong>instruction following</strong>, it checks verifiable constraints such as length limits, required keywords or output formats. DeepSeek-R1-Zero added a <strong>format reward</strong> for placing the reasoning between thinking tags and the answer after them, so that the answer could be extracted reliably.</p>
+<p>These rewards have three properties that make them unlike those of Chapter 24. They are <strong>binary or nearly so</strong>: a response is right or wrong. They are <strong>low-noise</strong>: a sound checker does not disagree with itself, so optimising harder does not run into Goodhart's law in the way a learned reward does. And they are <strong>sparse</strong>: a response of ten thousand tokens earns a single bit. DeepSeek deliberately avoided neural reward models for R1-Zero, reporting that they were vulnerable to reward hacking at scale, while rule-based rewards were not.</p>
+<p>"Hard to fool" is not "impossible to fool". A mathematics checker that accepts any response containing the right number can be gamed by listing many numbers. Weak unit tests reward programs that special-case the visible inputs. Models trained on code have learned to modify tests or exit early with a success code when the sandbox allowed it. Verifiable rewards move the burden of alignment from modelling human judgement to writing sound checkers, which is easier but still engineering. Verification also has a cost of its own. Checking a mathematical answer takes microseconds, but running a program against its tests in an isolated sandbox takes from a fraction of a second to many seconds, so a code-RL step with thousands of rollouts needs a fleet of CPU workers, pipelined with generation so that the GPUs never wait for verdicts. Figure 25.1 shows the loop.</p>
+
+<figure class="diagram" id="fig-25-1">
+<svg class="dg" viewBox="0 0 720 240" role="img" aria-label="RLVR loop: prompts with references, a group of samples per prompt, a programmatic verifier, group-relative advantages and a policy update">
+<text x="20" y="22" class="t-b">One RLVR step</text>
+<rect x="20" y="44" width="150" height="70" rx="8" class="bx"/><text x="95" y="66" text-anchor="middle" class="t-sm t-b">prompts</text><text x="95" y="84" text-anchor="middle" class="t-xs">with reference answers</text><text x="95" y="99" text-anchor="middle" class="t-xs">or unit tests</text>
+<rect x="200" y="44" width="170" height="70" rx="8" class="bx3"/><text x="285" y="66" text-anchor="middle" class="t-sm t-b">generate a group</text><text x="285" y="84" text-anchor="middle" class="t-xs">n_s samples per prompt</text><text x="285" y="99" text-anchor="middle" class="t-xs">(inference engine)</text>
+<rect x="400" y="44" width="140" height="70" rx="8" class="bx4"/><text x="470" y="66" text-anchor="middle" class="t-sm t-b">verify</text><text x="470" y="84" text-anchor="middle" class="t-xs">answer match, tests,</text><text x="470" y="99" text-anchor="middle" class="t-xs">format → 𝓡 ∈ {0, 1}</text>
+<rect x="570" y="44" width="130" height="70" rx="8" class="bx2"/><text x="635" y="66" text-anchor="middle" class="t-sm t-b">update</text><text x="635" y="84" text-anchor="middle" class="t-xs">group-relative</text><text x="635" y="99" text-anchor="middle" class="t-xs">advantages, clip</text>
+<line x1="170" y1="79" x2="198" y2="79" class="ln-acc"/><line x1="370" y1="79" x2="398" y2="79" class="ln-acc"/><line x1="540" y1="79" x2="568" y2="79" class="ln-acc"/>
+<path d="M635,114 C635,150 285,150 285,116" class="ln dash" fill="none"/><text x="460" y="160" text-anchor="middle" class="t-xs">new weights to the generator</text>
+<rect x="20" y="180" width="680" height="44" rx="6" class="fill-muted" opacity=".25"/>
+<text x="360" y="198" text-anchor="middle" class="t-xs">no reward model, no critic: the models held are the policy (trained) and, if a KL term is used, a frozen reference</text>
+<text x="360" y="214" text-anchor="middle" class="t-xs">the verifier is a CPU service (sandboxes for code), and the generator is a fleet of inference engines</text>
+</svg>
+<figcaption><b>Figure 25.1 — The RLVR loop.</b> A program replaces the reward model of Chapter 24, and the group of samples per prompt replaces the critic of Chapter 23. What remains expensive is the generation in the second box.</figcaption>
+</figure>
+
+<p>Figure 25.1 shows how much of the machinery of the previous two chapters has disappeared. There is no reward model, because a program scores the responses, and no critic, because, as §25.3 will show, the samples of each group serve as one another's baseline. What has grown is the second box. Each prompt is answered not once but \(n_s\) times, typically 8 to 64, and each answer may be thousands of tokens long.</p>
+
+<h2 id="s25-2">25.2 When does a group carry signal?</h2>
+<p>With a binary reward, learning comes only from contrast. If all \(n_s\) samples for a prompt are correct, or all are wrong, every sample's reward equals the group's mean, every advantage is zero, and the prompt contributes no gradient, however much it cost to generate. The useful prompts are those on which the model sometimes succeeds. If the model solves a prompt with probability \(p_s\) and samples are independent, the probability that a group of \(n_s\) is <strong>informative</strong>, containing at least one success and at least one failure, is</p>
+\[ P_{\text{info}}(p_s,n_s)\;=\;1-p_s^{\,n_s}-(1-p_s)^{n_s}. \]
+<p>Figure 25.2 plots it. For prompts of intermediate difficulty almost every group is informative. For a prompt the model solves 2% of the time, a group of 8 is informative only 15% of the time; for one it solves 98% of the time, likewise. Larger groups widen the useful band, at proportional generation cost.</p>
+
+<figure class="chart" id="fig-25-2">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Probability that a group contains both a success and a failure","height":320,
+ "x":{"label":"Pass rate of the prompt, p_s","min":0,"max":1,"fmt":"pct","ticks":[0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1]},
+ "y":{"label":"P(informative group)","min":0,"max":1,"fmt":"pct","ticks":[0,0.2,0.4,0.6,0.8,1]},
+ "series":[
+  {"name":"n_s = 4","color":"s2","points":[[0,0],[0.02,0.078],[0.05,0.186],[0.1,0.344],[0.2,0.589],[0.3,0.752],[0.5,0.875],[0.7,0.752],[0.8,0.589],[0.9,0.344],[0.95,0.186],[0.98,0.078],[1,0]]},
+  {"name":"n_s = 8","color":"s1","points":[[0,0],[0.02,0.149],[0.05,0.337],[0.1,0.570],[0.2,0.832],[0.3,0.942],[0.5,0.992],[0.7,0.942],[0.8,0.832],[0.9,0.570],[0.95,0.337],[0.98,0.149],[1,0]]},
+  {"name":"n_s = 16","color":"s3","points":[[0,0],[0.02,0.276],[0.05,0.560],[0.1,0.815],[0.2,0.972],[0.3,0.997],[0.5,1],[0.7,0.997],[0.8,0.972],[0.9,0.815],[0.95,0.560],[0.98,0.276],[1,0]]}
+ ]}
+</script>
+<figcaption><b>Figure 25.2 — Only mixed groups teach.</b> \(P_{\text{info}}=1-p_s^{n_s}-(1-p_s)^{n_s}\). Prompts that are almost always solved, or almost never, waste their generation budget; larger groups rescue harder and easier prompts at proportional cost.</figcaption>
+</figure>
+
+<p>Figure 25.2 has three practical consequences. First, <strong>data selection</strong> matters more in RLVR than in most training: a dataset of prompts the model already solves, or cannot begin to solve, produces almost no gradient. Practitioners estimate each prompt's pass rate with the current model and keep those in a middle band. Second, the useful band <em>moves</em> as the model improves, so the prompt mix must be refreshed, a curriculum in which easy problems are retired and hard ones become reachable. Third, within a training step, groups that turn out to be uninformative can be detected after generation and replaced, which is the dynamic sampling of §25.4. Even the strength of the signal from an informative group depends on \(p_s\): the variance of a Bernoulli reward is \(p_s(1-p_s)\), largest at \(p_s=\tfrac12\), and it is this variance that the group baseline converts into gradient.</p>
+
+<details class="drill">
+<summary>Drill 25.1 — How many samples to rescue hard prompts?</summary>
+<p>A model solves a class of hard prompts with probability 3%. How large must the group be for at least half of the groups to be informative? What does that cost relative to \(n_s=8\)?</p>
+<p><em>Solution.</em> For small \(p_s\), \(P_{\text{info}}\approx1-(1-p_s)^{n_s}\). Setting \((0.97)^{n_s}\le0.5\) gives \(n_s\ge\ln0.5/\ln0.97\approx22.8\), so 23 samples, nearly three times the generation of \(n_s=8\), whose groups are informative only \(1-0.97^8\approx22\%\) of the time. Per informative group, though, the costs are \(23/0.5=46\) samples against \(8/0.22\approx37\): larger groups for hard prompts buy reliability more than efficiency. A cheaper alternative is to raise the pass rate first, by distillation or SFT on related solutions, so that the prompts move into the band where small groups suffice.</p>
+</details>
+
+<h2 id="s25-3">25.3 GRPO</h2>
+<p>We now derive GRPO from the policy gradient of Chapter 23. For a prompt \(x\), draw a group of responses \(y_1,\dots,y_{n_s}\) from \(p_{\theta_{\text{old}}}\) and score them \(\mathcal R_1,\dots,\mathcal R_{n_s}\). §23.3 showed that any baseline independent of the sampled response leaves the gradient unbiased, and that the ideal one is the policy's expected reward on the prompt. The group provides an estimate of it for free. The cleanest choice is the <strong>leave-one-out</strong> mean, used by RLOO (Ahmadian et al., 2024)<span class="cite"><a href="#r-rloo">[8]</a></span>: response \(i\)'s baseline is the mean reward of the <em>other</em> responses,</p>
+\[ \hat A_i^{\text{RLOO}}\;=\;\mathcal R_i-\frac{1}{n_s-1}\sum_{j\ne i}\mathcal R_j, \]
+<p>which is independent of \(y_i\) because the samples are independent, so the estimator is exactly unbiased. GRPO (Shao et al., 2024) instead subtracts the mean of the whole group, including \(\mathcal R_i\), and divides by the group's standard deviation:</p>
+\[ \hat A_i^{\text{GRPO}}\;=\;\frac{\mathcal R_i-\bar{\mathcal R}}{\operatorname{std}(\mathcal R_{1:n_s})+\epsilon},\qquad \bar{\mathcal R}=\frac1{n_s}\sum_j\mathcal R_j. \]
+<p>The two are closely related. A line of algebra shows that \(\mathcal R_i-\bar{\mathcal R}=\frac{n_s-1}{n_s}\big(\mathcal R_i-\frac1{n_s-1}\sum_{j\ne i}\mathcal R_j\big)\), so subtracting the full mean is RLOO scaled by \((n_s-1)/n_s\): the numerator of GRPO's advantage is unbiased up to a constant factor. The division by the standard deviation is different in kind. It rescales each prompt's advantages to unit variance, so that a prompt whose samples barely differ gets advantages as large as one whose samples differ greatly. This is a reweighting of prompts, and §25.4 discusses what it does.</p>
+<p>GRPO then plugs the advantage into PPO's clipped surrogate (§23.6), giving every token of response \(i\) the same advantage \(\hat A_i\), and adds the \(k_3\) estimate of KL to the reference (§23.5) directly to the loss rather than to the reward. With \(n_{y,i}\) the length of response \(i\) and \(\varrho_{i,t}\) the ratio of new to old probability of its \(t\)-th token, the objective to maximise is</p>
+\[ J_{\text{GRPO}}(\theta)=\mathbb E\Bigg[\frac1{n_s}\sum_{i=1}^{n_s}\frac1{n_{y,i}}\sum_{t=1}^{n_{y,i}}\Big(\min\big(\varrho_{i,t}\hat A_i,\;\operatorname{clip}(\varrho_{i,t},1\pm\epsilon_{\text{clip}})\hat A_i\big)-\beta_{\text{KL}}\,k_{3,i,t}\Big)\Bigg]. \]
+<p>Compared with PPO for language models, this removes the critic and the reward model: the models held are the policy, with its training state (\(16N\) bytes), and the frozen reference (\(2N\)), about half of PPO's \(36N\). The price is \(n_s\) samples per prompt, but those were wanted anyway, both because a group is what makes a binary reward informative (§25.2) and because an inference engine generates samples of the same prompt cheaply, sharing the prompt's KV cache across them (§10.6). Figure 25.3 shows the advantages for one group.</p>
+
+<figure class="diagram" id="fig-25-3">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-label="A group of eight samples with three correct, their rewards and GRPO and RLOO advantages">
+<text x="20" y="22" class="t-b">Group-relative advantages for one prompt (n_s = 8, three correct)</text>
+<text x="20" y="54" class="t-xs">sample</text><text x="20" y="84" class="t-xs">reward</text><text x="20" y="128" class="t-xs">GRPO Â</text><text x="20" y="190" class="t-xs">RLOO Â</text>
+<g>
+<rect x="100" y="40" width="64" height="24" rx="4" class="bx3"/><text x="132" y="57" text-anchor="middle" class="t-xs">y₁ ✓</text>
+<rect x="172" y="40" width="64" height="24" rx="4" class="bx2"/><text x="204" y="57" text-anchor="middle" class="t-xs">y₂ ✗</text>
+<rect x="244" y="40" width="64" height="24" rx="4" class="bx3"/><text x="276" y="57" text-anchor="middle" class="t-xs">y₃ ✓</text>
+<rect x="316" y="40" width="64" height="24" rx="4" class="bx2"/><text x="348" y="57" text-anchor="middle" class="t-xs">y₄ ✗</text>
+<rect x="388" y="40" width="64" height="24" rx="4" class="bx2"/><text x="420" y="57" text-anchor="middle" class="t-xs">y₅ ✗</text>
+<rect x="460" y="40" width="64" height="24" rx="4" class="bx3"/><text x="492" y="57" text-anchor="middle" class="t-xs">y₆ ✓</text>
+<rect x="532" y="40" width="64" height="24" rx="4" class="bx2"/><text x="564" y="57" text-anchor="middle" class="t-xs">y₇ ✗</text>
+<rect x="604" y="40" width="64" height="24" rx="4" class="bx2"/><text x="636" y="57" text-anchor="middle" class="t-xs">y₈ ✗</text>
+</g>
+<text x="132" y="84" text-anchor="middle" class="t-xs">1</text><text x="204" y="84" text-anchor="middle" class="t-xs">0</text><text x="276" y="84" text-anchor="middle" class="t-xs">1</text><text x="348" y="84" text-anchor="middle" class="t-xs">0</text><text x="420" y="84" text-anchor="middle" class="t-xs">0</text><text x="492" y="84" text-anchor="middle" class="t-xs">1</text><text x="564" y="84" text-anchor="middle" class="t-xs">0</text><text x="636" y="84" text-anchor="middle" class="t-xs">0</text>
+<line x1="100" y1="128" x2="670" y2="128" class="ln dash"/>
+<rect x="120" y="102" width="24" height="26" class="fill-s3"/><rect x="264" y="102" width="24" height="26" class="fill-s3"/><rect x="480" y="102" width="24" height="26" class="fill-s3"/>
+<rect x="192" y="128" width="24" height="16" class="fill-s2"/><rect x="336" y="128" width="24" height="16" class="fill-s2"/><rect x="408" y="128" width="24" height="16" class="fill-s2"/><rect x="552" y="128" width="24" height="16" class="fill-s2"/><rect x="624" y="128" width="24" height="16" class="fill-s2"/>
+<text x="132" y="98" text-anchor="middle" class="t-xs">+1.29</text><text x="204" y="158" text-anchor="middle" class="t-xs">−0.77</text>
+<line x1="100" y1="190" x2="670" y2="190" class="ln dash"/>
+<rect x="120" y="176" width="24" height="14" class="fill-s3"/><rect x="264" y="176" width="24" height="14" class="fill-s3"/><rect x="480" y="176" width="24" height="14" class="fill-s3"/>
+<rect x="192" y="190" width="24" height="9" class="fill-s2"/><rect x="336" y="190" width="24" height="9" class="fill-s2"/><rect x="408" y="190" width="24" height="9" class="fill-s2"/><rect x="552" y="190" width="24" height="9" class="fill-s2"/><rect x="624" y="190" width="24" height="9" class="fill-s2"/>
+<text x="132" y="172" text-anchor="middle" class="t-xs">+0.71</text><text x="204" y="212" text-anchor="middle" class="t-xs">−0.43</text>
+<text x="420" y="224" text-anchor="middle" class="t-xs">every token of a response receives its response's advantage</text>
+</svg>
+<figcaption><b>Figure 25.3 — Advantages from a group.</b> With three of eight samples correct, GRPO gives correct samples \(+1.29\) and wrong ones \(-0.77\) (mean subtracted, divided by the standard deviation 0.48); RLOO gives \(+0.71\) and \(-0.43\). Both sum to zero over the group, and they differ by the factor \((n_s-1)/(n_s\,\mathrm{std})\).</figcaption>
+</figure>
+
+<div class="box example">
+<div class="box-title">Worked example — the advantages of Figure 25.3</div>
+<p><strong>Rewards.</strong> Three correct, five wrong: \(\bar{\mathcal R}=3/8=0.375\), and the population standard deviation of a 0/1 variable with mean 0.375 is \(\sqrt{0.375\times0.625}\approx0.484\).</p>
+<p><strong>GRPO.</strong> Correct: \((1-0.375)/0.484\approx1.29\). Wrong: \(-0.375/0.484\approx-0.77\). Check: \(3\times1.29-5\times0.77\approx0\).</p>
+<p><strong>RLOO.</strong> Correct: \(1-2/7\approx0.714\) (two of the other seven are correct). Wrong: \(0-3/7\approx-0.429\). Mean-subtracted without the standard deviation gives \(0.625\) and \(-0.375\), exactly \(7/8\) of RLOO's values.</p>
+<p><strong>What changes with difficulty.</strong> If only one of eight were correct, GRPO would give the correct sample \((1-0.125)/0.331\approx2.65\): rare successes on hard prompts get large advantages, because the standard deviation is small. RLOO would give \(1-0=1\). That amplification is the difficulty weighting §25.4 examines.</p>
+</div>
+
+<details class="drill">
+<summary>Drill 25.2 — Mean-subtracted advantages and leave-one-out</summary>
+<p>Prove that \(\mathcal R_i-\bar{\mathcal R}=\frac{n_s-1}{n_s}\Big(\mathcal R_i-\frac{1}{n_s-1}\sum_{j\ne i}\mathcal R_j\Big)\), and explain why subtracting \(\bar{\mathcal R}\), which depends on \(\mathcal R_i\), nevertheless gives a gradient that is unbiased up to scale.</p>
+<p><em>Solution.</em> Write \(S_{-i}=\sum_{j\ne i}\mathcal R_j\). Then \(\bar{\mathcal R}=(\mathcal R_i+S_{-i})/n_s\), and \(\mathcal R_i-\bar{\mathcal R}=\frac{(n_s-1)\mathcal R_i-S_{-i}}{n_s}=\frac{n_s-1}{n_s}\big(\mathcal R_i-\frac{S_{-i}}{n_s-1}\big)\). The bracket is the RLOO advantage, whose baseline \(S_{-i}/(n_s-1)\) is independent of \(y_i\), so its expected product with \(\nabla\log p_\theta(y_i)\) is the unbiased policy gradient (§23.3). Multiplying by the constant \((n_s-1)/n_s\) only rescales the gradient, which the learning rate absorbs. The division by the standard deviation is not a constant, since it depends on all the rewards, including \(\mathcal R_i\), and it does change the expected gradient.</p>
+</details>
+
+<h2 id="s25-4">25.4 What GRPO gets wrong: Dr. GRPO and DAPO</h2>
+<p>GRPO worked well enough to train DeepSeek-R1, and its success invited scrutiny. Two papers of March 2025 found biases in its objective and proposed fixes that are now standard. Liu et al.'s <strong>Dr. GRPO</strong><span class="cite"><a href="#r-drgrpo">[9]</a></span> ("GRPO done right") identified two biases, one from each normalisation in the objective of §25.3.</p>
+<p>The first is a <strong>length bias</strong>. GRPO averages each response's token terms with the factor \(1/n_{y,i}\), so every response contributes the same total weight to the gradient, however long it is. For a correct response with positive advantage, this means each token of a short answer is pushed up more strongly than each token of a long one: brevity is favoured among correct responses. For a wrong response with negative advantage, it means a long wrong answer is penalised, in total, no more than a short one, and each of its tokens is penalised less: among wrong responses, length is the cheapest way to dilute the penalty. The asymmetry rewards models for making their wrong answers longer, and Liu et al. argued that part of the dramatic growth in response length during R1-Zero-style training is an artefact of this normalisation rather than a sign of better reasoning. Figure 25.4 shows the effect.</p>
+
+<figure class="chart" id="fig-25-4">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Total gradient weight on one wrong response (|Â| = 0.77) against its length","height":320,
+ "x":{"label":"Response length n_y (tokens, log)","log":true,"min":500,"max":16000,"ticks":[500,1000,2000,4000,8000,16000]},
+ "y":{"label":"Total penalty weight on the response","min":0,"max":3.2,"ticks":[0,0.5,1,1.5,2,2.5,3]},
+ "series":[
+  {"name":"GRPO: per-response average (1/n_y)","color":"s2","points":[[500,0.77],[1000,0.77],[2000,0.77],[4000,0.77],[8000,0.77],[16000,0.77]]},
+  {"name":"Dr. GRPO / DAPO: constant per-token weight (normaliser 4,000)","color":"s1","points":[[500,0.096],[1000,0.193],[2000,0.385],[4000,0.77],[8000,1.54],[16000,3.08]]}
+ ]}
+</script>
+<figcaption><b>Figure 25.4 — Length normalisation and wrong answers.</b> Under GRPO's per-response averaging, a wrong answer of 16,000 tokens costs the model no more than one of 500, so each of its tokens is penalised 32 times less. Weighting every token equally makes the penalty grow with the length of the mistake.</figcaption>
+</figure>
+
+<p>Figure 25.4 makes the argument quantitative. With GRPO's normalisation the total penalty is flat in length; with a constant per-token weight, as Dr. GRPO and DAPO use, it grows in proportion to length, so that rambling wrong answers are discouraged rather than tolerated. The second bias is a <strong>difficulty bias</strong> from the division by the standard deviation. A prompt on which the group almost agrees, nearly all right or nearly all wrong, has a small standard deviation and therefore large advantages (the 2.65 of the worked example in §25.3), so very easy and very hard prompts are up-weighted relative to prompts of intermediate difficulty. Dr. GRPO removes both normalisations, using the mean-subtracted reward as the advantage and a constant normaliser for the token sum, and reported comparable accuracy with markedly shorter, more efficient responses.</p>
+<div class="box bridge">
+<div class="box-title">For the mathematician — which objective does GRPO optimise?</div>
+<p>Take one prompt with pass rate \(p=p_\theta(x)\) and a binary reward. With a mean baseline, the expected update is proportional to \(\nabla_\theta p\), the gradient of the expected reward, as it should be. GRPO divides by the group's standard deviation, which for large groups concentrates at \(\sqrt{p(1-p)}\), so its expected update is approximately \(\nabla_\theta p/\sqrt{p(1-p)}\). Since</p>
+\[ \frac{\mathrm d}{\mathrm dp}\,2\arcsin\sqrt p\;=\;\frac{1}{\sqrt{p(1-p)}}, \]
+<p>this is the gradient of \(2\arcsin\sqrt{p}\). Summed over prompts, GRPO therefore ascends \(\sum_x2\arcsin\sqrt{p_\theta(x)}\) rather than the mean pass rate \(\sum_xp_\theta(x)\). Statisticians will recognise the arcsine square-root transform, the variance-stabilising transformation of a binomial proportion. Its derivative is unbounded at \(p=0\) and \(p=1\), which is the difficulty bias stated precisely: an improvement from 1% to 2% on a hard prompt is worth as much as one from 50% to 54% on a medium one, although it adds only a quarter as much expected reward. Whether that weighting is desirable is a modelling choice. It does favour pushing nearly solved prompts to certainty and lifting nearly unsolved ones off zero, but it is not the expected-reward objective, and Dr. GRPO's removal of the normalisation restores the latter.</p>
+</div>
+
+<p>Yu et al.'s <strong>DAPO</strong><span class="cite"><a href="#r-dapo">[10]</a></span> (Decoupled clip and Dynamic sAmpling Policy Optimisation), from ByteDance and Tsinghua, attacked the problems that made long RLVR runs unstable, with four changes. <strong>Clip-higher</strong> decouples the clipping range into \(\epsilon_{\text{low}}=0.2\) and \(\epsilon_{\text{high}}=0.28\), letting low-probability tokens with positive advantage grow further before they are clipped. With symmetric clipping, a token at probability 0.01 can rise only to 0.012 per update, so exploratory tokens cannot gain ground, and the policy's entropy collapses. <strong>Dynamic sampling</strong> discards groups whose samples are all correct or all wrong (zero advantage, §25.2) and keeps sampling until the batch is full of informative groups, so that the effective batch size does not shrink as the model improves. A <strong>token-level loss</strong> averages over all tokens in the batch, the length fix of Figure 25.4. <strong>Overlong reward shaping</strong> handles responses cut off at the maximum length, which would otherwise be labelled wrong for reasons unrelated to their content: they are masked from the loss or given a soft penalty that grows as the length approaches the limit. DAPO also dropped the KL penalty, arguing that for verifiable rewards the policy should be allowed to move far from its starting point. With these changes it reported 50 points on AIME 2024 from the Qwen2.5-32B base model, above DeepSeek's R1-Zero-style result on the same base model, in half the training steps.</p>
+<p>A common thread runs through these fixes: <strong>entropy</strong>. RL on verifiable rewards sharpens the policy, concentrating probability on the reasoning paths that succeed, and the entropy of the token distribution falls rapidly early in training<span class="cite"><a href="#r-entropy">[15]</a></span>. Once it has collapsed, the samples in a group become nearly identical, groups stop being informative, and learning stalls. Clip-higher, dynamic sampling, higher sampling temperatures (with the care of §23.8) and explicit entropy bonuses are all ways of keeping enough diversity in the samples for the group baseline to work.</p>
+
+<h2 id="s25-5">25.5 Outcome rewards and process rewards</h2>
+<p>A verifier judges the final answer: it is an <strong>outcome reward</strong>. Over a long solution, the credit-assignment problem of §23.1 becomes severe: one bit at the end of ten thousand tokens says nothing about which steps were sound. A <strong>process reward model</strong> (PRM) instead scores each intermediate step, giving dense feedback. Lightman et al. (2023) trained both kinds<span class="cite"><a href="#r-prm">[6]</a></span> on mathematics: an outcome reward model on final-answer correctness, and a PRM on PRM800K, a dataset of 800,000 human labels of individual solution steps. Used to choose the best of many sampled solutions, the PRM solved 78% of a representative subset of the MATH benchmark against 72% for the outcome model, evidence that supervising the process helps. Math-Shepherd (Wang et al., 2023)<span class="cite"><a href="#r-shepherd">[7]</a></span> removed the human labels by estimating each step's quality automatically: from each intermediate step, roll out several completions and record how often they reach the correct answer, a Monte Carlo estimate of the step's value.</p>
+
+<figure class="diagram" id="fig-25-5">
+<svg class="dg" viewBox="0 0 720 236" role="img" aria-label="Outcome reward scores only the final answer; process reward scores every step; Monte Carlo rollouts estimate step values">
+<text x="20" y="22" class="t-b">One solution, two kinds of reward</text>
+<rect x="20" y="50" width="110" height="40" rx="6" class="bx"/><text x="75" y="74" text-anchor="middle" class="t-xs">step 1: set up</text>
+<rect x="150" y="50" width="110" height="40" rx="6" class="bx"/><text x="205" y="74" text-anchor="middle" class="t-xs">step 2: expand</text>
+<rect x="280" y="50" width="110" height="40" rx="6" class="bx2"/><text x="335" y="74" text-anchor="middle" class="t-xs">step 3: sign error</text>
+<rect x="410" y="50" width="110" height="40" rx="6" class="bx"/><text x="465" y="74" text-anchor="middle" class="t-xs">step 4: simplify</text>
+<rect x="540" y="50" width="160" height="40" rx="6" class="bx2"/><text x="620" y="74" text-anchor="middle" class="t-xs">answer: wrong</text>
+<line x1="130" y1="70" x2="148" y2="70" class="ln"/><line x1="260" y1="70" x2="278" y2="70" class="ln"/><line x1="390" y1="70" x2="408" y2="70" class="ln"/><line x1="520" y1="70" x2="538" y2="70" class="ln"/>
+<text x="20" y="116" class="t-sm t-b">outcome reward</text>
+<text x="620" y="136" text-anchor="middle" class="t-sm t-b">0</text>
+<text x="300" y="136" text-anchor="middle" class="t-xs">one bit, credited to every token equally</text>
+<text x="20" y="160" class="t-sm t-b">process reward</text>
+<text x="75" y="180" text-anchor="middle" class="t-sm">✓ 0.9</text><text x="205" y="180" text-anchor="middle" class="t-sm">✓ 0.8</text><text x="335" y="180" text-anchor="middle" class="t-sm t-b">✗ 0.1</text><text x="465" y="180" text-anchor="middle" class="t-sm">0.1</text><text x="620" y="180" text-anchor="middle" class="t-sm">0</text>
+<text x="20" y="210" class="t-xs">A step's process score can be learned from human labels (PRM800K), or estimated as the fraction of rollouts</text><text x="20" y="226" class="t-xs">from that step that end correctly (Math-Shepherd): a Monte Carlo value function.</text>
+</svg>
+<figcaption><b>Figure 25.5 — Outcome versus process supervision.</b> The outcome reward cannot tell the sound first two steps from the faulty third; a process reward localises the error. The price is a model that must judge partial solutions, with all the difficulty of the critic of §23.4.</figcaption>
+</figure>
+
+<p>Figure 25.5 shows why process rewards are attractive, and its caption hints at why the largest RLVR runs have nonetheless used outcome rewards. A PRM is a learned model of step quality, so it reintroduces exactly what verifiable rewards removed: a neural judge that can be wrong and can be exploited. A policy optimised against it learns to write steps that look correct to the PRM. The notion of a "step" is itself ill-defined in free-form reasoning. And scoring every step of every rollout adds substantial inference cost. DeepSeek reported in the R1 paper that its attempts to use PRMs and Monte Carlo tree search did not pay off at scale, and R1 was trained with outcome rewards alone. PRMs remain useful for selecting among samples at inference time and for analysing where solutions fail, and the Monte Carlo estimate of Math-Shepherd is, mathematically, the value function of Chapter 23 estimated by rollouts instead of a critic.</p>
+
+<h2 id="s25-6">25.6 What reinforcement learning teaches</h2>
+<p>The headline results of RLVR are striking. DeepSeek-R1-Zero, trained from the DeepSeek-V3 base model with GRPO and only accuracy and format rewards, raised its pass@1 on the AIME 2024 competition from 15.6% to 71.0%, and to 86.7% with majority voting over 64 samples. As training progressed, its responses grew from hundreds to many thousands of tokens without any reward for length, and the model began to re-examine its own steps mid-solution, the "aha moment" the authors highlighted. R1-Zero's outputs were hard to read, mixing languages, so DeepSeek-R1 added a small "cold start" of readable reasoning demonstrations before RL, then rounds of rejection-sampling SFT and RL across all task types. The same paper showed that <strong>distillation</strong> beats RL for small models: fine-tuning Qwen-32B on 800,000 samples from R1 produced a stronger reasoner than applying large-scale RL to Qwen-32B directly. Reasoning, once discovered by RL in a large model, is cheapest to transfer by SFT (§15.5).</p>
+<p>What exactly does RL add? Yue et al. (2025) measured pass@<span class="cite"><a href="#r-yue">[11]</a></span>\(k\), the probability that at least one of \(k\) samples is correct, for base models and their RLVR-trained versions across a range of \(k\). The RL-trained models were much better at small \(k\), but at large \(k\), in the hundreds, the base models caught up and often overtook them: problems that the RL model could solve were, almost always, problems the base model could already solve occasionally. Their interpretation, still debated, is that RLVR mainly <em>sharpens</em> the distribution, moving probability onto reasoning paths the base model already contained, rather than creating new ones, and that the entropy collapse of §25.4 narrows the set of problems solved at large \(k\). Distillation from a stronger teacher, by contrast, can add capabilities the student lacked.</p>
+<p>For inference engineers, the consequence is a model whose outputs are long and whose quality depends on how long it is allowed to think, which is the subject of Chapter 26. For the trainers of such models, the consequence is that the cost of RLVR is dominated by producing those long outputs during training, which is the subject of the last section.</p>
+
+<h2 id="s25-7">25.7 Rollout systems</h2>
+<p>An RLVR step generates \(n_s\) long responses for each of hundreds of prompts, verifies them, and trains on them. Two facts about the generation phase shape the systems built for it. First, response lengths vary enormously, from a few hundred tokens to the maximum allowed, so a batch that starts full empties gradually, and the GPUs spend the end of each step decoding a few stragglers at a small batch size and a small fraction of their capacity (Drill 26.2 estimates the effect for exponential lengths). Second, the generation engine and the trainer are different programs, whose weights must be synchronised after each update (§26.7) and whose numerics differ (§23.8).</p>
+
+<div class="box example">
+<div class="box-title">Worked example — one RLVR step for an 8B model on 64 H100s</div>
+<p><strong>Setup.</strong> 512 prompts, \(n_s=16\): 8,192 rollouts with mean length 4,000 tokens and a cap of 16,384, about \(3.3\times10^7\) generated tokens. Each H100 runs an 8B replica and decodes 128 rollouts.</p>
+<p><strong>Generation, ideal.</strong> At an average context of about 2,500 tokens, 128 sequences hold \(128\times2500\times128\) KiB ≈ 42 GB of cache; with 16 GB of weights a step reads about 58 GB, 22 ms at 80% of peak bandwidth, so a full GPU produces about 5,900 tokens per second. If every GPU stayed full, the \(3.3\times10^7\) tokens would take \(3.3\times10^7/(64\times5900)\approx87\) s.</p>
+<p><strong>Generation, real.</strong> With roughly exponential lengths, about 1.7% of rollouts (\(e^{-16384/4000}\)) reach the 16,384-token cap, so most GPUs hold at least one. Such a GPU must run 16,384 sequential decode steps; even averaging about 12 ms per step as its batch empties, that is about 200 s. The phase lasts about 200 s for 87 s of useful work: under 45% utilisation.</p>
+<p><strong>Training.</strong> A reference pass (\(2N\)) and one policy update with checkpointing (\(8N\)) over \(3.3\times10^7\) tokens: \(10\times8.03\times10^9\times3.3\times10^7\approx2.6\times10^{18}\) FLOPs, about 105 s at 40% MFU across 64 GPUs.</p>
+<p><strong>Consequence.</strong> The step takes about 300 s, two thirds of it generation, and more than half of the generation time is the long tail. Halving the decode time per token, or removing the tail, saves more than halving training time would.</p>
+</div>
+
+<p>The worked example shows where the engineering effort goes. Systems attack the tail from several directions. <strong>Length caps and curricula</strong> start training with a short maximum length and raise it as the model learns to use the space, so that early steps are cheap. <strong>Over-sampling with early termination</strong> launches more groups than needed and stops the phase when enough have finished, discarding or deferring the stragglers. <strong>Partial rollouts</strong>, used by Kimi k1.5<span class="cite"><a href="#r-kimi">[12]</a></span>, cap the tokens generated per step and carry unfinished responses over to the next step, continuing them with the updated policy. <strong>Asynchronous RL</strong> decouples the phases completely<span class="cite"><a href="#r-asyncrlhf">[14]</a></span>: a fleet of generators produces rollouts continuously with whatever weights they have, a trainer consumes them as they arrive, and new weights are pushed to the generators periodically. Figure 25.6 compares the synchronous and asynchronous timelines.</p>
+
+<figure class="diagram" id="fig-25-6">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="Synchronous RL alternates generation with a long tail and training; asynchronous RL overlaps generation and training with stale weights">
+<text x="20" y="22" class="t-b">Synchronous and asynchronous RL on the same GPUs' time</text>
+<text x="20" y="58" class="t-sm">synchronous</text>
+<rect x="130" y="44" width="150" height="24" class="fill-s3"/><text x="205" y="61" text-anchor="middle" class="t-xs t-on-dark">generate (full batch)</text>
+<rect x="280" y="44" width="110" height="24" class="fill-s3" opacity=".35"/><text x="335" y="61" text-anchor="middle" class="t-xs">long tail</text>
+<rect x="390" y="44" width="100" height="24" class="fill-s2"/><text x="440" y="61" text-anchor="middle" class="t-xs t-on">train</text>
+<rect x="490" y="44" width="150" height="24" class="fill-s3"/><text x="565" y="61" text-anchor="middle" class="t-xs t-on-dark">generate</text>
+<rect x="640" y="44" width="60" height="24" class="fill-s3" opacity=".35"/>
+<text x="20" y="118" class="t-sm">asynchronous</text>
+<text x="20" y="134" class="t-xs">generators</text>
+<rect x="130" y="104" width="570" height="24" class="fill-s3"/><text x="415" y="121" text-anchor="middle" class="t-xs t-on-dark">generate continuously with weights θ(k − n_stale); refill slots as rollouts finish</text>
+<text x="20" y="170" class="t-xs">trainer</text>
+<rect x="200" y="156" width="90" height="24" class="fill-s2"/><rect x="310" y="156" width="90" height="24" class="fill-s2"/><rect x="420" y="156" width="90" height="24" class="fill-s2"/><rect x="530" y="156" width="90" height="24" class="fill-s2"/>
+<text x="245" y="173" text-anchor="middle" class="t-xs t-on">step k</text><text x="355" y="173" text-anchor="middle" class="t-xs t-on">k + 1</text><text x="465" y="173" text-anchor="middle" class="t-xs t-on">k + 2</text><text x="575" y="173" text-anchor="middle" class="t-xs t-on">k + 3</text>
+<line x1="290" y1="156" x2="330" y2="130" class="ln dash"/><line x1="400" y1="156" x2="440" y2="130" class="ln dash"/><line x1="510" y1="156" x2="550" y2="130" class="ln dash"/>
+<text x="20" y="210" class="t-xs">Dashed: weight pushes. Asynchrony removes idle time but trains on rollouts from a policy n_stale updates old,</text>
+<text x="20" y="226" class="t-xs">which the clipped ratio and the truncated importance weights of §23.8 must correct.</text>
+</svg>
+<figcaption><b>Figure 25.6 — Hiding the tail.</b> In synchronous RL the GPUs alternate between generation, whose tail leaves them mostly idle, and training. Asynchronous RL keeps generators and trainer busy at the cost of training on slightly stale rollouts.</figcaption>
+</figure>
+
+<p>Figure 25.6 makes the trade explicit. Asynchronous training keeps every GPU busy, but its rollouts come from a policy \(n_{\text{stale}}\) updates behind the one being trained, so the gradient is off-policy. For small staleness the importance ratio in PPO's clipped objective (§23.6) and the truncated sampler corrections of §23.8 handle the mismatch, and systems such as AReaL reported<span class="cite"><a href="#r-areal">[13]</a></span> large speed-ups at comparable accuracy with staleness of a few steps. For large staleness the corrections become noisy and training degrades. The choice of \(n_{\text{stale}}\) is thus a statistical parameter set by systems considerations, which is the theme of this whole Part in miniature.</p>
+<p>Behind all these techniques is the inference engine. Continuous batching (Chapter 11) refills slots as rollouts finish; prefix caching (§10.6) shares the prompt across a group; speculative decoding (Chapter 20) can shorten the tail if the draft model is kept in step with the policy; and FP8 generation (Chapter 14) halves bytes per step, at the price of a larger sampler–trainer mismatch. Every technique of Parts III to VII reappears inside the training loop.</p>
+
+<h2 id="looking-ahead" class="unnumbered">Looking ahead</h2>
+<p>Part VIII has built the training side of modern post-training: reinforcement learning and PPO (Chapter 23), learning from preferences with RLHF and DPO (Chapter 24), and learning from verifiable rewards with GRPO and its successors (this chapter). The models that result think at length before they answer, and their quality depends on how much they are allowed to think. Chapter 26 turns to those reasoning models from the inference side: how test-time compute scales quality, the mathematics of parallel sampling and voting, how thinking length can be controlled, what reasoning tokens cost to serve, and how serving systems must adapt to outputs that are ten times longer than the ones the rest of this book assumed.</p>
+
+<h2 id="summary">Chapter summary</h2>
+<ul>
+<li>Verifiable rewards are computed by programs (answer matching, unit tests, format and constraint checks): binary, low-noise and sparse, but hackable through weak checkers. R1-Zero used only accuracy and format rewards.</li>
+<li>A group of \(n_s\) samples is informative with probability \(1-p_s^{n_s}-(1-p_s)^{n_s}\); prompts that are always or never solved give no gradient, so data must be filtered and refreshed.</li>
+<li>RLOO uses the leave-one-out mean as baseline (unbiased). GRPO's mean-subtracted reward equals RLOO times \((n_s-1)/n_s\); its division by the group standard deviation reweights prompts. GRPO plugs the advantage into PPO's clipped objective with a \(k_3\) KL term and holds only policy and reference (about \(18N\) bytes).</li>
+<li>Dr. GRPO: per-response length normalisation tolerates long wrong answers, and standard-deviation normalisation up-weights very easy and very hard prompts; remove both.</li>
+<li>With a binary reward, GRPO's standard-deviation normalisation makes it approximately ascend \(\sum_x2\arcsin\sqrt{p_\theta(x)}\), the variance-stabilising transform of the pass rate, rather than the expected reward itself.</li>
+<li>DAPO: clip-higher (\(\epsilon_{\text{low}}=0.2\), \(\epsilon_{\text{high}}=0.28\)) against entropy collapse, dynamic sampling of informative groups, token-level loss, overlong reward shaping, no KL.</li>
+<li>Process reward models give dense credit (PRM800K, Math-Shepherd's Monte Carlo step values) but are learned, hackable and costly; large RLVR runs have mostly used outcome rewards.</li>
+<li>RLVR raised R1-Zero's AIME pass@1 from 15.6% to 71.0% and grew its responses unprompted; it mainly sharpens pass@1 (base models can match at large \(k\)); distillation transfers reasoning to small models better than RL on them.</li>
+<li>An RLVR step is mostly generation, and much of that is the long tail. Length curricula, over-sampling, partial rollouts and asynchronous training (with staleness corrections) keep GPUs busy.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+<div class="mcq" data-id="ch30-mcq-01" data-topic="§25.1 Verifiable rewards">
+<p class="q">Which of these is a verifiable reward?</p>
+<ol class="opts"><li>A reward model trained on human comparisons</li><li data-correct>Running a program's unit tests in a sandbox</li><li>An LLM judge's preference</li><li>Perplexity under the reference model</li></ol>
+<div class="explain">Verifiable rewards are computed by programs from a reference answer or tests.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-02" data-topic="§25.1 R1-Zero">
+<p class="q">DeepSeek-R1-Zero was trained with which rewards?</p>
+<ol class="opts"><li>A neural reward model and a PRM</li><li data-correct>An accuracy reward and a format reward (reasoning inside thinking tags)</li><li>Human preferences</li><li>Length bonuses</li></ol>
+<div class="explain">DeepSeek avoided neural reward models, citing reward hacking at scale.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-03" data-topic="§25.1 Hacking">
+<p class="q">Which are ways a verifiable reward can still be gamed?</p>
+<ol class="opts"><li data-correct>A maths checker that accepts any response containing the right number</li><li>Sampling at temperature 1</li><li data-correct>Weak unit tests that a program can satisfy by special-casing visible inputs</li><li>Using a reference model</li></ol>
+<div class="explain">Soundness of the checker is the new alignment burden.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-04" data-topic="§25.1 Properties">
+<p class="q">Compared with learned preference rewards, verifiable rewards are:</p>
+<ol class="opts"><li>Dense and noisy</li><li data-correct>Sparse, nearly binary and low-noise</li><li>Continuous and differentiable</li><li>Always process-level</li></ol>
+<div class="explain">One bit per response, but trustworthy if the checker is sound.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-05" data-topic="§25.2 Informative groups">
+<p class="q">A group of 8 samples for a prompt the model solves with probability 0.5 is informative (mixed outcomes) with probability about:</p>
+<ol class="opts"><li>50%</li><li>87.5%</li><li data-correct>99%</li><li>100%</li></ol>
+<div class="explain">\(1-2\times0.5^8\approx0.992\).</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-06" data-topic="§25.2 Informative groups">
+<p class="q">Why does a prompt that the model always solves contribute no gradient in GRPO?</p>
+<ol class="opts"><li>Its KL is zero</li><li data-correct>All rewards equal the group mean, so every advantage is zero</li><li>It is filtered by the verifier</li><li>Its responses are too short</li></ol>
+<div class="explain">Learning from binary rewards needs contrast within the group.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-07" data-topic="§25.2 Hard prompts">
+<p class="q">For a prompt solved 2% of the time, a group of 8 is informative about:</p>
+<ol class="opts"><li>2% of the time</li><li data-correct>15% of the time</li><li>50% of the time</li><li>85% of the time</li></ol>
+<div class="explain">\(1-0.98^8\approx0.149\).</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-08" data-topic="§25.2 Curriculum">
+<p class="q">Why must the prompt mix be refreshed during RLVR?</p>
+<ol class="opts"><li>To avoid memorising answers only</li><li data-correct>As the model improves, prompts move out of the informative middle band of pass rates</li><li>To change the verifier</li><li>Because the reference model changes</li></ol>
+<div class="explain">Easy prompts become always-solved; hard ones become reachable.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-09" data-topic="§25.3 RLOO">
+<p class="q">RLOO's baseline for sample \(i\) is:</p>
+<ol class="opts"><li>The mean of all samples including \(i\)</li><li data-correct>The mean reward of the other \(n_s-1\) samples</li><li>A learned critic</li><li>Zero</li></ol>
+<div class="explain">It is independent of \(y_i\), so the estimator is exactly unbiased.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-10" data-topic="§25.3 GRPO vs RLOO">
+<p class="q">\(\mathcal R_i-\bar{\mathcal R}\) (mean over the whole group) equals the RLOO advantage multiplied by:</p>
+<ol class="opts"><li>1</li><li data-correct>\((n_s-1)/n_s\)</li><li>\(n_s/(n_s-1)\)</li><li>\(1/\operatorname{std}\)</li></ol>
+<div class="explain">So the mean-subtracted numerator is unbiased up to scale.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-11" data-topic="§25.3 GRPO">
+<p class="q">With 3 of 8 samples correct, GRPO's advantage for a correct sample is about:</p>
+<ol class="opts"><li>0.625</li><li>0.71</li><li data-correct>1.29</li><li>2.65</li></ol>
+<div class="explain">\((1-0.375)/\sqrt{0.375\times0.625}\approx0.625/0.484\).</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-12" data-topic="§25.3 Memory">
+<p class="q">Compared with PPO for language models, GRPO removes:</p>
+<ol class="opts"><li data-correct>The critic</li><li>The reference model, always</li><li data-correct>The reward model (when rewards are verifiable)</li><li>The clipped ratio</li></ol>
+<div class="explain">It holds the policy and, with a KL term, a reference: about \(18N\) bytes instead of \(36N\).</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-13" data-topic="§25.3 Tokens">
+<p class="q">In GRPO, the advantage of each token of response \(i\) is:</p>
+<ol class="opts"><li>Estimated by GAE</li><li data-correct>The same: the response's group-relative advantage \(\hat A_i\)</li><li>Zero except the last token</li><li>Proportional to its log-probability</li></ol>
+<div class="explain">Credit is not assigned within a response, unlike PPO with a critic.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-14" data-topic="§25.3 KL">
+<p class="q">GRPO includes the KL penalty to the reference:</p>
+<ol class="opts"><li>In the reward, per token</li><li data-correct>Directly in the loss, using the \(k_3\) estimator</li><li>Not at all</li><li>Only at evaluation</li></ol>
+<div class="explain">PPO-RLHF usually folds \(-\beta k_1\) into rewards; GRPO adds \(\beta k_3\) to the loss.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-15" data-topic="§25.3 Prefix sharing">
+<p class="q">Why are groups of samples cheap for an inference engine to generate?</p>
+<ol class="opts"><li>They use a smaller model</li><li data-correct>The prompt's KV cache can be computed once and shared by all samples of the group</li><li>They are generated greedily</li><li>They skip the verifier</li></ol>
+<div class="explain">Prefix caching (§10.6) or parallel sampling with a shared prefix.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-16" data-topic="§25.4 Length bias">
+<p class="q">Under GRPO's per-response averaging (\(1/n_{y,i}\)), a long wrong answer:</p>
+<ol class="opts"><li>Is penalised more than a short one</li><li data-correct>Receives the same total penalty as a short one, so each of its tokens is penalised less</li><li>Is ignored</li><li>Gets a positive advantage</li></ol>
+<div class="explain">This encourages lengthening wrong answers, a bias identified by Dr. GRPO.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-17" data-topic="§25.4 Difficulty bias">
+<p class="q">Dividing advantages by the group standard deviation:</p>
+<ol class="opts"><li>Has no effect on the gradient's direction</li><li data-correct>Up-weights prompts whose samples nearly agree (very easy or very hard)</li><li>Removes the length bias</li><li>Makes the estimator unbiased</li></ol>
+<div class="explain">Small standard deviation means large advantages; Dr. GRPO removes it.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-18" data-topic="§25.4 Clip-higher">
+<p class="q">DAPO's clip-higher (\(\epsilon_{\text{high}}=0.28&gt;\epsilon_{\text{low}}=0.2\)) mainly addresses:</p>
+<ol class="opts"><li>Memory use</li><li data-correct>Entropy collapse: low-probability tokens with positive advantage can grow more per update</li><li>Verifier errors</li><li>Weight synchronisation</li></ol>
+<div class="explain">With symmetric clipping, a 1% token can only reach 1.2% per update.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-19" data-topic="§25.4 Dynamic sampling">
+<p class="q">DAPO's dynamic sampling:</p>
+<ol class="opts"><li>Changes the temperature per prompt</li><li data-correct>Discards all-correct and all-wrong groups and keeps sampling until the batch has enough informative groups</li><li>Samples fewer responses for hard prompts</li><li>Uses a draft model</li></ol>
+<div class="explain">It keeps the effective batch size from shrinking as accuracy rises.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-20" data-topic="§25.4 Overlong">
+<p class="q">Why do truncated (over-length) responses need special handling?</p>
+<ol class="opts"><li>They cannot be tokenised</li><li data-correct>Labelling them wrong penalises reasoning that may have been sound but unfinished, adding reward noise</li><li>They break the KV cache</li><li>They are always correct</li></ol>
+<div class="explain">DAPO masks them or applies a soft length penalty near the limit.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-21" data-topic="§25.4 Token-level loss">
+<p class="q">A token-level loss (averaging over all tokens in the batch) means:</p>
+<ol class="opts"><li>Short responses dominate the gradient</li><li data-correct>Each token has equal weight, so longer responses contribute proportionally more</li><li>Only the last token matters</li><li>The KL term is removed</li></ol>
+<div class="explain">It fixes the length bias of per-response averaging.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-22" data-topic="§25.5 PRM">
+<p class="q">A process reward model differs from an outcome reward by:</p>
+<ol class="opts"><li>Using human preferences</li><li data-correct>Scoring each intermediate step rather than only the final answer</li><li>Being a program</li><li>Ignoring the answer</li></ol>
+<div class="explain">Dense credit, at the cost of a learned, exploitable judge.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-23" data-topic="§25.5 Math-Shepherd">
+<p class="q">Math-Shepherd labels a solution step automatically by:</p>
+<ol class="opts"><li>Asking humans</li><li data-correct>Rolling out completions from that step and measuring how often they reach the correct answer</li><li>Checking its syntax</li><li>Its length</li></ol>
+<div class="explain">A Monte Carlo estimate of the step's value.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-24" data-topic="§25.5 Why outcome">
+<p class="q">Why did DeepSeek-R1 use outcome rewards rather than PRMs?</p>
+<ol class="opts"><li>PRMs did not exist</li><li data-correct>PRMs reintroduce a learned, hackable judge, steps are ill-defined, and scoring every step is costly; their attempts did not pay off at scale</li><li>Outcome rewards are dense</li><li>PRMs need a critic</li></ol>
+<div class="explain">The R1 paper lists PRMs and MCTS among unsuccessful attempts.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-25" data-topic="§25.6 R1-Zero">
+<p class="q">During R1-Zero's RL training, average response length:</p>
+<ol class="opts"><li>Stayed constant</li><li data-correct>Grew from hundreds to thousands of tokens without a length reward</li><li>Shrank</li><li>Was fixed by a cap at 512</li></ol>
+<div class="explain">The model learned to think longer; Dr. GRPO argued part of the growth is a normalisation artefact.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-26" data-topic="§25.6 Distillation">
+<p class="q">The R1 paper found that, for a 32B model, the stronger reasoner came from:</p>
+<ol class="opts"><li>Large-scale RL on the 32B model</li><li data-correct>Fine-tuning it on samples from R1 (distillation)</li><li>Prompting with chain of thought</li><li>A PRM</li></ol>
+<div class="explain">Reasoning discovered by RL in a large model transfers cheaply by SFT.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-27" data-topic="§25.6 pass@k">
+<p class="q">Yue et al. (2025) found that, compared with their base models, RLVR-trained models:</p>
+<ol class="opts"><li>Were better at every \(k\)</li><li data-correct>Were better at small \(k\) but often matched or were overtaken by the base model at large \(k\)</li><li>Were worse at pass@1</li><li>Solved entirely new problems</li></ol>
+<div class="explain">Interpreted as sharpening the distribution rather than adding new reasoning paths.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-28" data-topic="§25.4 Entropy">
+<p class="q">Why is entropy collapse harmful in RLVR?</p>
+<ol class="opts"><li>It increases memory use</li><li data-correct>Samples in a group become nearly identical, groups stop being informative, and learning stalls</li><li>It slows decoding</li><li>It breaks the verifier</li></ol>
+<div class="explain">Clip-higher, dynamic sampling, temperature and entropy bonuses counter it.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-29" data-topic="§25.7 Tail">
+<p class="q">In synchronous RLVR, why is GPU utilisation during generation often below 50%?</p>
+<ol class="opts"><li>The verifier is slow</li><li data-correct>Response lengths vary widely, so batches empty and GPUs spend the end of the phase decoding a few long stragglers</li><li>Prefill dominates</li><li>The KV cache is too small</li></ol>
+<div class="explain">A few rollouts hitting the length cap set the phase's duration.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-30" data-topic="§25.7 Partial rollouts">
+<p class="q">Partial rollouts (as in Kimi k1.5):</p>
+<ol class="opts"><li>Truncate responses and mark them wrong</li><li data-correct>Cap tokens generated per step and continue unfinished responses in the next step with updated weights</li><li>Generate only the answer</li><li>Skip verification</li></ol>
+<div class="explain">They bound the step time without discarding long reasoning.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-31" data-topic="§25.7 Asynchrony">
+<p class="q">The cost of asynchronous RL is that:</p>
+<ol class="opts"><li>The trainer is idle</li><li data-correct>Rollouts come from a policy several updates old, so the gradient is off-policy and must be corrected</li><li>It needs more verifiers</li><li>It cannot use GRPO</li></ol>
+<div class="explain">Clipped ratios and truncated importance weights handle small staleness.</div>
+</div>
+
+<div class="mcq" data-id="ch30-mcq-32" data-topic="§25.7 Worked example">
+<p class="q">In the 8B, 64-GPU worked example, roughly what fraction of the RLVR step is generation?</p>
+<ol class="opts"><li>10%</li><li>33%</li><li data-correct>67%</li><li>95%</li></ol>
+<div class="explain">About 200 s of generation (much of it tail) against about 105 s of training.</div>
+</div>
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+<details class="qa" data-id="ch30-qa-01">
+<summary><span class="lvl warm">Warm-up</span> What is RLVR, and how does it differ from RLHF?</summary>
+<div class="answer">
+<p>Reinforcement learning with verifiable rewards trains a model on problems whose outputs can be checked by a program: maths answers against references, code against unit tests, instructions against parsers. RLHF uses a reward model learned from human preferences, which is noisy (around 70% agreement) and exploitable, so it needs a KL leash and careful early stopping. RLVR's reward is binary, low-noise and sparse. There is no reward model and usually no critic (GRPO, RLOO), and optimisation can push much further, which is how reasoning models such as o1 and R1 were trained. The new failure mode is unsound checkers, and the cost is dominated by generating many long samples per prompt.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch30-qa-02">
+<summary><span class="lvl core">Core</span> Derive GRPO's advantage and relate it to RLOO.</summary>
+<div class="answer">
+<p>Start from REINFORCE with a baseline: any baseline independent of the sampled response is unbiased, and the ideal is the policy's expected reward on the prompt. Sample a group of \(n_s\) responses. RLOO uses the leave-one-out mean, \(\hat A_i=\mathcal R_i-\frac1{n_s-1}\sum_{j\ne i}\mathcal R_j\): exactly unbiased. GRPO uses \((\mathcal R_i-\bar{\mathcal R})/\operatorname{std}\). Algebra: \(\mathcal R_i-\bar{\mathcal R}=\frac{n_s-1}{n_s}\hat A_i^{\text{RLOO}}\), so the numerator is unbiased up to scale. The standard-deviation division reweights prompts (more weight when samples nearly agree), which biases the gradient. GRPO broadcasts \(\hat A_i\) to all tokens and uses PPO's clipped ratio with a \(k_3\) KL term in the loss.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch30-qa-03">
+<summary><span class="lvl core">Core</span> Why does GRPO not need a critic, and what does it give up?</summary>
+<div class="answer">
+<p>The critic in PPO supplies a baseline \(V(s)\). GRPO instead estimates the prompt-level baseline from the other samples in the group, which, for a binary reward and a group of 8–64, is a decent estimate of the pass rate. That removes a network the size of the policy (16N bytes of state), the hard problem of learning values over text prefixes, and the bias a bad critic introduces. It gives up per-token credit assignment: every token of a response gets the same advantage, so the model is not told which steps mattered, only which responses were better. It also requires multiple samples per prompt, which is acceptable because informative groups need them anyway and an inference engine shares the prompt's KV cache.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch30-qa-04">
+<summary><span class="lvl deep">Deep-dive</span> Explain the two biases Dr. GRPO identified and their effects.</summary>
+<div class="answer">
+<p>Length bias: GRPO averages each response's token losses by \(1/n_{y,i}\), so every response has equal total weight. For negative advantages, a long wrong response is penalised no more in total than a short one, and less per token. For positive advantages, short correct responses get larger per-token pushes. The net incentive is to lengthen wrong answers, which inflates response length beyond what better reasoning needs. Difficulty bias: dividing by the group's standard deviation gives large advantages to prompts where samples nearly agree (pass rates near 0 or 1), over-weighting very easy and very hard prompts relative to intermediate ones. Fix: use mean-subtracted rewards without std normalisation, and sum token losses with a constant normaliser. They reported similar accuracy with shorter responses (better token efficiency).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch30-qa-05">
+<summary><span class="lvl core">Core</span> Describe DAPO's four changes and why each helps.</summary>
+<div class="answer">
+<p>Clip-higher: asymmetric clipping (\(\epsilon_{\text{low}}=0.2\), \(\epsilon_{\text{high}}=0.28\)) lets low-probability tokens with positive advantage grow more per update, countering entropy collapse and preserving exploration. Dynamic sampling: drop groups with all-correct or all-wrong outcomes (zero advantage) and resample to keep the batch full of informative groups, so the gradient's effective batch size does not shrink as accuracy rises. Token-level policy-gradient loss: average over all tokens in the batch, removing the length bias of per-sample averaging. Overlong reward shaping: mask or softly penalise truncated responses instead of marking them wrong, removing reward noise from the cap. It also removed the KL penalty for verifiable rewards. Result: 50 on AIME 2024 from Qwen2.5-32B base in half the steps of the R1-Zero-style baseline.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch30-qa-06">
+<summary><span class="lvl core">Core</span> When does a group of samples provide learning signal? How would you build an RLVR dataset?</summary>
+<div class="answer">
+<p>With binary rewards, only groups with both successes and failures have non-zero advantages. If the prompt's pass rate is \(p\), a group of \(n\) is informative with probability \(1-p^n-(1-p)^n\): near 1 for \(p\) in the middle, small near 0 or 1 (for \(p=0.02,n=8\), about 15%). Dataset design: estimate each prompt's pass rate with the current model (e.g. 8–16 samples), keep a middle band (say 10–90%), balance domains, deduplicate, and verify that references and tests are sound. During training, refresh the pool as the model improves (a curriculum), use dynamic sampling to replace uninformative groups, and use larger groups or SFT warm-up for valuable hard prompts.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch30-qa-07">
+<summary><span class="lvl core">Core</span> Outcome versus process rewards: trade-offs, and what large runs used.</summary>
+<div class="answer">
+<p>Outcome rewards check only the final answer: sound, cheap and hard to hack, but sparse, giving no indication of which steps were good. Process reward models score each step: dense credit (Lightman et al.: a PRM chose correct solutions more often than an outcome model, 78% versus 72% on a MATH subset). They need step labels (human, as in PRM800K, or Monte Carlo, as in Math-Shepherd), are learned and therefore exploitable, depend on an ill-defined segmentation into steps, and add inference cost. DeepSeek-R1 found PRMs did not pay off at scale and used outcome rewards. PRMs remain useful for best-of-\(n\) selection, search and diagnosis. A Monte Carlo step value is the RL value function estimated by rollouts.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch30-qa-08">
+<summary><span class="lvl design">Design</span> Estimate the time of one RLVR step for an 8B model with 512 prompts, 16 samples each, mean length 4k, cap 16k, on 64 H100s. Where would you optimise?</summary>
+<div class="answer">
+<p>Tokens: 8,192 × 4,000 ≈ 33M. Each GPU decodes 128 sequences; at an average context of 2.5k a step reads about 58 GB, 22 ms, so about 5,900 tokens/s per GPU and 87 s if always full. But about 1.7% of rollouts hit the 16k cap, so most GPUs run 16k sequential steps at falling batch, about 200 s: under 45% utilisation. Training: \((2N+8N)\times33\text{M}\approx2.6\times10^{18}\) FLOPs, about 105 s at 40% MFU. Step about 300 s, two thirds generation. Optimise the tail first: length curriculum (start at 8k), over-sample and stop early, partial rollouts, or asynchronous generation. Then per-token decode cost: FP8 weights and KV, CUDA graphs, larger batches, speculative decoding. Then colocate or overlap training with generation.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch30-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Does RLVR teach models new reasoning? Discuss the pass@k evidence.</summary>
+<div class="answer">
+<p>Yue et al. (2025) compared base and RLVR-trained models by pass@\(k\). RL models win at small \(k\), but base models catch up or overtake at large \(k\) (hundreds of samples), and the problems RL models solve are mostly ones the base model already solved occasionally. Interpretation: RLVR mostly sharpens, moving probability to successful paths the base model already contains. Entropy collapse may even shrink the set of solvable problems at large \(k\). Counterpoints: pass@1 and token efficiency are what users experience; long RL runs with exploration-preserving tricks (clip-higher, entropy control) and bigger budgets report gains at larger \(k\); and RL elicits behaviours (self-verification, backtracking) that make long reasoning usable. Distillation from a stronger teacher can add capabilities a student lacks, which is why small reasoning models are distilled rather than trained by RL.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch30-qa-10">
+<summary><span class="lvl design">Design</span> Design a rollout system for RLVR on a 70B model at large scale.</summary>
+<div class="answer">
+<p>Generators: a fleet of inference engines (vLLM or SGLang) with TP within nodes, continuous batching, prefix sharing across each group, FP8 weights and KV if the logprob mismatch is acceptable, and CUDA graphs. Trainer: FSDP or Megatron on a separate pool, or colocated with resharding between the layouts. Weight sync: a broadcast tree or NCCL from trainer to generators after each update (hundreds of GB, which must take seconds, not minutes). Tail control: length curriculum, over-sampling with early termination, partial rollouts that carry unfinished responses forward, or fully asynchronous generation with bounded staleness (1–4 steps) and truncated importance weights. Verification: a horizontally scaled CPU sandbox service with timeouts and isolation, plus caching of results. Data: online pass-rate estimation and dynamic sampling. Monitoring: generation throughput, tail lengths, uninformative-group fraction, entropy, logprob mismatch and reward-hacking audits.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch30-qa-11">
+<summary><span class="lvl core">Core</span> What is entropy collapse in RL fine-tuning, and how is it mitigated?</summary>
+<div class="answer">
+<p>RL sharpens the policy on successful paths, so token-level entropy drops quickly early in training. Once collapsed, the samples in a group are near-duplicates, all right or all wrong, advantages vanish and exploration stops: learning plateaus and pass@\(k\) at large \(k\) can fall. Mitigations: clip-higher (let rising low-probability tokens grow more), dynamic sampling (train only on informative groups), sampling temperature adjustments (keeping the gradient's sampling assumptions consistent), entropy bonuses or entropy-targeting regularisers, KL to a reference (which also restrains sharpening), diverse prompt pools, and avoiding too many updates per batch.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch30-qa-12">
+<summary><span class="lvl warm">Warm-up</span> Why are truncated responses a problem in RLVR, and how are they handled?</summary>
+<div class="answer">
+<p>A response cut off at the maximum length has no final answer, so a naive verifier marks it wrong, penalising reasoning that may have been on track and confusing "too long" with "wrong". This adds reward noise and pushes the model toward shorter, possibly worse reasoning, or, under GRPO's length bias, toward unhelpful patterns. Handling: mask truncated responses from the loss (overlong filtering), apply a soft penalty that grows as length nears the cap (overlong shaping), raise the cap over training (curriculum), or use partial rollouts that let a response continue in a later step.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch30-qa-13">
+<summary><span class="lvl core">Core</span> Summarise the DeepSeek-R1 training pipeline and what R1-Zero showed.</summary>
+<div class="answer">
+<p>R1-Zero: GRPO directly on the DeepSeek-V3 base model with accuracy and format rewards only, no SFT. AIME 2024 pass@1 rose from 15.6% to 71.0% (86.7% with majority voting over 64 samples); response length grew to thousands of tokens on its own, and reflective behaviour emerged. But outputs were hard to read and mixed languages. R1: a cold-start SFT on a small set of readable long chains of thought; reasoning-focused RL (with a language-consistency reward); rejection-sampling SFT on about 800k samples (reasoning plus general data); then RL across all scenarios (verifiable rewards for reasoning, preference rewards for helpfulness and harmlessness). Distilled models (Qwen and Llama, 1.5–70B) fine-tuned on R1 samples outperformed RL applied directly to models of their size.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch30-qa-14">
+<summary><span class="lvl deep">Deep-dive</span> Synchronous versus asynchronous RL: what is the statistical cost of asynchrony, and how is it controlled?</summary>
+<div class="answer">
+<p>Synchronous RL generates with the current weights, then trains: on-policy, but GPUs idle during the tail and during training if pools are separate. Asynchronous RL generates continuously with weights \(n_{\text{stale}}\) updates old: the samples come from \(p_{\theta_{k-n_{\text{stale}}}}\) while the gradient is for \(p_{\theta_k}\), so it is off-policy. Corrections: compute the PPO ratio against the generating policy's log-probs (recomputed in the trainer), clip it, and apply truncated per-token importance weights for the remaining mismatch. Variance and bias grow with staleness and with how fast the policy changes (learning rate, updates per batch). Control: bound staleness (1–4 steps), interrupt and restart very long rollouts with new weights, monitor ratio statistics, and lower the learning rate if the clipping fraction rises.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch30-qa-15">
+<summary><span class="lvl design">Design</span> How would you build a code-RL verifier service, and what can go wrong?</summary>
+<div class="answer">
+<p>A pool of isolated sandboxes (containers or microVMs) with no network, CPU and memory limits, and timeouts. Each rollout's program is run against hidden unit tests, and the service returns the pass fraction or all-pass. Scale horizontally, since thousands of rollouts per step need thousands of CPU-seconds, and pipeline verification with generation so it never blocks the trainer. Cache results by program hash. Failure modes: reward hacking through weak tests (special-casing inputs, printing expected outputs), exploiting the harness (modifying tests, exiting with a success code, reading the test files), non-deterministic tests (flaky rewards), timeouts mislabelled as failures, and resource exhaustion. Mitigations: strong, hidden and randomised tests, a read-only harness, auditing high-reward samples, and penalties for detected tampering.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch30-qa-16">
+<summary><span class="lvl core">Core</span> Compare the memory and compute of PPO, GRPO and RLOO for an 8B policy.</summary>
+<div class="answer">
+<p>PPO: actor and critic trained (16N each), reference and reward model frozen (2N each): about \(36N\) = 289 GB, plus a critic forward and backward pass per step. GRPO: policy trained (16N) plus a frozen reference for the KL term (2N): \(18N\) = 145 GB, and none if the KL term is dropped (as in DAPO) or if LoRA makes the reference the base model. RLOO: the same models as GRPO, with a leave-one-out baseline and no standard-deviation normalisation. Both GRPO and RLOO need \(n_s\) samples per prompt, so generation per prompt is \(n_s\) times PPO's single sample, but that generation shares the prompt's prefill, and verifiable rewards need groups anyway. Training compute per generated token is lower without a critic: \(8N\) policy (with checkpointing) plus \(2N\) reference, against about \(20N\) for PPO (actor and critic at \(8N\) each, plus reference and reward-model passes).</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-dsmath">Z. Shao et al. DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models (GRPO). 2024. <a href="https://arxiv.org/abs/2402.03300">arXiv:2402.03300</a>.</li>
+<li id="r-r1">DeepSeek-AI. DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning. 2025. <a href="https://arxiv.org/abs/2501.12948">arXiv:2501.12948</a>.</li>
+<li id="r-o1">OpenAI. Learning to Reason with LLMs. September 2024. <a href="https://openai.com/index/learning-to-reason-with-llms/">openai.com</a>.</li>
+<li id="r-tulu3">N. Lambert et al. Tülu 3: Pushing Frontiers in Open Language Model Post-Training (RLVR). 2024. <a href="https://arxiv.org/abs/2411.15124">arXiv:2411.15124</a>.</li>
+<li id="r-star">E. Zelikman, Y. Wu, J. Mu, N. Goodman. STaR: Bootstrapping Reasoning With Reasoning. <em>NeurIPS</em>, 2022. <a href="https://arxiv.org/abs/2203.14465">arXiv:2203.14465</a>.</li>
+<li id="r-prm">H. Lightman et al. Let\'s Verify Step by Step. <em>ICLR</em>, 2024. <a href="https://arxiv.org/abs/2305.20050">arXiv:2305.20050</a>.</li>
+<li id="r-shepherd">P. Wang et al. Math-Shepherd: Verify and Reinforce LLMs Step-by-step without Human Annotations. <em>ACL</em>, 2024. <a href="https://arxiv.org/abs/2312.08935">arXiv:2312.08935</a>.</li>
+<li id="r-rloo">A. Ahmadian et al. Back to Basics: Revisiting REINFORCE Style Optimization for Learning from Human Feedback in LLMs (RLOO). <em>ACL</em>, 2024. <a href="https://arxiv.org/abs/2402.14740">arXiv:2402.14740</a>.</li>
+<li id="r-drgrpo">Z. Liu et al. Understanding R1-Zero-Like Training: A Critical Perspective (Dr. GRPO). 2025. <a href="https://arxiv.org/abs/2503.20783">arXiv:2503.20783</a>.</li>
+<li id="r-dapo">Q. Yu et al. DAPO: An Open-Source LLM Reinforcement Learning System at Scale. 2025. <a href="https://arxiv.org/abs/2503.14476">arXiv:2503.14476</a>.</li>
+<li id="r-yue">Y. Yue et al. Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model? 2025. <a href="https://arxiv.org/abs/2504.13837">arXiv:2504.13837</a>.</li>
+<li id="r-kimi">Kimi Team. Kimi k1.5: Scaling Reinforcement Learning with LLMs. 2025. <a href="https://arxiv.org/abs/2501.12599">arXiv:2501.12599</a>.</li>
+<li id="r-areal">W. Fu et al. AReaL: A Large-Scale Asynchronous Reinforcement Learning System for Language Reasoning. 2025. <a href="https://arxiv.org/abs/2505.24298">arXiv:2505.24298</a>.</li>
+<li id="r-asyncrlhf">M. Noukhovitch et al. Asynchronous RLHF: Faster and More Efficient Off-Policy RL for Language Models. <em>ICLR</em>, 2025. <a href="https://arxiv.org/abs/2410.18252">arXiv:2410.18252</a>.</li>
+<li id="r-entropy">G. Cui et al. The Entropy Mechanism of Reinforcement Learning for Reasoning Language Models. 2025. <a href="https://arxiv.org/abs/2505.22617">arXiv:2505.22617</a>.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

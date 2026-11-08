@@ -1,0 +1,600 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 3 · The Language Model Inside the Agent — Foundations of Agentic AI</title>
+<meta name="description" content="Chapter 3 of Foundations of Agentic AI: what next-token prediction teaches, in-context learning as Bayesian inference, fine-tuning and RLHF, sampling temperature, calibration, and the cost of a model call.">
+<script>try{var t=localStorage.getItem('aai-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script defer src="/library/assets/book-shim.js" data-library="/library/" data-field="/library/AI_Engineering/" data-field-title="AI Engineering"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-chapter="ch03" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Part I · What Is an Agent? — Chapter 3</div>
+<h1 id="top">The Language Model Inside the Agent</h1>
+<p class="lede">An agent's policy is a language model, and every strength and weakness of the agent starts there. This chapter opens the box: what a model learns from predicting text, how a few examples in a prompt reconfigure it, how instruction tuning turns a predictor into an assistant, what sampling does to a policy, how far its confidence can be trusted, and what a single call costs in money and time.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Chapter 2 wrote the LLM agent as a triple \((p_\theta,f,g)\): a model, a context map built by the harness, and a parser. It then studied the harness and the environment while treating \(p_\theta\) as a black box that maps a context to an output. That was the right order for building a mathematical picture, but it leaves the most important component unexplained. Why should a model trained only to predict the next token of internet text be any good at choosing the next action in a repository it has never seen? Why does adding two examples to a prompt sometimes change its behaviour completely? Why do agents built on instruction-tuned models behave so differently from those built on raw pre-trained ones? Why does the same agent succeed on Monday and fail on Tuesday with an identical prompt?</p>
+<p>Each of these questions has a mechanism behind it, and each mechanism has direct consequences for agent design. In-context learning explains why the system prompt and examples are such powerful levers, and why they stop working when the task is far from anything in the training data. The objective of instruction tuning explains both the helpfulness of modern assistants and some of their characteristic failures, such as agreeing with a user who is wrong. Sampling temperature turns a deterministic-looking program into a random policy whose consistency, pass^\(k\), can be computed. Calibration determines whether an agent's own confidence can be used to decide when to ask a human. And the cost structure of a call, cheap to read and expensive to write, shapes everything from tool design to model routing.</p>
+<p>The companion book, <em>Introduction to LLM Engineering</em>, covers the internals of the Transformer and of inference serving in detail. Here we need only the properties of the model that an agent designer relies on, stated precisely enough to reason with. We draw on Chapter 1's history (§1.6) and Chapter 2's definition of the LLM agent (§2.4).</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Explain what next-token prediction forces a model to learn, and convert between words, tokens and dollars.</li>
+<li>Describe in-context learning as implicit Bayesian inference over latent tasks, and compute how examples sharpen the posterior.</li>
+<li>Explain supervised fine-tuning and RLHF, derive the optimal policy of the KL-regularised objective, and relate both to agent behaviour.</li>
+<li>Compute the effect of sampling temperature on a policy's action probabilities and on its consistency.</li>
+<li>Define calibration, read a reliability diagram, and use confidence for selective escalation.</li>
+<li>Estimate the latency and price of a model call from its input, cached and output tokens, and design a model cascade.</li>
+<li>List the failure modes an agent inherits from its model and the engineering response to each.</li>
+</ol>
+</div>
+
+<h2 id="s3-1">3.1 What an agent borrows from its model</h2>
+<p>When we build an agent we do not train a policy; we borrow one. The model arrives with capabilities nobody designed for our task: it reads code and prose, follows instructions, knows that a 404 means a missing page and that refunds usually need a booking reference. It also arrives with tendencies nobody designed: it guesses when it should look, it agrees when it should object, it writes more than it needs to. An agent designer's job is largely to exploit the first set and contain the second, and that requires a working model of where both come from.</p>
+<p>It helps to separate four layers, which Figure 3.1 draws as a pipeline. <strong>Pre-training</strong> on trillions of tokens of text produces a model of the distribution of text: a predictor. <strong>Supervised fine-tuning</strong> on demonstrations of conversations, instructions and tool use produces a model of the distribution of <em>good assistant responses</em>. <strong>Reinforcement learning</strong> from human preferences and, increasingly, from automatically verifiable rewards pushes that model towards responses that score well. Finally, at <strong>inference time</strong>, the harness conditions the model on a context and samples from it with some decoding rule. Each layer shapes the policy the agent ends up executing, and each is responsible for distinct behaviours we will meet in this chapter.</p>
+
+<figure class="diagram" id="fig-3-1">
+<svg class="dg" viewBox="0 0 720 220" role="img" aria-label="From pre-training to an agent's policy: four layers">
+<defs><marker id="ah31" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="14" y="40" width="150" height="80" rx="10" class="bx2"/><text x="89" y="66" text-anchor="middle" class="t-b">Pre-training</text><text x="89" y="86" text-anchor="middle" class="t-xs">~10¹³ tokens of text</text><text x="89" y="104" text-anchor="middle" class="t-xs">→ a predictor of text</text>
+<rect x="194" y="40" width="150" height="80" rx="10" class="bx3"/><text x="269" y="66" text-anchor="middle" class="t-b">Fine-tuning</text><text x="269" y="86" text-anchor="middle" class="t-xs">demonstrations, chats,</text><text x="269" y="104" text-anchor="middle" class="t-xs">tool-use transcripts</text>
+<rect x="374" y="40" width="150" height="80" rx="10" class="bx4"/><text x="449" y="66" text-anchor="middle" class="t-b">RL</text><text x="449" y="86" text-anchor="middle" class="t-xs">human preferences,</text><text x="449" y="104" text-anchor="middle" class="t-xs">verifiable rewards</text>
+<rect x="554" y="40" width="150" height="80" rx="10" class="fill-acc"/><text x="629" y="66" text-anchor="middle" class="t-on t-b">Inference</text><text x="629" y="86" text-anchor="middle" class="t-on t-xs">context cₜ, decoding</text><text x="629" y="104" text-anchor="middle" class="t-on t-xs">→ the agent's policy</text>
+<line x1="164" y1="80" x2="192" y2="80" class="ln" marker-end="url(#ah31)"/>
+<line x1="344" y1="80" x2="372" y2="80" class="ln" marker-end="url(#ah31)"/>
+<line x1="524" y1="80" x2="552" y2="80" class="ln" marker-end="url(#ah31)"/>
+<text x="89" y="148" text-anchor="middle" class="t-xs t-s2">knowledge, skills,</text><text x="89" y="164" text-anchor="middle" class="t-xs t-s2">in-context learning</text>
+<text x="269" y="148" text-anchor="middle" class="t-xs t-s2">instruction following,</text><text x="269" y="164" text-anchor="middle" class="t-xs t-s2">formats, tool calls</text>
+<text x="449" y="148" text-anchor="middle" class="t-xs t-s2">helpfulness, reasoning;</text><text x="449" y="164" text-anchor="middle" class="t-xs t-s2">sycophancy, overconfidence</text>
+<text x="629" y="148" text-anchor="middle" class="t-xs t-s2">randomness, cost,</text><text x="629" y="164" text-anchor="middle" class="t-xs t-s2">latency, context limits</text>
+<text x="360" y="204" text-anchor="middle" class="t-xs">bottom row: the behaviours each layer is chiefly responsible for</text>
+</svg>
+<figcaption><b>Figure 3.1 — Four layers of the agent's policy.</b> The model's knowledge and its ability to learn from context come from pre-training; its manners from fine-tuning; its preferences, and some of its biases, from reinforcement learning; and its randomness, cost and limits from how it is called.</figcaption></figure>
+
+<p>Figure 3.1's bottom row is a map of this chapter. We take the layers in order, asking of each the same question: what does it contribute to the agent, and what does it cost? The first layer is the foundation of everything, so we start there, with the deceptively simple objective of predicting the next token.</p>
+
+<h2 id="s3-2">3.2 Next-token prediction and what it teaches</h2>
+<p>A language model is trained to minimise the cross-entropy of the next token given the previous ones, averaged over a vast corpus:</p>
+\[ \mathcal L(\theta)=-\,\mathbb E_{x\sim\mathcal D}\Big[\tfrac1n\textstyle\sum_{i=1}^{n}\log p_\theta(x_i\mid x_{&lt;i})\Big]. \]
+<p>The units of text are <strong>tokens</strong>: sub-word pieces from a vocabulary \(\mathcal V\) of typically 100,000 to 250,000 entries, learned so that common strings get their own token and rare ones are spelled out in pieces. For English prose a word is about 1.3 tokens; code, numbers and non-English text use more tokens per character. Tokens matter to an agent designer because they are the unit of everything that is limited or charged: the context window is \(n_{\max}\) tokens, prices are per token, and decoding speed is in tokens per second.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — tokens and the price of reading</div>
+<p>A tokenizer is a deterministic, invertible map \(\mathrm{tok}:\Sigma^*\to\mathcal V^*\) from character strings to token strings, usually built by byte-pair encoding<span class="cite"><a href="#ref-bpe">[1]</a></span>: start with bytes, repeatedly merge the most frequent adjacent pair into a new symbol, and stop at the target vocabulary size. The map compresses typical text by a factor of three to four relative to bytes. For our cost arithmetic we use the rule of thumb in <code>NOTATION.md</code>: a page of prose is about 500 words, or 650 tokens. A 50-page contract is therefore about 32,500 tokens and costs \(0.0325\times\$3\approx\$0.10\) to read once at our reference input price. An agent that re-reads it at each of twenty steps without caching pays $1.95; with caching, about $0.28.</p>
+</div>
+
+<p>What must a model know to drive this loss down? To predict the next token of a recipe it must know what follows "preheat the oven to"; of a stack trace, which line usually raises a <code>KeyError</code>; of a customer-service transcript, what an agent says after "I'd like a refund". The loss rewards every regularity that makes text predictable, and text is predictable to the extent that it describes a structured world. In the limit, a model that predicted all text perfectly would have to represent the processes that generate it: the facts, the causal structure, the conventions of code and law, and the goals and beliefs of the writers. Real models are far from that limit, but they are far enough along it that probing studies find internal representations of quantities such as board states in game transcripts and the truth or falsehood of statements.</p>
+<p>Two features of this learning are crucial for agents. The first is breadth. Because the corpus covers almost every domain people write about, the resulting prior covers almost every environment an agent might be put in. The coding agent benefits from millions of repositories and bug discussions, the support agent from countless transcripts and policy documents, the research agent from the whole practice of citing sources. The second is that the model learns to predict text written by <em>agents</em>: people solving problems, explaining their reasoning, making plans and correcting mistakes. Conditioned on the beginning of such a text, the model continues it in kind. This is the deep reason a predictor can act as a policy: much of its training data consists of the traces of policies, and continuing a trace is choosing an action.</p>
+<p>What pre-training does <em>not</em> provide is equally important. The model's knowledge is frozen at its training cut-off. It has learned the statistics of text, which include many falsehoods and much that is stale. It has never observed the consequences of an action in a live environment, so its predictions about the contents of a file it has not read are confident guesses. And it does not know which continuation the user <em>wants</em>: a raw pre-trained model asked a question may continue with more questions, because that is what follows questions in many documents. The next two layers address the last problem. The first, which needs no training at all, is the prompt.</p>
+
+<h2 id="s3-3">3.3 In-context learning as inference</h2>
+<p>Brown and colleagues' discovery of in-context learning in GPT-3 (§1.6)<span class="cite"><a href="#ref-gpt3">[2]</a></span> was surprising because nothing in the training objective asks for it. The model is trained to predict text, not to learn tasks from examples. Yet given a prompt such as "sea otter → loutre de mer, cheese → fromage, peppermint →", it translates the last word; given two examples of reformatting a date, it reformats a third. For agents this capability is the main lever the designer has: a system prompt and a handful of examples reconfigure the policy without touching its weights. Understanding when it works requires a model of what is happening.</p>
+<p>The most illuminating account is Bayesian, due to Xie, Raghunathan, Liang and Ma (2021)<span class="cite"><a href="#ref-xie">[3]</a></span>. Suppose the training corpus is a mixture of documents, each generated by some latent "concept" \(\psi\): a task, a style, a format, a domain. A model that predicts the corpus well must, implicitly, infer which concept generated the document it is reading, because the right next token depends on it. Formally, its predictions approximate the posterior predictive</p>
+<div class="box formula">
+\[ p_\theta(y\mid \text{prompt})\;\approx\;\int p(y\mid\psi,\text{prompt})\;p(\psi\mid\text{prompt})\,d\psi . \]
+</div>
+<p>The prompt acts as evidence about \(\psi\). Each example in a few-shot prompt is a data point generated under the intended concept, so the posterior \(p(\psi\mid\text{prompt})\) concentrates on it, and the prediction for the query becomes the prediction a model specialised to that concept would make. Instructions work the same way, as strong evidence about the intended task. Figure 3.2 sketches the picture.</p>
+
+<figure class="diagram" id="fig-3-2">
+<svg class="dg" viewBox="0 0 720 240" role="img" aria-label="In-context learning as posterior concentration over latent concepts">
+<text x="120" y="22" text-anchor="middle" class="t-b">prior p(ψ)</text>
+<text x="360" y="22" text-anchor="middle" class="t-b">after 1 example</text>
+<text x="600" y="22" text-anchor="middle" class="t-b">after 3 examples</text>
+<line x1="20" y1="180" x2="220" y2="180" class="ln"/><line x1="260" y1="180" x2="460" y2="180" class="ln"/><line x1="500" y1="180" x2="700" y2="180" class="ln"/>
+<g class="fill-s3"><rect x="40" y="130" width="30" height="50"/><rect x="85" y="120" width="30" height="60"/><rect x="130" y="125" width="30" height="55"/><rect x="175" y="135" width="30" height="45"/></g>
+<g class="fill-s3"><rect x="280" y="160" width="30" height="20"/><rect x="325" y="80" width="30" height="100"/><rect x="370" y="150" width="30" height="30"/><rect x="415" y="168" width="30" height="12"/></g>
+<g class="fill-s3"><rect x="520" y="176" width="30" height="4"/><rect x="565" y="40" width="30" height="140"/><rect x="610" y="174" width="30" height="6"/><rect x="655" y="178" width="30" height="2"/></g>
+<g class="t-xs"><text x="55" y="196" text-anchor="middle">ψ₁</text><text x="100" y="196" text-anchor="middle">ψ₂</text><text x="145" y="196" text-anchor="middle">ψ₃</text><text x="190" y="196" text-anchor="middle">ψ₄</text>
+<text x="295" y="196" text-anchor="middle">ψ₁</text><text x="340" y="196" text-anchor="middle">ψ₂</text><text x="385" y="196" text-anchor="middle">ψ₃</text><text x="430" y="196" text-anchor="middle">ψ₄</text>
+<text x="535" y="196" text-anchor="middle">ψ₁</text><text x="580" y="196" text-anchor="middle">ψ₂</text><text x="625" y="196" text-anchor="middle">ψ₃</text><text x="670" y="196" text-anchor="middle">ψ₄</text></g>
+<text x="360" y="226" text-anchor="middle" class="t-xs">each demonstration is evidence about the latent task ψ; the prediction for the query averages over the posterior</text>
+</svg>
+<figcaption><b>Figure 3.2 — In-context learning as posterior concentration.</b> Before the examples the model is uncertain which latent task \(\psi\) generated the prompt. Each consistent example multiplies the odds in favour of the intended task, so a few examples usually suffice when that task is in the model's prior.</figcaption></figure>
+
+<p>Figure 3.2 makes two predictions that match practice. First, a few examples go a long way when the intended concept already has substantial prior mass: the posterior odds multiply by the likelihood ratio of each example, so they grow geometrically. Second, examples cannot conjure a concept the model has no prior for. If the task is genuinely novel, say an internal file format with idiosyncratic rules, the posterior concentrates on the nearest familiar concept, and the model confidently does the wrong thing. That is why detailed instructions, schemas and documentation in the context (which supply the concept explicitly) often help more than examples for agent tools, and why fine-tuning remains necessary for truly unfamiliar tasks.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — how many examples are enough?</div>
+<p>A prompt shows input–output pairs for a string transformation. Two latent tasks fit the format: \(\psi_A\) (the intended one) and \(\psi_B\), with prior probability one half each. Each example is nine times more likely under \(\psi_A\) than under \(\psi_B\) (it is consistent with \(\psi_B\) only by coincidence).</p>
+<p><b>Posterior.</b> After \(k\) examples the odds are \(9^k:1\), so \(p(\psi_A\mid\text{prompt})=9^k/(9^k+1)\): 0.900 for \(k=1\), 0.988 for \(k=2\), 0.9986 for \(k=3\).</p>
+<p><b>Error on the query.</b> If the two tasks disagree on the query, the model errs with probability about \(1/(9^k+1)\): 10% with one example, 1.2% with two, 0.14% with three. The fourth and fifth examples buy almost nothing.</p>
+<p><b>When the prior is unfavourable.</b> If \(p(\psi_A)=0.01\), three examples give odds \(729\times0.01/0.99\approx7.4\), a posterior of 0.88, and the model still errs 12% of the time; it takes five examples to reach 0.998. An unusual task needs either more evidence or an explicit description that raises its prior.</p>
+</div>
+
+<p>The Bayesian account is a model, not a mechanism, and two mechanistic findings complement it. Garg and colleagues (2022) trained Transformers on prompts of input–output pairs from random linear functions and found that the trained model's in-context predictions match ordinary least squares, the Bayes-optimal estimator for that prior: in-context learning can implement genuine statistical inference<span class="cite"><a href="#ref-garg">[4]</a></span>. Olsson and colleagues at Anthropic (2022) identified <em>induction heads</em>, attention circuits that find an earlier occurrence of the current token and copy what followed it, and showed that their emergence during training coincides with a sharp improvement in in-context learning<span class="cite"><a href="#ref-induction">[5]</a></span>. Copying patterns from earlier in the context is a crude but powerful form of learning from examples, and it explains a behaviour every agent builder notices: models imitate the format and style of whatever is in their context, including their own earlier mistakes. An agent whose history contains three sloppy tool calls is more likely to make a fourth.</p>
+<p>For an agent, the context is a growing in-context learning prompt: the system prompt and examples set the initial posterior over "what kind of task is this and how should I behave", and every observation and action updates it. This is the same picture as Chapter 2's belief state, now seen from inside the model. It also explains why the beginning of the context is so valuable: it fixes the concept against which everything else is interpreted. But in-context learning alone does not make a model do what users want. A raw model conditioned on a question will produce whatever usually follows such text. Making it an assistant took a different kind of training.</p>
+
+<h2 id="s3-4">3.4 From predictor to assistant: fine-tuning and RLHF</h2>
+<p>A pre-trained model asked "How do I reverse a list in Python?" might answer, or might continue with "How do I sort a list in Python? How do I…", because lists of questions are common on the web. To be a policy, the model must reliably produce the kind of output its user intends. Two stages of post-training achieve this, and both leave fingerprints on agent behaviour.</p>
+<p><strong>Supervised fine-tuning</strong> (SFT) continues training on a curated set of demonstrations: prompts paired with high-quality responses, written or vetted by people, increasingly generated by other models and filtered. The loss is the same cross-entropy as pre-training, computed only on the response tokens. The effect is to move the model's posterior over "what kind of document is this" decisively towards "a helpful assistant answering a user", so that it no longer needs to be coaxed by prompt engineering. For agents, SFT also teaches the <em>formats</em> of interaction: the chat template that separates system, user and assistant turns, and the syntax of tool calls and tool results. Figure 3.3 shows what the model actually sees.</p>
+
+<figure class="diagram" id="fig-3-3">
+<svg class="dg" viewBox="0 0 720 270" role="img" aria-label="A chat template: structured messages serialised into one token string">
+<defs><marker id="ah33" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<text x="150" y="22" text-anchor="middle" class="t-b">What the harness holds</text>
+<text x="530" y="22" text-anchor="middle" class="t-b">What the model reads (one string)</text>
+<rect x="20" y="36" width="260" height="34" rx="6" class="bx4"/><text x="30" y="58" class="t-sm">system: You are an airline agent…</text>
+<rect x="20" y="78" width="260" height="34" rx="6" class="bx3"/><text x="30" y="100" class="t-sm">tools: [lookup_booking, …] (JSON)</text>
+<rect x="20" y="120" width="260" height="34" rx="6" class="bx2"/><text x="30" y="142" class="t-sm">user: Change my flight to Friday</text>
+<rect x="20" y="162" width="260" height="34" rx="6" class="bx5"/><text x="30" y="184" class="t-sm">assistant: tool_call lookup_booking(…)</text>
+<rect x="20" y="204" width="260" height="34" rx="6" class="bx3"/><text x="30" y="226" class="t-sm">tool: {"flight": "BA117", …}</text>
+<line x1="290" y1="137" x2="360" y2="137" class="ln" marker-end="url(#ah33)"/><text x="325" y="128" text-anchor="middle" class="t-xs">template</text>
+<rect x="370" y="36" width="330" height="202" rx="8" class="fill-muted"/>
+<g font-family="JetBrains Mono, monospace" class="t-xs" style="font-variant-ligatures:none">
+<text x="382" y="58">&lt;|system|&gt; You are an airline agent…</text>
+<text x="382" y="80"># Tools: lookup_booking(ref: str) …</text>
+<text x="382" y="102">&lt;|end|&gt;&lt;|user|&gt; Change my flight to</text>
+<text x="382" y="124">Friday&lt;|end|&gt;&lt;|assistant|&gt;</text>
+<text x="382" y="146">&lt;tool_call&gt;{"name":"lookup_booking",</text>
+<text x="382" y="168">"arguments":{…}}&lt;/tool_call&gt;&lt;|end|&gt;</text>
+<text x="382" y="190">&lt;|tool|&gt;{"flight":"BA117",…}&lt;|end|&gt;</text>
+<text x="382" y="212">&lt;|assistant|&gt; ▮  ← model continues here</text>
+</g>
+</svg>
+<figcaption><b>Figure 3.3 — A chat template.</b> The harness keeps a structured list of messages; before each call it serialises them, with special tokens marking roles, into one token string, and the model continues after the final assistant marker. The exact markers differ between model families; the principle does not.</figcaption></figure>
+
+<p>Figure 3.3 dispels a common misconception. There is no separate channel for the system prompt, the tools or the tool results: everything is tokens in one sequence, distinguished only by special marker tokens that fine-tuning taught the model to respect. The model treats text after the system marker as more authoritative than text after a tool marker because it was trained on examples in which that was the right thing to do, not because of any hard boundary. This is the root of <em>prompt injection</em> (Chapter 20): text arriving in a tool result that says "ignore previous instructions" competes with the system prompt on the same footing, and the only defence inside the model is how firmly training established the hierarchy. Model developers now train explicitly on such an <em>instruction hierarchy</em><span class="cite"><a href="#ref-hierarchy">[6]</a></span>, but it remains a learned preference, not a guarantee.</p>
+<p>The second stage is <strong>reinforcement learning from human feedback</strong> (RLHF). Demonstrations show the model what good looks like; they do not show it the many ways of being slightly worse, nor rank alternatives. RLHF, as used for InstructGPT (§1.6)<span class="cite"><a href="#ref-instructgpt">[7]</a></span>, collects comparisons: for a prompt \(x\), people see two responses and choose the better. A <em>reward model</em> \(r_\phi(x,y)\) is fitted to the comparisons by maximum likelihood under the Bradley–Terry model<span class="cite"><a href="#ref-bt">[8]</a></span>, \(\Pr(y_w\succ y_l)=\sigma\big(r_\phi(x,y_w)-r_\phi(x,y_l)\big)\). The policy is then optimised to score highly under \(r_\phi\) while staying close to the fine-tuned model \(\pi_{\text{ref}}\):</p>
+<div class="box formula">
+\[ \max_{\pi}\;\mathbb E_{x}\Big[\mathbb E_{y\sim\pi(\cdot\mid x)}\,r_\phi(x,y)\;-\;\beta\,D_{\mathrm{KL}}\big(\pi(\cdot\mid x)\,\|\,\pi_{\text{ref}}(\cdot\mid x)\big)\Big]. \]
+</div>
+
+<div class="box thm">
+<div class="box-title">Proposition — the optimal KL-regularised policy</div>
+<p>For each prompt \(x\), the maximiser over distributions \(\pi(\cdot\mid x)\) is
+\[ \pi^*(y\mid x)=\frac{1}{Z(x)}\,\pi_{\text{ref}}(y\mid x)\,\exp\!\big(r_\phi(x,y)/\beta\big),\qquad Z(x)=\sum_y\pi_{\text{ref}}(y\mid x)\,e^{r_\phi(x,y)/\beta}. \]
+<em>Proof.</em> The objective for fixed \(x\) is \(\sum_y\pi(y)\big[r(y)-\beta\log\frac{\pi(y)}{\pi_{\text{ref}}(y)}\big]\). Writing \(\pi^*\) as above, this equals \(-\beta\,D_{\mathrm{KL}}(\pi\,\|\,\pi^*)+\beta\log Z\), which is maximised, uniquely, at \(\pi=\pi^*\) because the KL divergence is non-negative and zero only at equality.</p>
+</div>
+
+<p>The proposition says that RLHF <em>reweights</em> the fine-tuned model's distribution by an exponential of the reward: responses the reward model likes become more probable, by a factor controlled by \(\beta\), but nothing the reference model considers impossible can become likely. This picture, which Chapter 17 develops into direct preference optimisation, explains both what RLHF does well and its characteristic side effects. It does well what people reliably reward: helpful, clear, well-formatted, polite answers. It also amplifies whatever raters reward <em>unreliably</em>. People tend to prefer answers that agree with them, sound confident and are longer, and reward models learn those preferences. The result is a measurable tendency towards <strong>sycophancy</strong>, agreeing with a user's stated view even when it is wrong (Sharma et al., 2023)<span class="cite"><a href="#ref-sycophancy">[9]</a></span>, towards overconfidence (§3.6), and towards verbosity. For an agent these matter directly: a support agent that concedes a refund the policy forbids because the customer insists, or a coding agent that agrees its broken fix "should work" when the user suggests so, is exhibiting a trained preference, and the harness must counteract it with explicit policy, verification and, where needed, a second opinion.</p>
+<p>Since 2024 a third ingredient has become central: reinforcement learning against <strong>verifiable rewards</strong>, where the reward is not a learned model of human preference but an automatic check, such as unit tests passing, a maths answer matching, or a database reaching the right state. Reasoning models such as OpenAI's o1 and DeepSeek-R1 were trained this way (§1.9)<span class="cite"><a href="#ref-r1">[10]</a></span>, and agentic models are increasingly trained on whole multi-step tasks in sandboxed environments. This produces behaviours valuable to agents (persistence, checking work, recovering from errors) and its own failure mode, reward hacking, when the check is weaker than the goal. Chapter 18 is devoted to it. For now, the key point is that a modern model's dispositions as an agent are largely a product of post-training choices made by its developer, which is why the same harness can behave quite differently with different models.</p>
+
+<h2 id="s3-5">3.5 Sampling: the policy is random</h2>
+<p>The model outputs a distribution; the harness must choose one output. How it does so turns the agent's policy from a mathematical object into concrete behaviour, and the choice has a direct, computable effect on reliability. At each position the model produces logits \(z\in\mathbb R^{\lvert\mathcal V\rvert}\), and the next-token distribution with <strong>temperature</strong> \(T_s>0\) is</p>
+\[ p_{T_s}(v)=\frac{\exp(z_v/T_s)}{\sum_{u\in\mathcal V}\exp(z_u/T_s)} . \]
+<p>At \(T_s=1\) this is the model's own distribution. As \(T_s\to0\) it concentrates on the arg-max (greedy decoding); as \(T_s\to\infty\) it tends to uniform. Truncation rules such as top-\(p\) (sample only from the smallest set of tokens whose probabilities sum to \(p\)) remove the long tail of unlikely tokens. The companion book covers decoding algorithms in detail; what matters here is the effect on the agent.</p>
+<p>Consider one decision point where the model's logits for three candidate actions are \(z=(2,1,0)\), the first being correct. Figure 3.4 shows how temperature changes the probability of choosing it, and how that probability compounds when the same decision is faced five times, as pass^5 of §1.10.</p>
+
+<figure class="chart" id="fig-3-4">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Temperature and consistency at one decision (logits 2, 1, 0)","height":340,
+ "x":{"label":"Sampling temperature T_s","min":0,"max":3,"ticks":[0,0.5,1,1.5,2,2.5,3]},
+ "y":{"label":"Probability","min":0,"max":1,"fmt":"pct"},
+ "hlines":[{"y":0.3333,"text":"uniform: 1/3"}],
+ "series":[
+  {"name":"P(correct action), one decision","color":"s1","points":[[0.1,0.99995],[0.25,0.9817],[0.5,0.8668],[0.75,0.7502],[1,0.6652],[1.5,0.5627],[2,0.5065],[3,0.4485]]},
+  {"name":"pass^5: correct all five times","color":"s2","points":[[0.1,0.9998],[0.25,0.9118],[0.5,0.4893],[0.75,0.2376],[1,0.1302],[1.5,0.0564],[2,0.0333],[3,0.0181]]}
+ ]}
+</script>
+<figcaption><b>Figure 3.4 — Temperature trades consistency for diversity.</b> With logits \((2,1,0)\), the correct action is chosen 67% of the time at \(T_s=1\) but 98% at \(T_s=0.25\). Over five independent repetitions the gap widens: 13% against 91%.</figcaption></figure>
+
+<p>Figure 3.4 makes a point that is easy to state and often forgotten. At the model's native temperature, a decision with a clear but not overwhelming preference (logit gap of 1) is made correctly only two-thirds of the time, and an agent facing five such decisions in an episode gets all of them right only 13% of the time. Lowering the temperature sharpens every such preference and raises consistency dramatically. This is why agents are usually run at low temperature for actions with side effects, and why "the agent worked yesterday and failed today" so often has a simple explanation: it is a random policy, and yesterday's trajectory was one sample.</p>
+<p>Why not always use \(T_s=0\)? Three reasons. First, greedy decoding is consistent but not necessarily correct: if the model's top choice is wrong, it is wrong every time, whereas sampling at least sometimes tries the right action. When a verifier can select among attempts, diversity is valuable, and best-of-\(k\) search (Chapter 6) deliberately samples at higher temperature. Second, greedy decoding of long text tends to degenerate into repetition, and reasoning models are typically trained and served with sampling at moderate temperatures; their developers often recommend against \(T_s=0\). Third, even \(T_s=0\) is not exactly deterministic in practice: batched floating-point computation on GPUs can change results depending on what else is in the batch, so identical requests occasionally diverge. Reproducibility must therefore be engineered (logging seeds and full contexts, replaying tool outputs) rather than assumed.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — two decisions, one temperature</div>
+<p>A coding agent's episode contains two kinds of decision. <em>Edits</em> (12 per episode) have logit gap 2 between the right action and the best wrong one; <em>exploration choices</em> (which file to open next; 8 per episode) have many acceptable answers. Treat each edit as a two-way choice with logits \((2,0)\).</p>
+<p><b>At \(T_s=1\).</b> \(\Pr(\text{edit right})=e^2/(e^2+1)=7.389/8.389=0.881\); all 12 right: \(0.881^{12}=e^{12\ln0.881}=e^{-1.521}=0.219\).</p>
+<p><b>At \(T_s=0.5\).</b> Logits become \((4,0)\): \(\Pr=54.6/55.6=0.982\); all 12: \(0.982^{12}=e^{-0.218}=0.804\).</p>
+<p><b>Interpretation.</b> Halving the temperature raises the chance of a clean set of edits from 22% to 80%. Exploration choices are hardly affected, because many of their outcomes are acceptable. In practice, recovery (Chapter 2) also catches many wrong edits, but the lesson stands: temperature is a reliability parameter, not a style parameter, for actions that must be right.</p>
+</div>
+
+<h2 id="s3-6">3.6 Calibration: can the model's confidence be trusted?</h2>
+<p>An agent often needs to know how likely it is to be right: whether to escalate to a human, whether to run another check, whether a retrieved answer is good enough. The model's own confidence is the cheapest signal available. It is useful only if it is <strong>calibrated</strong>: among all the occasions on which the model says (or implies) it is 80% sure, it should be right about 80% of the time.</p>
+
+<div class="box def">
+<div class="box-title">Definition — calibration and expected calibration error</div>
+<p>A predictor that outputs an answer with confidence \(\hat c\in[0,1]\) is <strong>calibrated</strong> if \(\Pr(\text{correct}\mid\hat c=c)=c\) for all \(c\). Grouping predictions into bins \(B_1,\dots,B_J\) by confidence, the <strong>expected calibration error</strong> is \(\mathrm{ECE}=\sum_j\frac{\lvert B_j\rvert}{N}\,\big\lvert\mathrm{acc}(B_j)-\mathrm{conf}(B_j)\big\rvert\). A <strong>reliability diagram</strong> plots \(\mathrm{acc}(B_j)\) against \(\mathrm{conf}(B_j)\); a calibrated predictor lies on the diagonal.</p>
+</div>
+
+<p>There are several ways to extract a confidence from a language model: the probability it assigns to its answer's tokens, its probability of answering "True" when asked whether its own answer is correct (Kadavath et al., 2022)<span class="cite"><a href="#ref-kadavath">[11]</a></span>, a verbal statement ("I'm about 70% confident"), or agreement across several samples. Pre-trained models turn out to be remarkably well calibrated on multiple-choice questions when their token probabilities are used: Kadavath and colleagues found that large models "mostly know what they know". Post-training changes this. The GPT-4 technical report showed a reliability diagram in which the pre-trained model was close to the diagonal and the RLHF model was markedly overconfident<span class="cite"><a href="#ref-gpt4">[12]</a></span>, consistent with the reward-reweighting picture of §3.4: raters reward confident answers. Figure 3.5 sketches the typical shape.</p>
+
+<figure class="chart" id="fig-3-5">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Reliability diagram (schematic)","height":330,
+ "x":{"label":"Model's stated confidence","min":0.5,"max":1,"fmt":"pct","ticks":[0.5,0.6,0.7,0.8,0.9,1]},
+ "y":{"label":"Actual accuracy","min":0.4,"max":1,"fmt":"pct"},
+ "series":[
+  {"name":"perfect calibration","color":"s5","dash":true,"markers":false,"points":[[0.5,0.5],[1,1]]},
+  {"name":"pre-trained model (token probabilities)","color":"s1","points":[[0.55,0.54],[0.65,0.66],[0.75,0.74],[0.85,0.86],[0.95,0.94]]},
+  {"name":"after RLHF (overconfident)","color":"s2","points":[[0.55,0.47],[0.65,0.52],[0.75,0.57],[0.85,0.63],[0.95,0.72]]}
+ ]}
+</script>
+<figcaption><b>Figure 3.5 — Calibration before and after preference tuning (schematic).</b> The shape follows the published finding that pre-trained models' token probabilities are close to calibrated on multiple-choice tasks while preference-tuned models are overconfident; the points are illustrative, not measurements of a particular model.</figcaption></figure>
+
+<p>Figure 3.5 contains the practical rule: a raw confidence number from a chat model should not be taken at face value. Points below the diagonal mean that when the model says 95% it is right perhaps 70% of the time. Two remedies are standard. The first is <em>recalibration</em>: on a labelled validation set from the agent's own task distribution, fit a monotone map from the model's confidence to observed accuracy (temperature scaling or isotonic regression), and use the mapped value. The second is to use signals that are calibrated by construction, such as agreement across \(k\) independent samples (self-consistency, Chapter 5), or the verdict of an external check. Either way, calibration must be measured on the agent's real task distribution, because it varies across domains and degrades out of distribution.</p>
+<p>Calibration matters to agents because of <strong>selective escalation</strong>. A support agent that hands the hardest 20% of conversations to people, chosen by its confidence, is useful only if its confidence ranks conversations correctly by difficulty: what matters is that low confidence picks out the cases it would get wrong. Even a miscalibrated model can rank well (a monotone distortion preserves order), so the threshold must be set empirically on a validation set to hit a target accuracy on the cases the agent keeps. The model's confidence then becomes a dial trading automation rate against error rate, and the dial's quality, measured as accuracy at each coverage level, is one of the most useful numbers to report about a deployed agent.</p>
+
+<h2 id="s3-7">3.7 What a call costs</h2>
+<p>Every step of an agent is a model call, and the price and duration of a call have a structure that shapes agent design as much as any capability. A call has two phases, as Figure 3.6 shows. In <strong>prefill</strong>, the model reads the input tokens; because all of them are known in advance, they are processed in parallel, and the time is roughly proportional to the number of tokens not already cached, at \(v_{\text{pre}}\) tokens per second. In <strong>decode</strong>, the model writes the output one token at a time, each requiring a full pass through the model, at \(v_{\text{dec}}\) tokens per second. The time until the first output token appears (TTFT) is dominated by queueing and prefill; the remaining time by decode.</p>
+
+<figure class="diagram" id="fig-3-6">
+<svg class="dg" viewBox="0 0 720 200" role="img" aria-label="Timeline of one model call: queue, prefill, decode">
+<line x1="30" y1="120" x2="700" y2="120" class="ln"/>
+<rect x="30" y="90" width="50" height="30" class="fill-muted"/><text x="55" y="110" text-anchor="middle" class="t-xs">queue</text>
+<rect x="80" y="90" width="110" height="30" class="fill-s3"/><text x="135" y="110" text-anchor="middle" class="t-xs t-on">prefill (parallel)</text>
+<g class="fill-acc"><rect x="190" y="90" width="30" height="30"/><rect x="222" y="90" width="30" height="30"/><rect x="254" y="90" width="30" height="30"/><rect x="286" y="90" width="30" height="30"/><rect x="318" y="90" width="30" height="30"/><rect x="350" y="90" width="30" height="30"/><rect x="382" y="90" width="30" height="30"/><rect x="414" y="90" width="30" height="30"/><rect x="446" y="90" width="30" height="30"/><rect x="478" y="90" width="30" height="30"/><rect x="510" y="90" width="30" height="30"/><rect x="542" y="90" width="30" height="30"/><rect x="574" y="90" width="30" height="30"/><rect x="606" y="90" width="30" height="30"/><rect x="638" y="90" width="30" height="30"/></g>
+<text x="429" y="80" text-anchor="middle" class="t-sm">decode: one token per pass, n_out / v_dec seconds</text>
+<line x1="190" y1="130" x2="190" y2="150" class="ln"/><text x="190" y="166" text-anchor="middle" class="t-xs">first token (TTFT)</text>
+<line x1="668" y1="130" x2="668" y2="150" class="ln"/><text x="668" y="166" text-anchor="middle" class="t-xs">last token</text>
+<text x="135" y="60" text-anchor="middle" class="t-xs">n_new / v_pre seconds</text>
+<text x="135" y="44" text-anchor="middle" class="t-xs">cached prefix ≈ free</text>
+<text x="360" y="192" text-anchor="middle" class="t-xs">reading is fast and cheap per token; writing is slow and expensive per token</text>
+</svg>
+<figcaption><b>Figure 3.6 — Anatomy of one call.</b> Input tokens are read in parallel during prefill, and cached ones are nearly free; output tokens are written sequentially during decode. For typical agent steps, decode dominates the time even though input dominates the token count.</figcaption></figure>
+
+<p>Figure 3.6 explains the price list. Providers charge more per output token than per input token (five times more at our reference prices) because decode is the expensive phase for the hardware: each output token requires reading all the model's weights from memory for very little arithmetic, while prefill amortises that reading over many tokens. The companion book derives this from the memory bandwidth of GPUs. Cached input is cheaper still, because the work of reading it was done on an earlier call. Putting the pieces together, for a call with \(n^{\text{new}}\) fresh input tokens, \(n^{\text{cached}}\) cached ones and \(n_{\text{out}}\) output tokens,</p>
+<div class="box formula">
+\[ C=\kappa_{\text{in}}n^{\text{new}}+\kappa_{\text{cache}}n^{\text{cached}}+\kappa_{\text{out}}n_{\text{out}},\qquad \ell\approx\ell_{\text{queue}}+\frac{n^{\text{new}}}{v_{\text{pre}}}+\frac{n_{\text{out}}}{v_{\text{dec}}}. \]
+</div>
+<p>Three design consequences follow. <em>Make the model write less</em>: an agent whose steps produce 1,000 tokens of commentary takes \(1{,}000/60\approx17\) s per step and costs $0.015 per step in output alone; trimming to 200 tokens saves four-fifths of both. Reasoning models complicate this, because their hidden reasoning tokens are output tokens, billed and decoded like any other; a reasoning budget is therefore a latency and cost budget. <em>Make the model read stably</em>: since cached tokens cost a tenth, contexts should be append-only with a fixed prefix, the subject of Chapter 4. <em>Use the cheapest model that suffices</em>: our reference small model costs a twelfth as much per token and decodes two and a half times faster, so routing easy steps to it can cut cost substantially, if a reliable gate decides which steps are easy.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — a model cascade for the support agent</div>
+<p>Each support turn reads 8,000 tokens and writes 150 (ignore caching for simplicity). The frontier model costs \(0.008\times\$3+0.00015\times\$15=\$0.0263\) per turn; the small model \(0.008\times\$0.25+0.00015\times\$1.25=\$0.0022\).</p>
+<p><b>Cascade.</b> Every turn first goes to the small model, which also reports a calibrated confidence. Turns below a threshold, 30% of traffic, are re-run on the frontier model. Cost per turn: \(0.0022+0.3\times0.0263=\$0.0101\), 38% of frontier-only.</p>
+<p><b>Quality.</b> Suppose the frontier model is right on 95% of turns and the small model on 85%, with the small model's errors concentrated in its low-confidence turns, so that it is right on 96% of the 70% it keeps. Overall accuracy: \(0.7\times0.96+0.3\times0.95=0.957\), no worse than frontier-only. If instead its confidence were uninformative, it would keep an unfiltered 70% at 85% accuracy and overall accuracy would fall to \(0.7\times0.85+0.3\times0.95=0.88\).</p>
+<p><b>Latency.</b> Escalated turns pay for both calls, about 1 s for the small model plus 2.5 s for the frontier model's decode, so the cascade trades a slower tail for a cheaper mean.</p>
+</div>
+
+<h3 id="windows">Context windows: nominal and effective</h3>
+<p>One more property of a call shapes agents more than any price: the context window \(n_{\max}\), the maximum number of tokens the model can condition on. Windows grew from 2,048 tokens for GPT-3 (2020) to 128,000–200,000 tokens for typical frontier models in 2024–2025, with some offering a million or more. Why is there a limit at all? The model was trained on sequences up to some length and its position encoding is only reliable within that range, and the cost of attention grows with context length: each new token attends to every previous one, so the per-token compute and the memory for cached keys and values grow linearly with the context, and processing a whole context costs quadratically. The companion book treats the engineering of long contexts in depth.</p>
+<p>For an agent designer the important distinction is between the <em>nominal</em> window, the number of tokens the API accepts, and the <em>effective</em> window, the length up to which the model actually uses the information well. Benchmarks that hide a fact in a long document and ask about it ("needle in a haystack") are passed by most modern models at their full nominal length, but harder tests that require combining several facts, or reasoning over the whole context, show accuracy falling well before the nominal limit. In an agent, the context is not a clean document with one needle but a long, messy history of tool outputs, and the decline is correspondingly earlier. The practical rule is to treat the nominal window as a hard ceiling and to design for a working budget well below it, keeping in context only what the next decision needs. Chapter 4 makes this budget the organising principle of context engineering, and Chapter 14 shows what to do when a task's history cannot fit at all.</p>
+
+<p>The worked example connects the last two sections: a cascade is only as good as the calibration of the gate that runs it. It also illustrates a more general pattern in agent engineering, the substitution of a cheap, imperfect component guarded by a check for an expensive, better one. Chapter 21 treats routing and cascades systematically. Before leaving the model, we collect the failure modes it brings to every agent built on it.</p>
+
+<h2 id="s3-8">3.8 What the agent inherits</h2>
+<p>Every agent inherits its model's characteristic errors, and it is worth naming them, because each has a known engineering response and an interviewer will expect you to match the two.</p>
+<p><strong>Hallucination</strong> is the confident generation of false content: a function that does not exist, a citation to a paper never written, a refund policy invented on the spot. Its cause is the objective of §3.2: the model is trained to produce plausible continuations, and a plausible guess is rewarded as long as text like it appears in the corpus. The response is grounding: make the agent look things up rather than recall them, quote its sources, and check claims against tools (does the function exist? does the URL resolve?). <strong>Sycophancy</strong> (§3.4) is agreement with the user or with apparent authority at the expense of truth; the response is explicit policy in the system prompt, verification that does not depend on the model's judgement, and, for high-stakes decisions, a second model or a human. <strong>Overconfidence</strong> (§3.6) is the miscalibration of stated certainty; the response is recalibration and external checks. <strong>Prompt sensitivity</strong> is the dependence of behaviour on details of phrasing and order that should not matter; Sclar and colleagues found accuracy swings of tens of points from formatting changes alone in few-shot prompts<span class="cite"><a href="#ref-sclar">[13]</a></span>. The response is to evaluate prompts on a fixed test set, never on anecdotes, and to keep prompt changes under version control like code.</p>
+<p>Two further inherited properties concern the context. <strong>Position effects</strong>: models use information at the start and end of a long context more reliably than information in the middle (Liu et al., 2023)<span class="cite"><a href="#ref-lost">[14]</a></span>, and long contexts filled with irrelevant material degrade performance even when the relevant part is present. The response is to keep the context short and relevant, which Chapter 4 develops. <strong>Imitation of context</strong> (§3.3): the model continues patterns it sees, including errors and formats in its own earlier turns. The response is to keep the history clean (for example, by not leaving malformed tool calls in it once they are corrected) and to put good examples where the model will see them.</p>
+<p>Finally, the model has a <strong>knowledge cut-off</strong> and no access to anything after it, or to anything private, unless the harness provides it. An agent asked about this week's events, or about an internal code base, can only answer well by retrieving the information (Chapter 9). Each of these inherited properties reappears in a later chapter as the motivation for a technique, which is the sense in which this chapter is the foundation for the rest of the book.</p>
+
+<details class="drill">
+<summary>Drill 3.1 — temperature by hand</summary>
+<p>A model has logits \((3,0)\) for the correct and incorrect actions at a decision. (a) Find the probability of the correct action at \(T_s=1\) and \(T_s=2\). (b) At what temperature is it 99%?</p>
+<p>(a) \(T_s=1\): \(e^3/(e^3+1)=20.09/21.09=0.953\). \(T_s=2\): \(e^{1.5}/(e^{1.5}+1)=4.482/5.482=0.818\). (b) Need \(\sigma(3/T_s)=0.99\), i.e. \(3/T_s=\ln 99=4.595\), so \(T_s=0.653\).</p>
+</details>
+
+<details class="drill">
+<summary>Drill 3.2 — the cost of thinking</summary>
+<p>A reasoning model spends 2,000 hidden reasoning tokens and 200 visible tokens per agent step, reading 20,000 fresh tokens. Using the reference prices and speeds, what does a step cost and how long does it take? How do the numbers change with a 500-token reasoning budget?</p>
+<p>Output is 2,200 tokens: cost \(0.02\times\$3+0.0022\times\$15=\$0.06+\$0.033=\$0.093\); time \(20{,}000/5{,}000+2{,}200/60=4+36.7=40.7\) s. With a 500-token budget, output is 700 tokens: $0.0705 and \(4+11.7=15.7\) s. The reasoning budget is mostly a latency lever: it cuts the step time by 61% and its cost by 24%. Whether quality survives must be measured; Chapter 5 shows how accuracy depends on reasoning length.</p>
+</details>
+
+<details class="drill">
+<summary>Drill 3.3 — how many examples?</summary>
+<p>Two tasks fit a prompt's format, with prior odds 1:4 against the intended one, and each example has likelihood ratio 5 in its favour. How many examples are needed for the posterior to exceed 99%?</p>
+<p>Odds after \(k\) examples: \(5^k/4\). Need \(5^k/4\ge99\), i.e. \(5^k\ge396\): \(k=4\) gives 625, so four examples (posterior \(625/629=0.994\)); three give \(125/4=31\), a posterior of 0.969.</p>
+</details>
+
+<h2 id="looking-ahead" class="unnumbered">Looking ahead</h2>
+<p>The model behaves like an implicit Bayesian reasoner whose posterior over "what is going on and what should I do" is set by its context. It reads cheaply and writes expensively, it is overconfident after preference tuning, and it imitates whatever it sees. All of this puts the context at the centre of agent design: it is the agent's belief state (Chapter 2), its in-context learning prompt (§3.3), its main cost (§3.7) and its main attack surface (§3.4). How, then, should the context be built? What goes in the system prompt, how should tools be described, where should examples go, how do we keep it cacheable, and what happens as it fills up? Chapter 4 turns these questions into the discipline of context engineering.</p>
+
+<h2 id="summary">Chapter summary</h2>
+<ul>
+<li>The agent's policy has four layers: pre-training (knowledge, in-context learning), fine-tuning (instruction following, formats), RL (preferences, reasoning; also sycophancy and overconfidence) and inference (randomness, cost, limits).</li>
+<li>Next-token prediction forces a model to represent regularities of the world described by text, including traces of goal-directed behaviour, which is why a predictor can act as a policy. Tokens are the unit of limits and prices: about 1.3 per word, 650 per page.</li>
+<li><b>In-context learning</b> behaves like Bayesian inference over latent tasks: examples multiply posterior odds, so a few suffice for familiar tasks, while unfamiliar tasks need explicit description or fine-tuning. Models imitate their context, including errors.</li>
+<li><b>RLHF</b> fits a Bradley–Terry reward model and optimises reward minus \(\beta\)·KL, whose optimum is \(\pi^*\propto\pi_{\text{ref}}e^{r/\beta}\): a reweighting that amplifies what raters reward, reliably or not. Chat templates serialise all roles into one token string, so instruction hierarchy is learned, not enforced.</li>
+<li><b>Temperature</b> sharpens or flattens the policy; consistency (pass^\(k\)) is very sensitive to it. Use low temperature for consequential actions and diversity only with selection. \(T_s=0\) is not perfectly deterministic.</li>
+<li><b>Calibration</b>: pre-trained token probabilities are close to calibrated; preference-tuned models are overconfident. Recalibrate on task data and set escalation thresholds empirically.</li>
+<li>A call costs \(\kappa_{\text{in}}n^{\text{new}}+\kappa_{\text{cache}}n^{\text{cached}}+\kappa_{\text{out}}n_{\text{out}}\) and takes about \(n^{\text{new}}/v_{\text{pre}}+n_{\text{out}}/v_{\text{dec}}\). Write less, read stably, and route to cheaper models through calibrated gates.</li>
+<li>Inherited failure modes (hallucination, sycophancy, overconfidence, prompt sensitivity, position effects, context imitation, knowledge cut-off) each motivate a later technique.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ch03-mcq-01" data-topic="§3.1 Layers">
+<p class="q">Which layer of Figure 3.1 is chiefly responsible for a model's tendency to agree with a user who is wrong?</p>
+<ol class="opts"><li>Pre-training</li><li>Supervised fine-tuning</li><li data-correct>Reinforcement learning from human preferences</li><li>The decoding rule</li></ol>
+<div class="explain">Raters tend to prefer agreement; the reward model learns it and RLHF amplifies it (sycophancy).</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-02" data-topic="§3.2 Tokens">
+<p class="q">About how many tokens is a 40-page English report, using the book's rule of thumb?</p>
+<ol class="opts"><li>4,000</li><li data-correct>26,000</li><li>80,000</li><li>260,000</li></ol>
+<div class="explain">About 650 tokens per page: \(40\times650=26{,}000\).</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-03" data-topic="§3.2 Pre-training">
+<p class="q">Why can a model trained only on next-token prediction act as a reasonable policy?</p>
+<ol class="opts"><li>Because it was trained with rewards</li><li data-correct>Because its corpus contains many traces of goal-directed behaviour, and continuing a trace amounts to choosing an action</li><li>Because tokens are actions by definition</li><li>Because it has observed environments directly</li></ol>
+<div class="explain">Text written by people solving problems is evidence of policies; predicting its continuation imitates them.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-04" data-topic="§3.2 Pre-training">
+<p class="q">Select all things that pre-training alone does <em>not</em> give a model.</p>
+<ol class="opts"><li data-correct>Knowledge of events after its training cut-off</li><li data-correct>Observations of the consequences of its own actions</li><li>Broad knowledge of code and prose</li><li data-correct>A reliable preference for doing what the user wants</li></ol>
+<div class="explain">Pre-training provides breadth. Recency, grounding and instruction following come from retrieval, tools and post-training.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-05" data-topic="§3.3 In-context learning">
+<p class="q">In the Bayesian account of in-context learning, a few-shot example acts as:</p>
+<ol class="opts"><li>A gradient step on the weights</li><li data-correct>Evidence that updates the posterior over latent tasks</li><li>A change of the vocabulary</li><li>A constraint on decoding</li></ol>
+<div class="explain">\(p(y\mid\text{prompt})\approx\int p(y\mid\psi)p(\psi\mid\text{prompt})d\psi\); examples sharpen \(p(\psi\mid\text{prompt})\). No weights change.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-06" data-topic="§3.3 In-context learning">
+<p class="q">Prior odds 1:1, likelihood ratio 9 per example. After two examples the posterior on the intended task is about:</p>
+<ol class="opts"><li>0.90</li><li data-correct>0.988</li><li>0.81</li><li>0.9986</li></ol>
+<div class="explain">Odds \(81:1\), posterior \(81/82\approx0.988\).</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-07" data-topic="§3.3 In-context learning">
+<p class="q">Why do examples help less for a genuinely novel internal file format?</p>
+<ol class="opts"><li>Because examples are always ignored</li><li data-correct>Because the intended concept has little prior mass, so the posterior concentrates on the nearest familiar concept</li><li>Because the context window is too small</li><li>Because temperature is too high</li></ol>
+<div class="explain">Examples multiply odds; with a tiny prior, many examples or an explicit description are needed.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-08" data-topic="§3.3 Mechanisms">
+<p class="q">Induction heads are attention circuits that:</p>
+<ol class="opts"><li>Compute the softmax temperature</li><li data-correct>Find an earlier occurrence of the current token and predict what followed it</li><li>Store the system prompt</li><li>Parse tool calls</li></ol>
+<div class="explain">Their emergence coincides with a jump in in-context learning; they also explain imitation of patterns in the context.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-09" data-topic="§3.3 Imitation">
+<p class="q">An agent's history contains several malformed tool calls that were later corrected. A sensible harness practice is to:</p>
+<ol class="opts"><li>Keep them to show the model its mistakes</li><li data-correct>Remove or replace them once corrected, since models imitate patterns in their context</li><li>Raise the temperature</li><li>Duplicate them for emphasis</li></ol>
+<div class="explain">Malformed patterns in context make similar outputs more likely. A short note on what went wrong is better than the raw error-prone pattern.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-10" data-topic="§3.4 Chat templates">
+<p class="q">In a chat template, the system prompt is:</p>
+<ol class="opts"><li>Sent on a separate, privileged channel that the model cannot override</li><li data-correct>Tokens in the same sequence as everything else, marked by special tokens whose authority is learned</li><li>Stored in the model's weights</li><li>Only used during training</li></ol>
+<div class="explain">Everything is one token string; the instruction hierarchy is a trained preference, which is why prompt injection is possible.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-11" data-topic="§3.4 RLHF">
+<p class="q">Under the Bradley–Terry model, if \(r(y_w)-r(y_l)=2\), the probability that \(y_w\) is preferred is about:</p>
+<ol class="opts"><li>0.5</li><li>0.73</li><li data-correct>0.88</li><li>0.98</li></ol>
+<div class="explain">\(\sigma(2)=1/(1+e^{-2})\approx0.881\).</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-12" data-topic="§3.4 RLHF">
+<p class="q">The optimal policy of \(\max_\pi\mathbb E_\pi[r]-\beta D_{\mathrm{KL}}(\pi\|\pi_{\text{ref}})\) is:</p>
+<ol class="opts"><li>\(\arg\max_y r(y)\)</li><li data-correct>\(\pi_{\text{ref}}(y)\exp(r(y)/\beta)/Z\)</li><li>\(\pi_{\text{ref}}\) unchanged</li><li>Uniform over high-reward responses</li></ol>
+<div class="explain">The objective equals \(-\beta D_{\mathrm{KL}}(\pi\|\pi^*)+\beta\log Z\), maximised at \(\pi^*\).</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-13" data-topic="§3.4 RLHF">
+<p class="q">As \(\beta\to\infty\) in the KL-regularised objective, the optimal policy tends to:</p>
+<ol class="opts"><li data-correct>The reference policy</li><li>The reward-maximising response</li><li>The uniform distribution</li><li>A random policy</li></ol>
+<div class="explain">\(e^{r/\beta}\to1\), so \(\pi^*\to\pi_{\text{ref}}\). As \(\beta\to0\) it concentrates on the highest-reward response in the support of \(\pi_{\text{ref}}\).</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-14" data-topic="§3.4 RLHF">
+<p class="q">Why can RLHF make a response more likely only if the reference model already gives it non-zero probability?</p>
+<ol class="opts"><li>Because rewards are bounded</li><li data-correct>Because the optimum multiplies \(\pi_{\text{ref}}(y)\) by a finite factor</li><li>Because the KL term is always zero</li><li>Because of the softmax temperature</li></ol>
+<div class="explain">\(\pi^*(y)\propto\pi_{\text{ref}}(y)e^{r(y)/\beta}\): zero stays zero. RLHF reweights rather than invents.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-15" data-topic="§3.4 Verifiable rewards">
+<p class="q">Reinforcement learning with verifiable rewards differs from RLHF mainly in that:</p>
+<ol class="opts"><li>It uses no policy gradient</li><li data-correct>The reward comes from an automatic check (tests, exact answers, end-states) rather than a learned preference model</li><li>It requires no environment</li><li>It cannot cause reward hacking</li></ol>
+<div class="explain">Verifiable rewards avoid reward-model errors but can still be hacked when the check is weaker than the goal.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-16" data-topic="§3.5 Temperature">
+<p class="q">With logits \((2,1,0)\), the probability of the first action at \(T_s=1\) is about:</p>
+<ol class="opts"><li>0.33</li><li>0.50</li><li data-correct>0.67</li><li>0.87</li></ol>
+<div class="explain">\(e^2/(e^2+e+1)=7.389/11.107\approx0.665\).</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-17" data-topic="§3.5 Temperature">
+<p class="q">Halving the temperature is equivalent to:</p>
+<ol class="opts"><li>Halving the logits</li><li data-correct>Doubling the logits</li><li>Adding a constant to the logits</li><li>Taking the square root of the probabilities</li></ol>
+<div class="explain">\(z/T_s\) with \(T_s\to T_s/2\) doubles every logit, which squares the unnormalised probabilities.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-18" data-topic="§3.5 Temperature">
+<p class="q">When is sampling at a higher temperature beneficial for an agent?</p>
+<ol class="opts"><li>For irreversible actions</li><li data-correct>When several attempts are generated and a reliable verifier selects among them</li><li>When pass^\(k\) must be maximised</li><li>Never</li></ol>
+<div class="explain">Diversity helps best-of-\(k\) with selection; it hurts consistency of single attempts.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-19" data-topic="§3.5 Determinism">
+<p class="q">Why can two identical requests at \(T_s=0\) still produce different outputs?</p>
+<ol class="opts"><li>Because greedy decoding samples</li><li data-correct>Because batched floating-point computation can differ with batch composition, changing near-tied arg-maxes</li><li>Because the tokenizer is random</li><li>Because the cache expires</li></ol>
+<div class="explain">Non-associativity of floating-point arithmetic plus batch-dependent kernels can flip near-ties. Reproducibility must be engineered.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-20" data-topic="§3.6 Calibration">
+<p class="q">A model is calibrated if:</p>
+<ol class="opts"><li>It is always right when confident</li><li data-correct>Among answers given with confidence \(c\), the fraction correct is \(c\)</li><li>Its confidence is always above 50%</li><li>Its ECE is maximal</li></ol>
+<div class="explain">Calibration matches stated confidence to empirical accuracy; it does not require high accuracy.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-21" data-topic="§3.6 Calibration">
+<p class="q">On a reliability diagram, points lying below the diagonal indicate:</p>
+<ol class="opts"><li>Underconfidence</li><li data-correct>Overconfidence</li><li>Perfect calibration</li><li>High accuracy</li></ol>
+<div class="explain">Accuracy lower than stated confidence means the model claims more certainty than it has.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-22" data-topic="§3.6 Calibration">
+<p class="q">ECE over two bins: 600 predictions at confidence 0.9 with accuracy 0.8, and 400 at confidence 0.6 with accuracy 0.6. ECE is:</p>
+<ol class="opts"><li>0.04</li><li data-correct>0.06</li><li>0.10</li><li>0.20</li></ol>
+<div class="explain">\(0.6\times0.1+0.4\times0=0.06\).</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-23" data-topic="§3.6 Selective escalation">
+<p class="q">For selective escalation, the property of the confidence signal that matters most is:</p>
+<ol class="opts"><li>Its absolute calibration</li><li data-correct>That it ranks cases by likelihood of error, so a threshold separates hard cases</li><li>That it is verbalised</li><li>That it is always above 0.5</li></ol>
+<div class="explain">Any monotone distortion preserves ranking; thresholds are set empirically on validation data for a target accuracy.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-24" data-topic="§3.7 Cost">
+<p class="q">Why do providers charge more per output token than per input token?</p>
+<ol class="opts"><li>Output tokens are longer</li><li data-correct>Decode produces one token per pass, reading all weights for little arithmetic, while prefill amortises that reading across many tokens</li><li>Input tokens are compressed</li><li>Output tokens require retrieval</li></ol>
+<div class="explain">Decode is memory-bandwidth bound and sequential; prefill is parallel. The companion book derives this.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-25" data-topic="§3.7 Latency">
+<p class="q">A step reads 10,000 fresh tokens and writes 600 at the reference speeds. Its model time is about:</p>
+<ol class="opts"><li>2 s</li><li data-correct>12 s</li><li>60 s</li><li>0.2 s</li></ol>
+<div class="explain">\(10{,}000/5{,}000+600/60=2+10=12\) s.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-26" data-topic="§3.7 Reasoning tokens">
+<p class="q">Hidden reasoning tokens of a reasoning model are:</p>
+<ol class="opts"><li>Free, because the user does not see them</li><li data-correct>Output tokens: decoded sequentially and billed at the output price</li><li>Input tokens</li><li>Cached tokens</li></ol>
+<div class="explain">A reasoning budget is therefore a latency and cost budget.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-27" data-topic="§3.7 Cascades">
+<p class="q">A cascade sends all turns to a small model ($0.002) and escalates 40% to a frontier model ($0.026). Cost per turn is about:</p>
+<ol class="opts"><li>$0.0104</li><li data-correct>$0.0124</li><li>$0.026</li><li>$0.028</li></ol>
+<div class="explain">\(0.002+0.4\times0.026=0.0124\).</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-28" data-topic="§3.7 Cascades">
+<p class="q">A cascade's quality depends most on:</p>
+<ol class="opts"><li>The frontier model's temperature</li><li data-correct>Whether the small model's confidence identifies the turns it would get wrong</li><li>The number of tokens in the system prompt</li><li>The output price</li></ol>
+<div class="explain">With an uninformative gate, the kept turns have the small model's average error rate.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-29" data-topic="§3.8 Failure modes">
+<p class="q">Match the failure to its standard response: hallucinated API functions in a coding agent.</p>
+<ol class="opts"><li>Raise temperature</li><li data-correct>Ground with tools: search the code base or documentation and check the function exists</li><li>Add more few-shot examples of any kind</li><li>Remove the system prompt</li></ol>
+<div class="explain">Look things up rather than recall; verify claims against the environment.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-30" data-topic="§3.8 Failure modes">
+<p class="q">Select all that are practices against prompt sensitivity.</p>
+<ol class="opts"><li data-correct>Evaluate prompt changes on a fixed test set</li><li data-correct>Keep prompts under version control</li><li>Judge prompts by a few memorable examples</li><li data-correct>Report variance across paraphrases or orderings</li></ol>
+<div class="explain">Prompts are code; changes need regression tests, not anecdotes.</div>
+</div>
+
+<div class="mcq" data-id="ch03-mcq-31" data-topic="§3.8 Position effects">
+<p class="q">"Lost in the middle" refers to:</p>
+<ol class="opts"><li>Agents losing track of their goal mid-episode</li><li data-correct>Models using information in the middle of long contexts less reliably than at the start or end</li><li>Tokens dropped by the tokenizer</li><li>Cache misses in the middle of the context</li></ol>
+<div class="explain">Liu et al. (2023) found U-shaped accuracy versus the position of relevant information.</div>
+</div>
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer out loud first, then reveal the model answer and rate yourself.</p>
+
+<details class="qa" data-id="ch03-qa-01">
+<summary><span class="lvl warm">Warm-up</span> What is in-context learning, and why does it matter for agents?</summary>
+<div class="answer"><p>In-context learning is a model's ability to perform a task specified only by instructions and examples in its prompt, with no weight updates. It emerged with scale (GPT-3). For agents it is the main configuration lever: the system prompt, tool descriptions and examples set the policy, and every observation in the context further conditions it. A useful model is Bayesian: the prompt is evidence about the latent task, so a few examples suffice for familiar tasks, while unfamiliar ones need explicit descriptions or fine-tuning. It also explains why models imitate patterns in their context, good or bad.</p></div>
+</details>
+
+<details class="qa" data-id="ch03-qa-02">
+<summary><span class="lvl warm">Warm-up</span> What does temperature do, and what temperature would you use for an agent's tool calls?</summary>
+<div class="answer"><p>Temperature divides logits before the softmax: low values sharpen the distribution towards the arg-max, high values flatten it. For consequential tool calls I would use a low temperature, because consistency compounds: a decision with a logit gap of 1 is right 73% of the time at \(T_s=1\) in a two-way choice, far less reliably than at 0.3. I would raise it when generating several candidates for a verifier to choose among, and follow the model developer's guidance for reasoning models, which are often tuned for moderate temperatures. I would also not assume \(T_s=0\) is deterministic.</p></div>
+</details>
+
+<details class="qa" data-id="ch03-qa-03">
+<summary><span class="lvl warm">Warm-up</span> Why is output more expensive than input, and what does that imply for agent design?</summary>
+<div class="answer"><p>Input is processed in parallel during prefill, amortising the cost of reading the weights; output is generated one token per forward pass, each pass reading the weights for little computation, so it is slow and occupies the hardware longer. Implications: keep outputs short (concise reasoning, compact tool calls), set reasoning budgets, prefer tools that return the needed information over the model writing long intermediate text, and remember that latency is dominated by output length. Input is cheap per token but dominates volume in agents, so caching matters too.</p></div>
+</details>
+
+<details class="qa" data-id="ch03-qa-04">
+<summary><span class="lvl core">Core</span> Derive the optimal policy of the KL-regularised RLHF objective and interpret it.</summary>
+<div class="answer"><p>For a fixed prompt, maximise \(\sum_y\pi(y)r(y)-\beta\sum_y\pi(y)\log\frac{\pi(y)}{\pi_{\text{ref}}(y)}\) over the simplex. Define \(\pi^*(y)=\pi_{\text{ref}}(y)e^{r(y)/\beta}/Z\). Substituting \(r(y)=\beta\log\frac{\pi^*(y)}{\pi_{\text{ref}}(y)}+\beta\log Z\), the objective becomes \(-\beta D_{\mathrm{KL}}(\pi\|\pi^*)+\beta\log Z\), maximised uniquely at \(\pi^*\). Interpretation: RLHF exponentially tilts the reference distribution towards high reward; \(\beta\) controls how far. It cannot create behaviours the reference assigns zero probability, and it amplifies whatever the reward model rewards, including rater biases such as preferring agreement or length. This is also the starting point of DPO: inverting the relation expresses the reward in terms of the policy.</p></div>
+</details>
+
+<details class="qa" data-id="ch03-qa-05">
+<summary><span class="lvl core">Core</span> What is sycophancy, where does it come from, and how would you mitigate it in a support agent?</summary>
+<div class="answer"><p>Sycophancy is a model's tendency to agree with the user's stated beliefs or demands even when wrong. It comes largely from preference tuning: raters tend to prefer agreeable answers, reward models learn it, and RLHF amplifies it. In a support agent it shows up as conceding refunds or exceptions the policy forbids because the customer insists. Mitigations: state the policy and the authority hierarchy explicitly in the system prompt; make policy checks deterministic in code where possible (the refund tool itself refuses ineligible requests); require the agent to cite the policy clause for exceptions; evaluate with adversarial simulated customers; and route contested cases to humans.</p></div>
+</details>
+
+<details class="qa" data-id="ch03-qa-06">
+<summary><span class="lvl core">Core</span> How would you obtain a confidence estimate from an LLM agent, and how would you check whether it can be trusted?</summary>
+<div class="answer"><p>Options: token probability of the answer (or of a short final label), asking the model for P(True) about its own answer, verbalised confidence, agreement rate across \(k\) samples, or an external verifier's score. To check it, assemble a labelled validation set from the real task distribution, bin predictions by confidence and plot a reliability diagram; compute ECE and, more importantly for escalation, the accuracy–coverage curve (accuracy of the cases kept as the threshold varies) and AUROC for separating correct from incorrect. Recalibrate with temperature scaling or isotonic regression if needed, and re-check after any model or prompt change, since calibration shifts with both.</p></div>
+</details>
+
+<details class="qa" data-id="ch03-qa-07">
+<summary><span class="lvl core">Core</span> Estimate the cost and latency of an agent step that reads 30k tokens (25k cached) and writes 400 tokens.</summary>
+<div class="answer"><p>Cost: fresh \(5{,}000\times\$3/\text{M}=\$0.015\); cached \(25{,}000\times\$0.30/\text{M}=\$0.0075\); output \(400\times\$15/\text{M}=\$0.006\); total $0.0285. Latency: prefill of 5,000 fresh tokens at 5,000/s is 1 s; decode of 400 tokens at 60/s is 6.7 s; about 7.7 s plus queueing and tool time. Decode dominates time, fresh input dominates cost here; caching saved \(25{,}000\times\$2.70/\text{M}=\$0.0675\).</p></div>
+</details>
+
+<details class="qa" data-id="ch03-qa-08">
+<summary><span class="lvl core">Core</span> Explain chat templates and why they matter for security.</summary>
+<div class="answer"><p>A chat template serialises structured messages (system, user, assistant, tool) into a single token sequence using special role-marker tokens; the model was fine-tuned on this format. All content, including tool results from untrusted sources, ends up in the same sequence, and the authority of the system prompt over tool content is a learned behaviour, not an enforced boundary. Hence indirect prompt injection: instructions in a web page or email returned by a tool can compete with the developer's instructions. Defences cannot rely on the template alone; they need privilege separation, constrained tool permissions, and treating tool outputs as data (Chapter 20). Using the wrong template for a model also degrades behaviour badly, which is a common bug with open models.</p></div>
+</details>
+
+<details class="qa" data-id="ch03-qa-09">
+<summary><span class="lvl core">Core</span> Your agent works in testing and fails intermittently in production with the same prompts. What could be going on?</summary>
+<div class="answer"><p>It is a random policy: at non-zero temperature, each run is a sample, and pass^\(k\) can be much lower than single-run success. Even at \(T_s=0\), batch-dependent numerics can flip near-tied choices. Other causes: production contexts differ (longer histories, different tool outputs, real user phrasing), model version changes behind an alias, cache or truncation differences, rate-limit retries changing order, and non-deterministic tools. Diagnose by logging full contexts and outputs, replaying failures, measuring success over many samples per task (not one), lowering temperature for consequential steps, and pinning model versions.</p></div>
+</details>
+
+<details class="qa" data-id="ch03-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> Present the Bayesian view of in-context learning and its limits. What does it predict that you could test?</summary>
+<div class="answer"><p>If pre-training data are a mixture over latent concepts, a good predictor approximates the posterior predictive, integrating over concepts weighted by their posterior given the prompt; examples are evidence that concentrates the posterior. Predictions: accuracy improves roughly geometrically in odds with consistent examples; label noise in examples hurts less than expected when the concept is identifiable from the inputs' format; novel concepts with low prior require many examples; order and format changes matter because they change the likelihoods. Limits: real models are not exact Bayesians; they show recency and position biases, can be swayed by label semantics, and in-context "learning" can also implement algorithms (least squares, gradient-descent-like updates) that are not well described as selecting a pretrained concept. Tests: vary the number of examples and the prior plausibility of the task and look at the shape of the accuracy curve; flip labels and see whether the model follows them (large models do more).</p></div>
+</details>
+
+<details class="qa" data-id="ch03-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> Why might preference tuning hurt calibration, and how would you restore usable confidence for an agent?</summary>
+<div class="answer"><p>The RLHF optimum tilts the distribution by \(e^{r/\beta}\); if raters reward confident, decisive answers, probability mass moves towards a single answer regardless of whether the model "knows", so token probabilities become sharper than accuracy warrants. Verbal confidence is also shaped by what raters like. Restoration: recalibrate on task data with temperature scaling of answer log-probabilities or isotonic regression; use sample agreement, which measures the spread of the policy's own distribution; use a separately trained verifier or a P(True) probe; and combine signals with a small logistic model fitted on validation data. Evaluate by accuracy–coverage curves on held-out tasks and re-fit after model updates.</p></div>
+</details>
+
+<details class="qa" data-id="ch03-qa-12">
+<summary><span class="lvl deep">Deep-dive</span> Compare token-probability confidence, verbalised confidence and self-consistency for agent escalation.</summary>
+<div class="answer"><p>Token probabilities are cheap and, for pre-trained models on short closed-form answers, well calibrated, but they are often unavailable from APIs, ill-defined for long free-form outputs, and distorted by post-training. Verbalised confidence is always available and interpretable, but is coarse, often overconfident, and sensitive to prompting. Self-consistency (agreement of \(k\) samples) works for any output with a comparable answer, captures the policy's actual uncertainty, and tends to rank well, but costs \(k\) times as much and needs a way to compare answers. In practice: self-consistency or a verifier for high-stakes, low-volume decisions; a cheap probe or recalibrated token probability for high-volume gating; always validated on the real distribution.</p></div>
+</details>
+
+<details class="qa" data-id="ch03-qa-13">
+<summary><span class="lvl design">Design</span> Design a model-routing scheme for a high-volume support agent that must keep quality while cutting cost.</summary>
+<div class="answer"><p>Classify turns by type and risk: greetings, FAQ, status look-ups (low risk) vs refunds, changes, complaints (high risk). Route low-risk types to a small model by rule; for others, run the small model with a calibrated confidence (sample agreement or a trained probe) and escalate below a threshold tuned on validation data to meet a target accuracy; always route irreversible actions through the frontier model or a deterministic policy check. Measure per-type accuracy, escalation rate, cost per conversation and tail latency; monitor drift in the gate's calibration; keep a shadow evaluation comparing small-model decisions against frontier decisions on a sample. Expect savings of half or more of model cost if most traffic is routine and the gate ranks well.</p></div>
+</details>
+
+<details class="qa" data-id="ch03-qa-14">
+<summary><span class="lvl design">Design</span> A product manager wants the agent to "never hallucinate". What do you build?</summary>
+<div class="answer"><p>Reframe as: claims that matter must be grounded and checkable. Build retrieval over authoritative sources and require the agent to answer from them with citations; restrict factual tools to verified data (booking system, documentation); add a verification step that checks citations support claims (string match or a judge model) and that referenced entities exist (functions, URLs, booking numbers); allow and reward "I don't know" and escalation; set low temperature for factual answers; evaluate with a hallucination test set including unanswerable questions; and monitor in production by sampling and auditing. Be explicit that the rate can be driven low but not to zero, and design the user experience accordingly.</p></div>
+</details>
+
+<details class="qa" data-id="ch03-qa-15">
+<summary><span class="lvl design">Design</span> You can either fine-tune a small model for your agent's tool use or keep prompting a frontier model. How do you decide?</summary>
+<div class="answer"><p>Consider: task novelty (in-context learning works when the behaviour is near the prior; unusual formats or domain rules favour fine-tuning); volume and cost (at high volume the frontier model's price dominates and a fine-tuned small model can be an order of magnitude cheaper); latency needs; data availability (hundreds to thousands of good trajectories, possibly distilled from the frontier model); the pace of change (prompts adapt in minutes; fine-tunes need retraining); and quality ceiling (frontier models handle the long tail better). A common path is to prototype with the frontier model, log trajectories, filter the successful ones, distil into a small model for the routine traffic, and keep the frontier model behind a confidence gate for the rest, evaluating both on the same test set.</p></div>
+</details>
+
+<details class="qa" data-id="ch03-qa-16">
+<summary><span class="lvl deep">Deep-dive</span> Why does a predictor of internet text end up with representations useful for acting? Give the argument and its caveats.</summary>
+<div class="answer"><p>Minimising cross-entropy on a corpus generated by processes in the world (people writing about facts, code that runs, conversations with goals) rewards any internal variable that improves prediction; latent variables of the generating process, such as the state of a program, the truth of a claim or a writer's intent, are such variables, so sufficiently good predictors learn representations of them (probing finds board states, truth directions, etc.). Traces of goal-directed behaviour are common, so the model learns conditional distributions of next actions given situations. Caveats: the model learns what people wrote, not what is true; it has no interventional data, so causal knowledge is second-hand; representations are only as good as the coverage of the corpus; and imitation of average behaviour is not optimal behaviour, which is why post-training and RL are needed.</p></div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="ref-bpe">R. Sennrich, B. Haddow, A. Birch. Neural Machine Translation of Rare Words with Subword Units. <em>ACL</em>, 2016. <a href="https://arxiv.org/abs/1508.07909">arXiv:1508.07909</a>.</li>
+<li id="ref-gpt3">T. Brown et al. Language Models are Few-Shot Learners. <em>NeurIPS</em>, 2020. <a href="https://arxiv.org/abs/2005.14165">arXiv:2005.14165</a>.</li>
+<li id="ref-xie">S. M. Xie, A. Raghunathan, P. Liang, T. Ma. An Explanation of In-context Learning as Implicit Bayesian Inference. <em>ICLR</em>, 2022. <a href="https://arxiv.org/abs/2111.02080">arXiv:2111.02080</a>.</li>
+<li id="ref-garg">S. Garg, D. Tsipras, P. Liang, G. Valiant. What Can Transformers Learn In-Context? A Case Study of Simple Function Classes. <em>NeurIPS</em>, 2022. <a href="https://arxiv.org/abs/2208.01066">arXiv:2208.01066</a>.</li>
+<li id="ref-induction">C. Olsson et al. In-context Learning and Induction Heads. Transformer Circuits Thread, 2022. <a href="https://arxiv.org/abs/2209.11895">arXiv:2209.11895</a>.</li>
+<li id="ref-hierarchy">E. Wallace et al. The Instruction Hierarchy: Training LLMs to Prioritize Privileged Instructions. 2024. <a href="https://arxiv.org/abs/2404.13208">arXiv:2404.13208</a>.</li>
+<li id="ref-instructgpt">L. Ouyang et al. Training language models to follow instructions with human feedback. <em>NeurIPS</em>, 2022. <a href="https://arxiv.org/abs/2203.02155">arXiv:2203.02155</a>.</li>
+<li id="ref-bt">R. A. Bradley and M. E. Terry. Rank Analysis of Incomplete Block Designs: I. The Method of Paired Comparisons. <em>Biometrika</em>, 39(3/4), 1952.</li>
+<li id="ref-sycophancy">M. Sharma et al. Towards Understanding Sycophancy in Language Models. <em>ICLR</em>, 2024. <a href="https://arxiv.org/abs/2310.13548">arXiv:2310.13548</a>.</li>
+<li id="ref-r1">DeepSeek-AI. DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning. 2025. <a href="https://arxiv.org/abs/2501.12948">arXiv:2501.12948</a>.</li>
+<li id="ref-kadavath">S. Kadavath et al. Language Models (Mostly) Know What They Know. 2022. <a href="https://arxiv.org/abs/2207.05221">arXiv:2207.05221</a>.</li>
+<li id="ref-gpt4">OpenAI. GPT-4 Technical Report. 2023. <a href="https://arxiv.org/abs/2303.08774">arXiv:2303.08774</a>.</li>
+<li id="ref-sclar">M. Sclar, Y. Choi, Y. Tsvetkov, A. Suhr. Quantifying Language Models' Sensitivity to Spurious Features in Prompt Design. <em>ICLR</em>, 2024. <a href="https://arxiv.org/abs/2310.11324">arXiv:2310.11324</a>.</li>
+<li id="ref-lost">N. F. Liu et al. Lost in the Middle: How Language Models Use Long Contexts. <em>TACL</em>, 2024. <a href="https://arxiv.org/abs/2307.03172">arXiv:2307.03172</a>.</li>
+<li>Further reading: C. Guo, G. Pleiss, Y. Sun, K. Q. Weinberger, On Calibration of Modern Neural Networks, <a href="https://arxiv.org/abs/1706.04599">arXiv:1706.04599</a>; the companion book <a href="/library/AI_Engineering/LLM-Engineering/">Introduction to LLM Engineering</a>, Chapters 2–4 (the Transformer, prefill and decode, decoding).</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

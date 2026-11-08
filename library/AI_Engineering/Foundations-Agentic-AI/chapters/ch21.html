@@ -1,0 +1,611 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 21 · Agents in Production — Foundations of Agentic AI</title>
+<meta name="description" content="The cost and latency of agent tasks, routing and cascades, caching, traces and observability, guardrails, the economics of human review, and safe releases.">
+<script>try{var t=localStorage.getItem('aai-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script defer src="/library/assets/book-shim.js" data-library="/library/" data-field="/library/AI_Engineering/" data-field-title="AI Engineering"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-chapter="ch21" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Part VII · Reliability, Safety and Production — Chapter 21</div>
+<h1 id="top">Agents in Production</h1>
+<p class="lede">A working agent is not yet a product. Production adds a budget, a latency target, thousands of concurrent users, a need to see what each run did, and the obligation to keep working as models, tools and traffic change. This chapter gives the quantitative models of production operation: the cost and latency of an agent task, routing and cascades between models, caching, observability and tracing, guardrails, the economics of human review, and safe change over time.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>The previous chapters built an agent that works, measured how well (Chapter 19) and made it hard to subvert (Chapter 20). Each of them used cost and latency as constraints, from the price of a call (§3.7) and the economics of caching (§4.6) to the break-even of distillation (§17.8). This chapter makes them the subject. A product manager deciding whether an agent can replace a workflow asks quantitative questions: what does a resolved task cost, including the failures and the people who handle them? How long does a user wait? What happens to cost when the agent takes twice as many steps? Which requests can go to a cheaper model? And when something goes wrong for one user among thousands, how do we find out what happened?</p>
+<p>The answers come from a handful of models that the reader can build in a spreadsheet. The cost of a task grows quadratically with its length unless the context is cached, and caching makes it nearly linear. Latency is dominated by decoding and by tools, not by prefill. A cascade from a small model to a large one is worth it when the small model knows when it does not know. Human review has an optimal level, set by the cost of an error, the cost of a review and how well the agent ranks its own uncertainty. And every one of these numbers drifts, so production is a loop of measurement and adjustment rather than a configuration.</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Compute the cost of a multi-turn agent task with and without prompt caching, and the cost per <em>successful</em> task including failures and escalations.</li>
+<li>Decompose agent latency into prefill, decode and tool time, and reduce it with streaming, parallelism and model choice.</li>
+<li>Design routing and cascades between models, and compute when a cascade pays.</li>
+<li>Use caching at several levels (prompt, tool result, semantic) and reason about their risks.</li>
+<li>Instrument an agent with traces and spans, and use traces for debugging, cost attribution and online evaluation.</li>
+<li>Place guardrails and human review, and find the automation level that minimises total cost.</li>
+<li>Roll out changes to models, prompts and tools safely, with shadow traffic, canaries and regression gates.</li>
+</ol>
+</div>
+<p>We use the reference prices and speeds (Chapter 1), the cost of a call (§3.7), prompt caching (§4.6), the episode cost model (§2.8), permissions and approvals (§8.9), Little's law (§16.7), evaluation (Chapter 19) and guardrails as security layers (§20.5).</p>
+
+<h2 id="s21-1">21.1 The economics of an agent task</h2>
+<p>A single model call is priced by its tokens: input at \(\kappa_{\text{in}}\), output at \(\kappa_{\text{out}}\), cached input at \(\kappa_{\text{cache}}\) (§3.7). An agent task is a sequence of calls in which the context grows: each turn appends the model's output and the tool's observation, and the next call re-reads everything. Let the fixed prefix (system prompt and tool definitions) be \(n_0\) tokens, let each turn add \(\Delta n\) tokens (output plus observation), and let the model write \(n_{\text{out}}\) tokens per turn. The call at turn \(t\) reads about \(n_0+t\,\Delta n\) input tokens, so an episode of \(H\) turns reads</p>
+<div class="box formula">
+\[ N_{\text{in}}(H)=\sum_{t=1}^{H}\big(n_0+t\,\Delta n\big)=Hn_0+\Delta n\,\frac{H(H+1)}{2}\ \text{input tokens}, \]
+</div>
+<p>which is quadratic in \(H\): doubling the length of a task roughly quadruples its input cost. Prompt caching changes the picture. With a cached prefix, each call pays the full input price only for the tokens that are new since the previous call, about \(\Delta n\), and the cached price for the rest. The uncached input over the episode is then about \(n_0+H\Delta n\), linear in \(H\), and the quadratic term is paid at \(\kappa_{\text{cache}}\), a tenth of the input price in the reference setting. Figure 21.1 shows the two cost curves for the support agent.</p>
+
+<figure class="chart" id="fig-21-1">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Cost of one agent task by number of turns (frontier model)","height":320,
+ "x":{"label":"Turns H","log":true,"min":5,"max":80,"ticks":[5,10,20,40,80]},
+ "y":{"label":"Cost per task ($)","log":true,"min":0.05,"max":20},
+ "series":[
+  {"name":"no caching","color":"s2","points":[[5,0.165],[10,0.443],[20,1.335],[40,4.47],[80,16.14]]},
+  {"name":"prefix cached","color":"s1","points":[[5,0.071],[10,0.139],[20,0.309],[40,0.784],[80,2.276]]}
+ ]}
+</script>
+<figcaption><b>Figure 21.1 — Caching turns quadratic cost into nearly linear cost.</b> With a 5,000-token prefix, 1,500 tokens added per turn and 300 output tokens per turn, a 20-turn task costs $1.34 without caching and $0.31 with it; at 80 turns, $16.14 against $2.28. Illustrative reference prices; real prices vary and change.</figcaption></figure>
+
+<p>Figure 21.1 has two lessons beyond "cache everything". First, the slope: even with caching, cost grows faster than linearly at long horizons, because the cached quadratic term eventually dominates; at 80 turns the cached reads are over half the bill. Long tasks therefore need context management (compaction, sub-agents, external state, Chapter 14) for cost reasons as well as quality ones. Second, the order of magnitude: a 20-turn task on a frontier model costs tens of cents, which is cheap compared with a person's time and expensive compared with a web request. Whether an agent is economical depends less on the per-task cost than on what a task's outcome is worth.</p>
+<p>The cost that matters is therefore the cost per <em>successful</em> outcome, with failures priced in. If a task costs \(C\) in model and tool calls, succeeds with probability \(p\), and a failure costs \(F\) to handle (a person resolves the conversation, an engineer redoes the fix, a customer churns), then the expected cost per task is \(C+(1-p)F\), and the expected cost per successful agent outcome is \(C/p\) if failures are simply retried by the agent. The value of an outcome \(U\) (Chapter 2's value of success) sets the ceiling: the agent is worth deploying where \(pU-C-(1-p)F\) exceeds the same quantity for the alternative, which is usually a person or a simpler system.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — what a resolved support conversation costs</div>
+<p>A support conversation averages 20 turns with the parameters of Figure 21.1; on the frontier model with caching it costs $0.31 in tokens, plus $0.02 in tool and infrastructure costs. The agent resolves 70% of conversations; the rest escalate to a person at $4 each. A fully human service costs $5 per conversation.</p>
+<p><b>Expected cost per conversation.</b> \(0.33+0.30\times4=\$1.53\), against $5 for the human service: a saving of $3.47 per conversation.</p>
+<p><b>Without caching.</b> \(1.335+0.02+1.20=\$2.56\): still a saving, but $1.03 of it was lost to not caching.</p>
+<p><b>Sensitivity to resolution.</b> Each point of resolution is worth \(0.01\times\$4=\$0.04\) per conversation, an eighth of the token cost. A change that raises resolution from 70% to 75% at the cost of doubling the tokens (\(0.33\to0.66\)) changes the total to \(0.66+0.25\times4=\$1.66\): slightly worse. A change that raises it to 80% at the same doubling gives \(0.66+0.8=\$1.46\): slightly better. The escalation cost, not the token cost, dominates the economics, which is why the quality of the agent usually matters more than its price.</p>
+</div>
+
+<p>Where the money goes within a task is the other half of the economics, and it is rarely where teams expect. A trace of the support agent (§21.5) might show 45% of token cost in cached reads of the growing history, 30% in output tokens (of which a third is reasoning the user never sees), 15% in uncached new input (mostly tool outputs, some of them long JSON payloads), and 10% in the initial prefix. Each points to a different lever: compaction for the history, a reasoning budget or a smaller model for the output (§5.7), trimming tool outputs to what the model needs (§8.5), and a shorter system prompt. Cost attribution of this kind requires the per-call token accounting that tracing provides, and it is the first thing to build after the agent itself.</p>
+
+<h2 id="s21-2">21.2 Latency</h2>
+<p>Users wait for agents, and how long they wait shapes what the agent can be used for: a support agent that takes two minutes per reply is not a chat agent, and a coding agent that takes forty minutes per task is a background worker, not a pair programmer. The latency of one turn has three parts: <em>prefill</em>, the time to process the new input tokens (cached tokens are nearly free); <em>decode</em>, the time to generate the output; and <em>tool time</em>, the time the tool takes to respond. With prefill speed \(v_{\text{pre}}\), decode speed \(v_{\text{dec}}\) and tool latency \(\ell_{\text{tool}}\), a turn takes about</p>
+<div class="box formula">
+\[ \ell_{\text{turn}}\approx\frac{\Delta n}{v_{\text{pre}}}+\frac{n_{\text{out}}}{v_{\text{dec}}}+\ell_{\text{tool}}, \]
+</div>
+<p>and an episode about \(H\ell_{\text{turn}}\) plus queueing. In the reference setting (\(v_{\text{pre}}=5{,}000\), \(v_{\text{dec}}=60\) tokens per second), a turn with 1,500 new input tokens, 300 output tokens and a one-second tool call takes \(0.3+5+1=6.3\) seconds, and decode is 80% of it. This is the general pattern: for agents with cached contexts, decode dominates, so the levers are fewer output tokens (concise reasoning, compact tool-call formats), faster decoding (smaller models, which decode two to three times faster in the reference setting), and parallel tool calls (§8.6), which overlap tool time.</p>
+<p>Perceived latency differs from total latency, and most of the user-facing work is on the former. <em>Streaming</em> shows tokens as they are generated, so the user sees progress after the time to first token rather than after the whole turn. <em>Progress reporting</em> for multi-step tasks ("searching the booking system", "running the tests") makes waiting tolerable, and a short acknowledgement before a long tool call does the same. <em>Asynchrony</em> changes the contract: a coding agent that opens a pull request and notifies the user when it is done is judged on the quality of the result, not the minutes it took. Choosing the contract (interactive, streaming, or asynchronous with notification) is a product decision that the latency model informs.</p>
+<p>Tail latency matters more for agents than for single calls, because an episode is a sum of many turns and a single slow tool call or a long reasoning burst sets the user's experience. If turn latencies are independent with mean \(\mu\) and standard deviation \(\sigma\), an episode of \(H\) turns has mean \(H\mu\) and standard deviation \(\sqrt H\sigma\), so relative variability falls with length; but real tails are heavier than this, driven by occasional slow tools, retries (§8.7) and rate-limit back-offs, and the 95th-percentile episode is often two or three times the median. Timeouts on tools, bounded retries and a hard limit on turns cap the tail, at the cost of turning some slow successes into failures.</p>
+
+<details class="drill">
+<summary>Drill 21.1 — making the support agent feel fast</summary>
+<p>A support turn has 1,500 new input tokens, 300 output tokens (of which 200 are reasoning), and a one-second tool call. Compute the turn latency on the frontier model, then with (a) reasoning cut to 50 tokens, (b) the small model (\(v_{\text{dec}}=150\)) with the original output, (c) both.</p>
+<p>Frontier: \(0.3+300/60+1=6.3\) s. (a) 150 output tokens: \(0.3+2.5+1=3.8\) s. (b) \(0.3+300/150+1=3.3\) s (small-model prefill is at least as fast). (c) \(0.3+1+1=2.3\) s. Streaming the visible 100 tokens of the reply makes the perceived wait shorter still, since the user starts reading after the reasoning and the tool call: about 1.3 s plus the time to first token in case (c). Whether (b) and (c) are acceptable depends on the small model's resolution rate, which brings in the economics of §21.1 and the routing of §21.3.</p>
+</details>
+
+<h2 id="s21-3">21.3 Routing and cascades</h2>
+<p>Requests differ in difficulty, and models differ in price by an order of magnitude: in the reference setting the small model costs a twelfth of the frontier model per token. Sending every request to the frontier model overpays for the easy ones; sending every request to the small model underserves the hard ones. Two architectures, shown in Figure 21.2, exploit the difference. A <strong>router</strong> classifies each request up front and sends it to one model. A <strong>cascade</strong> sends every request to the cheap model first and escalates to the expensive one only when the cheap model's answer fails a check: low confidence, a failed verifier, a refusal, a malformed output.</p>
+
+<figure class="diagram" id="fig-21-2">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="Router sends each request to one model; cascade tries the small model first and escalates on a failed check">
+<defs><marker id="ah212" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker>
+<marker id="ah212a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead-acc"/></marker></defs>
+<g class="t-xs">
+<text x="20" y="28">router</text>
+<rect x="20" y="40" width="90" height="40" rx="8" class="bx2"/><text x="65" y="64" text-anchor="middle">request</text>
+<rect x="150" y="40" width="110" height="40" rx="8" class="bx4"/><text x="205" y="58" text-anchor="middle">classifier</text><text x="205" y="71" text-anchor="middle">(cheap)</text>
+<rect x="310" y="20" width="120" height="34" rx="8" class="bx3"/><text x="370" y="41" text-anchor="middle">small model</text>
+<rect x="310" y="66" width="120" height="34" rx="8" class="fill-acc"/><text x="370" y="87" text-anchor="middle" class="t-on">frontier model</text>
+<text x="460" y="45">one call per request; errors in</text><text x="460" y="58">routing are not corrected</text>
+<text x="20" y="138">cascade</text>
+<rect x="20" y="150" width="90" height="40" rx="8" class="bx2"/><text x="65" y="174" text-anchor="middle">request</text>
+<rect x="150" y="150" width="110" height="40" rx="8" class="bx3"/><text x="205" y="174" text-anchor="middle">small model</text>
+<rect x="300" y="150" width="120" height="40" rx="8" class="bx4"/><text x="360" y="168" text-anchor="middle">check: confidence,</text><text x="360" y="181" text-anchor="middle">verifier, format</text>
+<rect x="470" y="130" width="100" height="34" rx="8" class="bx"/><text x="520" y="151" text-anchor="middle">accept</text>
+<rect x="470" y="180" width="100" height="34" rx="8" class="fill-acc"/><text x="520" y="201" text-anchor="middle" class="t-on">frontier model</text>
+<text x="590" y="150">fraction a</text><text x="590" y="200">fraction 1 − a</text>
+<text x="360" y="232" text-anchor="middle" class="t-xs">cost = c_s + (1 − a)·c_l; pays when a &gt; c_s / c_l and the check is reliable</text>
+</g>
+<line x1="110" y1="60" x2="148" y2="60" class="ln" marker-end="url(#ah212)"/>
+<line x1="260" y1="55" x2="308" y2="38" class="ln" marker-end="url(#ah212)"/><line x1="260" y1="65" x2="308" y2="82" class="ln" marker-end="url(#ah212)"/>
+<line x1="110" y1="170" x2="148" y2="170" class="ln" marker-end="url(#ah212)"/>
+<line x1="260" y1="170" x2="298" y2="170" class="ln" marker-end="url(#ah212)"/>
+<line x1="420" y1="163" x2="468" y2="148" class="ln" marker-end="url(#ah212)"/><line x1="420" y1="178" x2="468" y2="196" class="ln-acc" marker-end="url(#ah212a)"/>
+</svg>
+<figcaption><b>Figure 21.2 — Routing and cascading.</b> A router makes one decision before any model runs; a cascade lets the small model try and escalates when a check fails, paying for both models on escalated requests but catching the small model's mistakes.</figcaption></figure>
+
+<p>The arithmetic of a cascade is simple. If the small model costs \(c_s\) per request, the large model \(c_l\), and the check accepts a fraction \(a\) of the small model's outputs, the expected cost is \(c_s+(1-a)c_l\). It is below the cost of always using the large model when \(a&gt;c_s/c_l\), which for a twelve-fold price ratio means accepting more than 8% of requests: almost always satisfied. Quality is the binding constraint. The cascade's quality is the small model's quality on accepted requests plus the large model's on escalated ones, so it matches the large model only if the check accepts mostly requests the small model got right. The cascade is exactly as good as its check, and a confidence signal that does not separate right from wrong answers (§3.6 on calibration) makes the cascade a cheaper, worse system.</p>
+<p>The idea was developed for single calls before agents. FrugalGPT (Chen, Zaharia and Zou, 2023) learned cascades over several commercial models with a scorer deciding when to stop, and reported matching the best model's accuracy on several tasks at a fraction of its cost<span class="cite"><a href="#ref-frugal">[1]</a></span>. RouteLLM (Ong and colleagues, 2024) trained routers on human preference data to decide between a strong and a weak model, and reported large cost reductions at most of the strong model's quality<span class="cite"><a href="#ref-routellm">[2]</a></span>. For agents, routing can happen at three levels: per task (the whole conversation goes to one model, decided from the first message), per node of the architecture (§16.8: routine steps such as extraction and summarisation always go to the small model), and per turn (escalate a turn when the small model's tool call fails validation). Per-node routing is the most common in practice because it is the easiest to measure and the least likely to surprise.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — a cascade for the support agent</div>
+<p>On the support agent, the small model costs about $0.026 per conversation (a twelfth of $0.31) and the frontier $0.31; escalation to a person costs $4. After the first turn, the small model's confidence check accepts 65% of conversations. On those, the small model resolves 85% (the frontier would resolve 88%). The frontier resolves 70% overall, so on the other 35% it resolves \((0.70-0.65\times0.88)/0.35=36.6\%\).</p>
+<p><b>Resolution.</b> Cascade: \(0.65\times0.85+0.35\times0.366=68.0\%\), against 70% for the frontier alone.</p>
+<p><b>Token cost.</b> \(0.65\times0.026+0.35\times(0.005+0.31)=\$0.127\) per conversation (the $0.005 is the small model's first turn on escalated conversations), against $0.31.</p>
+<p><b>Total.</b> Cascade: \(0.127+0.02+0.320\times4=\$1.42\). Frontier: \(0.31+0.02+0.30\times4=\$1.53\). The cascade saves $0.18 in tokens and loses $0.08 in extra escalations: a net $0.10 per conversation, 7%.</p>
+<p><b>What decides it.</b> If the check were worse, so that the small model resolved only 78% of the conversations it accepted, the cascade's resolution would fall to 63.5% and its total to $1.61, worse than the frontier alone. Measure the check's precision on held-out conversations before routing traffic through it.</p>
+</div>
+
+<p>Routing has costs that the example omits. Two models mean two sets of prompts to maintain, two behaviours to evaluate and two failure profiles to monitor, and the small model's errors may be different in kind (more policy violations, say) rather than just more frequent, which a resolution rate does not show. Routers drift as traffic changes. And a cascade's escalated requests are the slowest, since they pay for the small model's attempt before the large model starts, which matters for latency targets on hard requests. The general advice of §16.8 applies: start with one strong model, measure, and introduce routing where traces show a large, stable class of easy requests.</p>
+
+<h2 id="s21-4">21.4 Caching</h2>
+<p>Caching is the oldest performance technique in computing, and an agent offers several places to apply it, each with a different risk.</p>
+<p><strong>Prompt-prefix caching</strong> (§4.6) is the one every agent should use, and it has no correctness risk, because the provider caches the computation of an identical prefix and the output is unaffected. Its effectiveness depends on discipline in how contexts are built: put stable content (system prompt, tool definitions, long documents) first and volatile content last; append to the history rather than editing it; serialise tool definitions and structured data deterministically (sorted keys, fixed formatting), since a single changed byte early in the prompt invalidates everything after it; and keep timestamps and per-request identifiers out of the prefix. A trace-level metric, the fraction of input tokens served from cache, should be monitored, because a small change to a prompt template can silently drop it from 90% to zero and multiply costs by five.</p>
+<p><strong>Tool-result caching</strong> stores the outputs of tool calls keyed by their arguments, so that repeated calls, common when an agent re-reads a file or re-runs a search, cost nothing. It is safe for pure, read-only tools within a short time-to-live, and unsafe for anything with side effects or rapidly changing data: a cached flight availability that is ten minutes old can be wrong. The rule from §8.7 applies: cache reads, never writes, and make the staleness bound explicit per tool.</p>
+<p><strong>Semantic caching</strong> stores whole responses keyed by an embedding of the request, and serves a cached response when a new request is similar enough (the similarity of dense retrieval, §9.3, with a threshold). It can remove the model call entirely for frequently asked questions. It is also the most dangerous cache, because "similar" is not "same": "can I change my flight to Tuesday?" and "can I change my flight to Thursday?" are close in embedding space and need different answers, and personalised or stateful requests should never be answered from a shared cache. Semantic caching is appropriate for stateless informational answers (baggage policy, opening hours), behind a threshold tuned on labelled pairs to keep false hits rare.</p>
+<p><strong>Plan and trajectory reuse</strong> is the agent-specific form: if the agent has solved a task of this type before, reuse the successful plan or tool sequence as a starting point. It is a form of procedural memory (§13.6), and it saves both tokens and turns, at the risk of applying a stale procedure to a changed environment, so reused plans should be validated as they run.</p>
+
+<details class="drill">
+<summary>Drill 21.2 — is a semantic cache worth it?</summary>
+<p>A semantic cache could answer 30% of the support agent's first messages (informational questions) without running the agent, saving $0.31 each. On a labelled sample, 2% of cache hits are false (the cached answer is wrong for the new question), and a wrong answer costs $4 in a follow-up escalation. Per conversation, what is the expected net saving, and at what false-hit rate does it vanish?</p>
+<p>Saving \(0.3\times0.31=\$0.093\); cost of false hits \(0.3\times0.02\times4=\$0.024\); net $0.069 per conversation. Break-even when \(0.31=f\times4\), \(f=7.75\%\). The cache pays comfortably at 2%, but the false-hit rate must be measured on real traffic and monitored, since it grows when policies change and the cache does not.</p>
+</details>
+
+<h2 id="s21-5">21.5 Observability: traces, spans and what to log</h2>
+<p>When a conventional web service misbehaves, its logs usually say why: a stack trace, an error code, a slow database query. When an agent misbehaves, the cause is typically a decision: the model read a tool output, misinterpreted it, and chose a wrong action five turns before anything visibly failed. Finding it requires seeing what the model saw at each step, what it did, and what came back. <strong>Observability</strong> for agents is therefore built on <em>traces</em>: complete, structured records of each run, in which every model call, tool call and sub-agent is a <em>span</em> with its inputs, outputs, timings, token counts and cost.</p>
+<p>The vocabulary comes from distributed tracing of microservices, and the agent ecosystem adopted it: the OpenTelemetry project published semantic conventions for generative-AI spans in 2024, specifying attribute names for the model, token usage, tool calls and so on, so that traces from different frameworks can be read by the same tools<span class="cite"><a href="#ref-otel">[3]</a></span>. Figure 21.3 shows a trace of one support conversation turn as a <em>waterfall</em>: each span is a bar on a time axis, nested under its parent, so that the structure of the run and the source of its latency are visible at once.</p>
+
+<figure class="diagram" id="fig-21-3">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Trace waterfall of one agent turn: root span, model call, parallel tool calls, guardrail, second model call">
+<g class="t-xs">
+<text x="20" y="30">span</text><text x="200" y="30">time →  (0 to 7 s)</text>
+<line x1="180" y1="38" x2="700" y2="38" class="ln"/>
+<text x="20" y="62">turn 7 (root)</text><rect x="180" y="50" width="510" height="16" rx="3" class="bx2"/><text x="695" y="62" text-anchor="end">6.9 s · $0.021</text>
+<text x="32" y="88">model call 1</text><rect x="180" y="76" width="200" height="16" rx="3" class="fill-acc"/><text x="385" y="88">2.7 s · 11.8k in (90% cached) · 160 out</text>
+<text x="32" y="114">tool: get_booking</text><rect x="382" y="102" width="70" height="16" rx="3" class="bx3"/><text x="456" y="114">0.9 s</text>
+<text x="32" y="140">tool: fare_rules</text><rect x="382" y="128" width="120" height="16" rx="3" class="bx3"/><text x="506" y="140">1.6 s (parallel)</text>
+<text x="32" y="166">guardrail: policy</text><rect x="504" y="154" width="18" height="16" rx="3" class="bx4"/><text x="526" y="166">0.2 s</text>
+<text x="32" y="192">model call 2</text><rect x="524" y="180" width="166" height="16" rx="3" class="fill-acc"/><text x="520" y="208" text-anchor="end" class="t-xs">2.2 s · reply streamed after 0.4 s</text>
+<text x="32" y="236">critical path</text><path d="M180,232 L380,232 L502,232 L522,232 L690,232" class="ln-acc"/>
+<text x="360" y="252" text-anchor="middle">model call 1 → fare_rules → guardrail → model call 2 = 6.7 s of 6.9 s</text>
+</g>
+</svg>
+<figcaption><b>Figure 21.3 — A trace waterfall.</b> Each span is a bar nested under its parent. The two tool calls run in parallel, so only the slower one is on the critical path; the two model calls account for 4.9 of the turn's 6.9 seconds, so faster decoding, not faster tools, is the lever for this turn.</figcaption></figure>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — a trace is a weighted tree, and latency is a longest path</div>
+<p>A trace is a rooted tree whose nodes are spans, each with an interval \([s_v,e_v]\) on the time axis, contained in its parent's interval. Sequential children of a node occupy disjoint intervals in order; parallel children overlap. The duration of a node is determined by a max-plus recursion: for sequential children the durations add, for parallel ones the maximum is taken. The <em>critical path</em> is the root-to-leaf chain realising this value, the longest path through the dependency graph of the spans, and only spans on it affect end-to-end latency: shortening an off-path span changes nothing. Cost, by contrast, is additive over all nodes, so the spans that dominate cost and the spans that dominate latency are generally different sets, and optimising one does not optimise the other.</p>
+</div>
+
+<p>What to record in each span follows from what debugging and evaluation need. For model calls: the full input (or a reference to it, since contexts are large), the output including tool calls and, where available, reasoning, the model and its version, the sampling parameters, token counts split into cached, uncached and output, cost and timings. For tool calls: the arguments, the result (truncated if very large), status, duration and retries. For the run as a whole: the user or tenant (pseudonymised), the agent version (prompt, tools, model, policies), the outcome and any feedback. Storing full contexts is expensive (a 20-turn conversation re-reads hundreds of thousands of tokens), so systems store each new message once and reconstruct contexts by reference. Privacy rules apply to traces as to any user data: retention limits, access control, redaction of personal and secret data before storage.</p>
+<p>Traces serve four purposes in production, and each needs different tooling. <em>Debugging</em>: given a reported failure, open its trace and read it, ideally with the ability to replay from any span with a changed prompt (the time travel of §16.4). <em>Cost and latency attribution</em>: aggregate spans by type, tool, model and node to find where money and time go (§21.1, §21.2). <em>Online evaluation</em>: run graders (Chapter 19) on a sample of live traces, automatic checks on all, a calibrated judge on some, people on a few, to measure quality on real traffic. And <em>monitoring and alerting</em>: watch rates over time (resolution, escalation, tool errors, guardrail blocks, cache hit rate, cost per task, latency percentiles) and alert on shifts. A change in any of these is usually the first sign that something upstream (a model update, a changed API, a new kind of user request) has moved.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — finding a cost regression in traces</div>
+<p>The support agent's cost per conversation rises overnight from $0.33 to $0.71, with no change to resolution. Aggregating spans by type shows model-call input cost up five-fold; output and tool costs unchanged.</p>
+<p><b>Cache hit rate.</b> The fraction of input tokens served from cache has fallen from 91% to 55%. With \(N_{\text{in}}\approx415{,}000\) tokens per conversation, 36 points of hit rate is about 150,000 tokens moved from $0.30 to $3 per million: \(150{,}000\times2.70/10^6\approx\$0.40\) more per conversation, matching the observed rise.</p>
+<p><b>Cause.</b> Diffing the prefix of two consecutive calls in one trace shows that a deploy inserted the current time, to the minute, into the system prompt after the tool definitions, so whenever consecutive calls fall in different minutes the cached prefix ends there and the history behind it is re-read at full price.</p>
+<p><b>Fix and guard.</b> Move the timestamp to the end of the context and add an alert on cache hit rate below 80%. Without per-span token accounting, the regression would have appeared only in the monthly bill.</p>
+</div>
+
+<h2 id="s21-6">21.6 Guardrails</h2>
+<p>A <strong>guardrail</strong> is a check, outside the model, that inspects an input, an output or a proposed action and can block, modify or escalate it. Chapter 20 treated guardrails as security layers; in production they also enforce quality and policy: output schemas, business rules, tone and content policies, privacy rules (no card numbers in replies), and domain constraints (no medical dosing advice). Figure 21.4 shows where they sit. <em>Input guardrails</em> screen user messages and retrieved content before the model sees them (abuse, injection, out-of-scope requests). <em>Action guardrails</em> check each proposed tool call against policy before it executes (the deterministic refund check of §20.5). <em>Output guardrails</em> check the reply before the user sees it (schema validity, policy compliance, leaked personal data, unsupported claims).</p>
+
+<figure class="diagram" id="fig-21-4">
+<svg class="dg" viewBox="0 0 720 220" role="img" aria-label="Guardrail placement: input, action and output guardrails around the agent loop">
+<defs><marker id="ah214" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<g class="t-xs">
+<rect x="20" y="85" width="90" height="44" rx="8" class="bx2"/><text x="65" y="111" text-anchor="middle">user message</text>
+<rect x="140" y="85" width="110" height="44" rx="8" class="bx4"/><text x="195" y="104" text-anchor="middle">input guardrail</text><text x="195" y="118" text-anchor="middle">abuse, scope, injection</text>
+<rect x="280" y="75" width="150" height="64" rx="10" class="fill-acc"/><text x="355" y="103" text-anchor="middle" class="t-on">agent loop</text><text x="355" y="119" text-anchor="middle" class="t-on">model ⇄ tools</text>
+<rect x="280" y="170" width="150" height="40" rx="8" class="bx4"/><text x="355" y="188" text-anchor="middle">action guardrail</text><text x="355" y="201" text-anchor="middle">policy on each tool call</text>
+<rect x="460" y="85" width="120" height="44" rx="8" class="bx4"/><text x="520" y="104" text-anchor="middle">output guardrail</text><text x="520" y="118" text-anchor="middle">schema, PII, claims</text>
+<rect x="610" y="85" width="90" height="44" rx="8" class="bx3"/><text x="655" y="111" text-anchor="middle">reply</text>
+<rect x="460" y="20" width="240" height="40" rx="8" class="bx"/><text x="580" y="38" text-anchor="middle">on block: retry with the reason, rewrite,</text><text x="580" y="51" text-anchor="middle">or escalate to a person</text>
+</g>
+<line x1="110" y1="107" x2="138" y2="107" class="ln" marker-end="url(#ah214)"/><line x1="250" y1="107" x2="278" y2="107" class="ln" marker-end="url(#ah214)"/>
+<line x1="430" y1="107" x2="458" y2="107" class="ln" marker-end="url(#ah214)"/><line x1="580" y1="107" x2="608" y2="107" class="ln" marker-end="url(#ah214)"/>
+<line x1="340" y1="139" x2="340" y2="168" class="ln" marker-end="url(#ah214)"/><line x1="370" y1="168" x2="370" y2="141" class="ln" marker-end="url(#ah214)"/>
+<line x1="520" y1="85" x2="520" y2="62" class="ln dash"/>
+</svg>
+<figcaption><b>Figure 21.4 — Where guardrails sit.</b> Input guardrails screen what enters, action guardrails check each tool call before it runs, and output guardrails check what leaves. A block should produce an actionable reason so the agent can repair its action, rather than a silent failure.</figcaption></figure>
+
+<p>Guardrails have costs that must be weighed like any other component. <em>Latency</em>: a model-based guardrail adds a model call per check; a deterministic one adds milliseconds; output guardrails on streamed replies either delay the stream or must run on chunks and retract text, which users notice. <em>False positives</em>: a guardrail that blocks 3% of legitimate replies degrades the product for 3% of users, and its block rate, like a judge's error rates (§19.6), must be measured on labelled traffic. <em>False negatives</em>: a guardrail is a verifier with a miss rate, and §20.5 showed why model-based guardrails should be counted as correlated with the agent itself. The design principles are the same as for tools (§8.5): deterministic checks wherever a rule can be written in code; model checks only for what code cannot express; and every block accompanied by a reason the agent can act on, so that a blocked refund becomes "the fare is non-refundable; offer a voucher" rather than a dead end.</p>
+
+<h2 id="s21-7">21.7 Humans in the loop</h2>
+<p>People appear in production agent systems in three roles: as <em>approvers</em> of consequential actions (§8.9), as <em>handlers</em> of escalated tasks, and as <em>reviewers</em> of samples for quality measurement (§19.7). Each is a cost, and each can be sized. The most consequential design decision is how much the agent handles on its own, and it has a clean formulation as <strong>selective automation</strong>. Rank tasks by the agent's confidence; let the agent handle the most confident fraction \(c\) (the coverage) and route the rest to people. The error rate among handled tasks, \(e(c)\), rises with coverage, because each increase admits less confident tasks. With an agent cost \(C\) per task, a cost \(C_{\text{err}}\) per error that reaches a customer, and a human cost \(C_h\) per routed task, the expected cost per task is</p>
+<div class="box formula">
+\[ \text{cost}(c)=c\,\big(C+e(c)\,C_{\text{err}}\big)+(1-c)\,C_h, \]
+</div>
+<p>minimised where the marginal task's expected cost equals the human cost: \(\frac{d}{dc}\big[c\,e(c)\big]C_{\text{err}}+C=C_h\). Figure 21.5 plots an example with \(C=\$0.33\), \(C_h=\$4\), \(C_{\text{err}}=\$20\) and an error curve \(e(c)=0.02+0.10c^2\) (2% error on the easiest tasks, rising to 12% at full coverage).</p>
+
+<figure class="chart" id="fig-21-5">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Cost per task against automation coverage","height":320,
+ "x":{"label":"Coverage c (fraction handled by the agent alone)","min":0,"max":1,"fmt":"pct"},
+ "y":{"label":"Expected cost per task ($)","min":2,"max":4.2},
+ "series":[
+  {"name":"agent handles its most confident fraction c; people handle the rest","color":"s1","points":[[0,4],[0.2,3.362],[0.4,2.82],[0.6,2.47],[0.7,2.397],[0.74,2.391],[0.8,2.408],[0.9,2.515],[1,2.73]]}
+ ],
+ "vlines":[{"x":0.74,"label":"optimum ≈ 74%"}]}
+</script>
+<figcaption><b>Figure 21.5 — There is an optimal level of automation.</b> Handling more tasks saves human cost until the marginal tasks are error-prone enough that their expected error cost exceeds a person's cost. Here the optimum is about 74% coverage at $2.39 per task; full automation costs $2.73. Illustrative numbers.</figcaption></figure>
+
+<p>Figure 21.5's curve is flat near its minimum, which is good news for operators: coverage between 65% and 85% costs within a few cents of the optimum, so the threshold need not be tuned precisely. The position of the optimum, however, moves with each input, and its sensitivity is instructive. A more expensive error (a wrong refund rather than a mildly unhelpful answer) moves the optimum left; a better confidence ranking (a flatter \(e(c)\)) moves it right and lowers the whole curve; a cheaper human channel moves it left. Improving the agent's <em>ranking</em> of its own uncertainty is often worth more than improving its average accuracy, because it is what lets the system automate the right tasks.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — staffing the human queue</div>
+<p>The support agent handles 50,000 conversations a month, about 1,670 a day, at 74% coverage, so 26% (about 430 a day) go to people. A person needs 8 minutes per routed conversation, and approvals of large refunds add 60 a day at 2 minutes each.</p>
+<p><b>Work.</b> \(430\times8+60\times2=3{,}560\) minutes, about 59 hours a day.</p>
+<p><b>Staff.</b> At 6 productive hours per person per day and a target utilisation of 80% (so that queues stay short), about \(59/(6\times0.8)\approx12.4\) people, spread across the hours when conversations arrive.</p>
+<p><b>Waiting.</b> By Little's law (§16.7), if arrivals peak at 60 routed conversations an hour and each waits on average 10 minutes before a person picks it up, about 10 conversations are waiting at any moment at the peak, the number the queue's design and the customer's patience must accommodate.</p>
+<p><b>Sensitivity.</b> Raising coverage to 80% removes about 100 routed conversations a day, 13 hours of work, nearly three people, while the expected error cost rises slightly: the trade of Figure 21.5 in staffing terms.</p>
+</div>
+
+<p>Two failure modes of human-in-the-loop design recur. <em>Rubber-stamping</em>: approvers who see hundreds of requests a day, almost all fine, stop reading them, so the probability of catching a bad action (\(p_{\text{catch}}\) of §8.9) falls towards zero exactly as volume rises. Remedies include showing approvers only what needs judgement, with the relevant facts highlighted, inserting known-bad test cases to measure attention, and keeping approval rates per person visible. <em>Deskilling</em>: when the agent handles all routine tasks, the people who handle escalations see only hard cases, without the routine experience that built their judgement, and they lose context about what normal looks like. Rotating staff through review of routine agent output, and treating escalations as training data for both the agent and the people, keeps the human channel competent.</p>
+
+<h2 id="s21-8">21.8 Changing a running system</h2>
+<p>An agent in production changes constantly: model providers release new versions and deprecate old ones, prompts are edited, tools are added, policies change, and the traffic itself drifts. Each change can improve the system on average and break it for a class of tasks, and the evaluation of Chapter 19 only partly predicts which. Production practice therefore treats every change as a release, moved through stages that each limit the damage of a bad one. Figure 21.6 shows the ladder.</p>
+
+<figure class="diagram" id="fig-21-6">
+<svg class="dg" viewBox="0 0 720 210" role="img" aria-label="Release ladder: offline evaluation, shadow traffic, canary, staged rollout, full rollout, with rollback">
+<defs><marker id="ah216" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker>
+<marker id="ah216a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead-acc"/></marker></defs>
+<g class="t-xs">
+<rect x="20" y="130" width="120" height="50" rx="8" class="bx2"/><text x="80" y="150" text-anchor="middle">offline eval</text><text x="80" y="164" text-anchor="middle">suite + regression gate</text>
+<rect x="160" y="105" width="120" height="50" rx="8" class="bx"/><text x="220" y="125" text-anchor="middle">shadow</text><text x="220" y="139" text-anchor="middle">real inputs, no effects</text>
+<rect x="300" y="80" width="120" height="50" rx="8" class="bx3"/><text x="360" y="100" text-anchor="middle">canary</text><text x="360" y="114" text-anchor="middle">1–5% of traffic</text>
+<rect x="440" y="55" width="120" height="50" rx="8" class="bx4"/><text x="500" y="75" text-anchor="middle">staged rollout</text><text x="500" y="89" text-anchor="middle">25% → 50%</text>
+<rect x="580" y="30" width="120" height="50" rx="8" class="fill-acc"/><text x="640" y="50" text-anchor="middle" class="t-on">full rollout</text><text x="640" y="64" text-anchor="middle" class="t-on">old version kept warm</text>
+<text x="360" y="200" text-anchor="middle" class="t-xs t-acc">rollback at any stage if metrics regress: resolution, violations, cost, latency</text>
+</g>
+<line x1="140" y1="150" x2="158" y2="135" class="ln" marker-end="url(#ah216)"/><line x1="280" y1="125" x2="298" y2="110" class="ln" marker-end="url(#ah216)"/>
+<line x1="420" y1="100" x2="438" y2="85" class="ln" marker-end="url(#ah216)"/><line x1="560" y1="75" x2="578" y2="60" class="ln" marker-end="url(#ah216)"/>
+<path d="M640,82 C640,180 400,185 150,182" class="ln-acc dash" marker-end="url(#ah216a)"/>
+</svg>
+<figcaption><b>Figure 21.6 — A release ladder for agent changes.</b> Each rung exposes the change to more real traffic with more consequence, and each has a rollback. Shadow traffic runs the new version on real inputs without letting it act; canaries let it act on a small share of users while metrics are compared.</figcaption></figure>
+
+<p>Each rung of Figure 21.6 answers a question the previous one could not. The offline suite checks known behaviours and blocks regressions on critical criteria. <em>Shadow</em> runs the new version on copies of real inputs with its actions disabled or simulated, which exposes it to the real distribution without risk, and allows paired comparison of its decisions with the current version's. A <em>canary</em> lets it act for a small fraction of users, so effects that only appear with real consequences (user satisfaction, downstream errors) can be measured, with the statistics of §19.4 deciding when the sample is large enough. Staged rollout widens exposure while monitoring continues. Throughout, the previous version stays deployable, so rollback is a configuration change rather than an emergency.</p>
+<p>Three practices make the ladder work for agents in particular. <em>Pin versions</em>: call models by dated version identifiers rather than aliases that a provider may repoint, so that a model change is a deliberate release rather than a surprise; when a provider deprecates a version, the migration goes through the ladder like any other change. <em>Version everything together</em>: an agent's behaviour depends on the model, the prompts, the tool definitions, the policies and the guardrails, so a release identifier should name all of them, and traces should record it. <em>Watch for drift</em>: even with nothing changed on the agent's side, the world changes, as new products, new policies and new kinds of request appear, so the online metrics of §21.5 are compared against baselines continuously, and a drop in resolution on one class of requests triggers the error analysis of §19.8 before it becomes a trend.</p>
+
+<details class="drill">
+<summary>Drill 21.3 — how long should the canary run?</summary>
+<p>The support agent's escalation rate is 30%. A new version is canaried on 5% of 1,670 daily conversations. How many days of canary are needed to detect an increase in escalation to 33% with an unpaired comparison at 80% power and the 5% level, and what does this imply?</p>
+<p>Per arm, the standard error of the difference must be at most \(0.03/2.8=0.0107\). With the control arm large, the canary arm dominates: \(\sqrt{0.3\times0.7/n}\le0.0107\Rightarrow n\ge1{,}830\) canary conversations. At \(0.05\times1{,}670\approx84\) a day, that is about 22 days, too slow for most release schedules. Options: a larger canary share (25% gives about 4.4 days), a sharper metric (the paired shadow comparison of decisions on the same conversations), or accepting that only larger regressions will be caught at the canary stage and relying on the offline suite for small ones.</p>
+</details>
+
+<h2 id="s21-9">21.9 Capacity, rate limits and budgets</h2>
+<p>A production agent shares finite resources: the model provider's rate limits (requests and tokens per minute), sandboxes and browsers, tool back-ends with their own quotas, and the organisation's budget. Each must be sized for peak, not average, load, and each needs a behaviour for when it runs out. Sizing uses the tools already developed. Little's law (§16.7) gives the number of tasks in flight, arrival rate times duration; the token model of §21.1 converts tasks into tokens per minute; and the peak-to-mean ratio of the traffic, measured from logs, sets the headroom. Rate limits from model providers are usually expressed in input and output tokens per minute, and whether cached tokens count towards them varies by provider, which can change the answer by an order of magnitude.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — sizing the support agent for its peak hour</div>
+<p>The support agent's 50,000 monthly conversations peak at 200 new conversations an hour on Monday mornings. A conversation lasts about 10 minutes of wall-clock time, including the customer's typing, and uses 415,000 input tokens (about 91% cached) and 6,000 output tokens over its 20 turns.</p>
+<p><b>Concurrency.</b> By Little's law, \(200/60\times10\approx33\) conversations in flight at the peak.</p>
+<p><b>Token rate.</b> Input \(200\times415{,}000/60\approx1.4\) million tokens per minute, of which about 125,000 are uncached; output \(200\times6{,}000/60=20{,}000\) tokens per minute. If the provider counts cached tokens towards the limit, the agent needs a 1.4-million-token-per-minute quota; if not, about 125,000.</p>
+<p><b>Headroom.</b> Retries and longer-than-average conversations add load: planning for 1.5 times the computed rate is common. Tool back-ends need the same sizing: at roughly one booking lookup per conversation per two turns, about 33 lookups a minute at peak.</p>
+</div>
+
+<p>When a limit is hit, the agent should degrade rather than fail. <em>Back-off and queue</em>: retry rate-limited calls with exponential back-off and jitter (§8.7), and queue new tasks rather than rejecting them when waiting is acceptable. <em>Fall back</em>: route routine nodes to a second provider or a smaller model when the primary is saturated, which requires having evaluated the fallback beforehand. <em>Prioritise</em>: interactive conversations before background tasks, paying customers before free ones. And <em>shed load visibly</em>: tell users that responses are slower rather than letting them time out.</p>
+<p>Budgets are the financial form of the same control. A per-task budget, in tokens, turns or dollars, set at a few times the median from traces, stops runaway tasks (an agent caught in a loop of failing tool calls can otherwise spend dollars on one task) and converts them into failures that are counted and examined. Per-user and per-tenant budgets bound abuse and the damage of a compromised account. And a global budget with alerts at fractions of the month's allowance prevents the surprise bill. Like rate limits, budgets need a defined behaviour on exhaustion (stop and summarise progress, hand off to a person, or ask the user), since an agent that silently stops is worse than one that explains why.</p>
+
+<h2 id="looking-ahead">Looking ahead</h2>
+<p>This chapter completes the technical arc of the book: from a single model call to an agent that is designed, trained, evaluated, secured and operated. The last chapter changes register. An interview for an agent-engineering role, at an AI lab or a large technology company, usually includes a system-design round: an open problem ("design a coding agent for our monorepo", "design an agent that handles refunds") to be worked through in forty-five minutes, with the interviewer probing for the quantitative reasoning, the trade-offs and the failure modes that the previous twenty-one chapters developed. Chapter 22 presents a method for these rounds, worked case studies for the three running examples and others, and the rubric by which answers are judged, so that the reader can turn the book's content into a performance under time pressure.</p>
+
+<h2 id="summary">Summary</h2>
+<ul>
+<li>Input tokens over an \(H\)-turn task grow as \(Hn_0+\Delta n\,H(H+1)/2\); prefix caching makes the uncached part linear and prices the quadratic part at \(\kappa_{\text{cache}}\). A 20-turn support task costs $1.34 uncached and $0.31 cached in the reference setting.</li>
+<li>The relevant cost is per outcome: \(C+(1-p)F\) with failure costs included. Escalation costs usually dominate token costs, so quality matters more than price.</li>
+<li>Turn latency \(\approx\Delta n/v_{\text{pre}}+n_{\text{out}}/v_{\text{dec}}+\ell_{\text{tool}}\) is dominated by decoding when contexts are cached; levers are shorter outputs, faster models, parallel tools, streaming and asynchronous contracts. Tails are set by slow tools and retries.</li>
+<li>Cascades cost \(c_s+(1-a)c_l\) and pay on cost whenever \(a&gt;c_s/c_l\), but are only as good as their acceptance check; routers decide up front. Route per node first.</li>
+<li>Prefix caching is safe and needs disciplined prompt construction; tool-result caching is safe for reads with explicit staleness; semantic caching needs a measured false-hit rate; plan reuse needs validation.</li>
+<li>Traces of spans (OpenTelemetry GenAI conventions) support debugging, cost and latency attribution, online evaluation and alerting. Latency follows the critical path; cost sums over all spans.</li>
+<li>Guardrails sit at input, action and output; prefer deterministic checks, measure false-positive rates, and return actionable reasons.</li>
+<li>Selective automation has an optimal coverage where the marginal task's expected cost equals a person's; better uncertainty ranking moves it up. Size human queues with workload and Little's law; guard against rubber-stamping and deskilling.</li>
+<li>Size capacity for the peak with Little's law and the token model; check whether cached tokens count towards rate limits; degrade by back-off, fallback, prioritisation and visible load shedding; set per-task, per-tenant and global budgets with a defined behaviour when they run out.</li>
+<li>Release changes through offline gates, shadow traffic, canaries and staged rollout with rollback; pin model versions, version all components together, and watch for drift.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ch21-mcq-01" data-topic="§21.1 Economics">
+<p class="q">Without caching, the input tokens of an \(H\)-turn agent task grow:</p>
+<ol class="opts"><li>Linearly in \(H\)</li><li data-correct>Quadratically in \(H\)</li><li>Logarithmically</li><li>Exponentially</li></ol>
+<div class="explain">Each turn re-reads a context that grows linearly.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-02" data-topic="§21.1 Economics">
+<p class="q">With prefix caching, the part of input paid at the full price grows:</p>
+<ol class="opts"><li>Quadratically</li><li data-correct>Roughly linearly, as \(n_0+H\Delta n\)</li><li>Not at all</li><li>Exponentially</li></ol>
+<div class="explain">Only new tokens per turn are uncached.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-03" data-topic="§21.1 Economics">
+<p class="q">In the reference setting, a 20-turn support task costs about $1.34 uncached. Cached, it costs about:</p>
+<ol class="opts"><li>$1.20</li><li>$0.67</li><li data-correct>$0.31</li><li>$0.03</li></ol>
+<div class="explain">Figure 21.1.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-04" data-topic="§21.1 Economics">
+<p class="q">The support agent costs $0.33 per conversation, resolves 70%, and escalations cost $4. The expected cost per conversation is:</p>
+<ol class="opts"><li>$0.33</li><li data-correct>$1.53</li><li>$4.33</li><li>$2.80</li></ol>
+<div class="explain">\(0.33+0.3\times4\).</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-05" data-topic="§21.1 Economics">
+<p class="q">In that example, which usually dominates the economics?</p>
+<ol class="opts"><li>Token prices</li><li data-correct>The cost of failures (escalations), so resolution rate matters most</li><li>Tool costs</li><li>Storage</li></ol>
+<div class="explain">One point of resolution is worth $0.04, an eighth of the token cost.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-06" data-topic="§21.2 Latency">
+<p class="q">For a cached agent turn with 1,500 new tokens, 300 output tokens and a one-second tool, the largest latency component is:</p>
+<ol class="opts"><li>Prefill</li><li data-correct>Decode</li><li>The tool</li><li>Network</li></ol>
+<div class="explain">\(300/60=5\) s of 6.3 s.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-07" data-topic="§21.2 Latency">
+<p class="q">Which reduce perceived latency without reducing total latency? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Streaming tokens</li><li data-correct>Progress messages during long tool calls</li><li data-correct>Asynchronous completion with a notification</li><li>A smaller model</li></ol>
+<div class="explain">A smaller model reduces total latency too.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-08" data-topic="§21.2 Latency">
+<p class="q">Tail latency of agent episodes is driven mainly by:</p>
+<ol class="opts"><li>Average decode speed</li><li data-correct>Occasional slow tools, retries and back-offs, plus long reasoning bursts</li><li>Tokenisation</li><li>Cache hits</li></ol>
+<div class="explain">Cap with timeouts, bounded retries and turn limits.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-09" data-topic="§21.3 Cascades">
+<p class="q">A cascade with small cost \(c_s\), large cost \(c_l\) and acceptance rate \(a\) costs:</p>
+<ol class="opts"><li>\(ac_s+(1-a)c_l\)</li><li data-correct>\(c_s+(1-a)c_l\)</li><li>\(c_l\)</li><li>\(c_s c_l\)</li></ol>
+<div class="explain">The small model runs on every request.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-10" data-topic="§21.3 Cascades">
+<p class="q">With a twelve-fold price ratio, a cascade is cheaper than always using the large model when it accepts more than about:</p>
+<ol class="opts"><li>50%</li><li>25%</li><li data-correct>8%</li><li>1%</li></ol>
+<div class="explain">\(a&gt;c_s/c_l=1/12\).</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-11" data-topic="§21.3 Cascades">
+<p class="q">What determines whether a cascade matches the large model's quality?</p>
+<ol class="opts"><li>The price ratio</li><li data-correct>Whether the acceptance check accepts mostly outputs the small model got right</li><li>The context length</li><li>The number of tools</li></ol>
+<div class="explain">The cascade is only as good as its check.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-12" data-topic="§21.3 Routing">
+<p class="q">A router differs from a cascade in that it:</p>
+<ol class="opts"><li>Uses more models</li><li data-correct>Decides before any model runs, so routing errors are not corrected</li><li>Is always more accurate</li><li>Needs a verifier</li></ol>
+<div class="explain">Cascades pay twice on escalations but catch small-model errors.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-13" data-topic="§21.4 Caching">
+<p class="q">Which practices keep prompt-cache hit rates high? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Stable content first, volatile content last</li><li data-correct>Append to history rather than editing it</li><li data-correct>Deterministic serialisation of tool definitions</li><li>A timestamp at the top of the system prompt</li></ol>
+<div class="explain">One changed early byte invalidates everything after it.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-14" data-topic="§21.4 Caching">
+<p class="q">Tool-result caching is safe for:</p>
+<ol class="opts"><li>Payment tools</li><li data-correct>Pure, read-only tools within an explicit staleness bound</li><li>Any tool</li><li>Tools with side effects, if idempotent</li></ol>
+<div class="explain">Cache reads, never writes.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-15" data-topic="§21.4 Caching">
+<p class="q">The main risk of semantic caching is:</p>
+<ol class="opts"><li>High latency</li><li data-correct>False hits: similar but different requests served a wrong cached answer</li><li>Low hit rates</li><li>Cache invalidation storms</li></ol>
+<div class="explain">"Tuesday" and "Thursday" are close in embedding space.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-16" data-topic="§21.4 Caching">
+<p class="q">A semantic cache saving $0.31 per hit breaks even when a false hit costs $4 at a false-hit rate of about:</p>
+<ol class="opts"><li>0.8%</li><li>2%</li><li data-correct>7.75%</li><li>31%</li></ol>
+<div class="explain">\(0.31/4\).</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-17" data-topic="§21.5 Observability">
+<p class="q">Why are traces, rather than ordinary logs, the basis of agent observability?</p>
+<ol class="opts"><li>They are smaller</li><li data-correct>Agent failures are usually decisions; you need what the model saw and did at each step, structured as nested spans</li><li>Logs cannot be stored</li><li>Traces are required by law</li></ol>
+<div class="explain">Inputs, outputs, timings, tokens and cost per span.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-18" data-topic="§21.5 Observability">
+<p class="q">End-to-end latency of a trace is determined by:</p>
+<ol class="opts"><li>The sum of all spans</li><li data-correct>The critical path: the longest chain of dependent spans</li><li>The slowest span alone</li><li>The number of spans</li></ol>
+<div class="explain">Parallel spans contribute only their maximum.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-19" data-topic="§21.5 Observability">
+<p class="q">A sudden fall in cache hit rate with unchanged quality most likely indicates:</p>
+<ol class="opts"><li>A model upgrade</li><li data-correct>A change that made the prompt prefix vary between calls</li><li>More users</li><li>A tool outage</li></ol>
+<div class="explain">E.g. a timestamp inserted into the system prompt.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-20" data-topic="§21.5 Observability">
+<p class="q">Which are uses of production traces? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Debugging individual failures with replay</li><li data-correct>Cost and latency attribution</li><li data-correct>Online evaluation by graders on samples</li><li>Replacing the offline evaluation suite entirely</li></ol>
+<div class="explain">Traces complement, not replace, offline evaluation.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-21" data-topic="§21.6 Guardrails">
+<p class="q">Action guardrails check:</p>
+<ol class="opts"><li>User messages</li><li data-correct>Each proposed tool call against policy before it executes</li><li>Final replies only</li><li>Model weights</li></ol>
+<div class="explain">E.g. a deterministic refund-eligibility check.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-22" data-topic="§21.6 Guardrails">
+<p class="q">A good guardrail block should:</p>
+<ol class="opts"><li>Fail silently</li><li data-correct>Return an actionable reason so the agent can repair the action or escalate</li><li>Terminate the session</li><li>Retry the same action</li></ol>
+<div class="explain">"Non-refundable fare; offer a voucher."</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-23" data-topic="§21.6 Guardrails">
+<p class="q">Which costs must be measured for a guardrail? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Added latency</li><li data-correct>False-positive rate on legitimate traffic</li><li data-correct>False-negative rate</li><li>Its effect on token prices</li></ol>
+<div class="explain">A guardrail is a verifier with error rates.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-24" data-topic="§21.7 Human in the loop">
+<p class="q">In selective automation, increasing coverage raises the error rate among handled tasks because:</p>
+<ol class="opts"><li>The model gets tired</li><li data-correct>Each increase admits less confident tasks</li><li>Humans make more errors</li><li>Costs rise</li></ol>
+<div class="explain">Tasks are ranked by confidence.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-25" data-topic="§21.7 Human in the loop">
+<p class="q">In Figure 21.5 the cost-minimising coverage is about:</p>
+<ol class="opts"><li>25%</li><li>50%</li><li data-correct>74%</li><li>100%</li></ol>
+<div class="explain">Where the marginal task's expected cost equals a person's $4.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-26" data-topic="§21.7 Human in the loop">
+<p class="q">Which change moves the optimal coverage higher?</p>
+<ol class="opts"><li>A more expensive error</li><li data-correct>A better confidence ranking (flatter error curve)</li><li>A cheaper human channel</li><li>A slower agent</li></ol>
+<div class="explain">Better ranking lets the system automate the right tasks.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-27" data-topic="§21.7 Human in the loop">
+<p class="q">Rubber-stamping by approvers means:</p>
+<ol class="opts"><li>Approvers reject everything</li><li data-correct>Approvers stop reading as volume rises, so the probability of catching bad actions falls</li><li>Approvals are automated</li><li>Approvers are overpaid</li></ol>
+<div class="explain">Show only what needs judgement and test attention with known-bad cases.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-28" data-topic="§21.7 Staffing">
+<p class="q">430 routed conversations a day at 8 minutes each need about how many person-hours a day?</p>
+<ol class="opts"><li>8</li><li>29</li><li data-correct>57</li><li>430</li></ol>
+<div class="explain">\(430\times8/60\approx57\); approvals add about 2 more.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-29" data-topic="§21.8 Releases">
+<p class="q">Shadow traffic means:</p>
+<ol class="opts"><li>Routing traffic to a cheaper model</li><li data-correct>Running the new version on copies of real inputs with its actions disabled</li><li>Hiding errors from users</li><li>Testing at night</li></ol>
+<div class="explain">Real distribution, no consequences, paired comparison possible.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-30" data-topic="§21.8 Releases">
+<p class="q">Why pin model versions rather than use provider aliases?</p>
+<ol class="opts"><li>Pinned versions are cheaper</li><li data-correct>So a model change is a deliberate, evaluated release rather than a silent change</li><li>Aliases are slower</li><li>Pinning improves caching</li></ol>
+<div class="explain">Migrations go through the release ladder.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-31" data-topic="§21.8 Releases">
+<p class="q">A 5% canary of 1,670 daily conversations needs about how long to detect an escalation increase from 30% to 33%?</p>
+<ol class="opts"><li>1 day</li><li>4 days</li><li data-correct>about 3 weeks</li><li>1 year</li></ol>
+<div class="explain">About 1,830 canary conversations at 84 a day.</div>
+</div>
+
+<div class="mcq" data-id="ch21-mcq-32" data-topic="§21.8 Releases">
+<p class="q">An agent release identifier should name:</p>
+<ol class="opts"><li>Only the model</li><li data-correct>The model, prompts, tool definitions, policies and guardrails together</li><li>Only the prompts</li><li>The date</li></ol>
+<div class="explain">Behaviour depends on all of them.</div>
+</div>
+<div class="mcq" data-id="ch21-mcq-33" data-topic="§21.9 Capacity">
+<p class="q">At a peak of 200 new conversations an hour, each lasting 10 minutes, how many conversations are in flight?</p>
+<ol class="opts"><li>20</li><li data-correct>About 33</li><li>200</li><li>2,000</li></ol>
+<div class="explain">Little's law: \(200/60\times10\).</div>
+</div>
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer out loud first, then reveal the model answer and rate yourself.</p>
+
+<details class="qa" data-id="ch21-qa-01">
+<summary><span class="lvl warm">Warm-up</span> How do you estimate the cost of an agent task?</summary>
+<div class="answer"><p>Tokens per turn: input \(n_0+t\Delta n\), output \(n_{\text{out}}\); sum over \(H\) turns; price uncached new input at \(\kappa_{\text{in}}\), cached re-reads at \(\kappa_{\text{cache}}\), output at \(\kappa_{\text{out}}\); add tools and infrastructure. Then cost per outcome: \(C+(1-p)F\). Measure the inputs from traces rather than guessing.</p></div>
+</details>
+
+<details class="qa" data-id="ch21-qa-02">
+<summary><span class="lvl warm">Warm-up</span> Why does caching matter so much for agents?</summary>
+<div class="answer"><p>Each turn re-reads the growing context, so input tokens grow quadratically with turns. Caching prices re-read tokens at about a tenth, making uncached input linear: a 20-turn task drops from $1.34 to $0.31 in the reference setting, and the gap grows with length. It also cuts prefill latency on cached tokens.</p></div>
+</details>
+
+<details class="qa" data-id="ch21-qa-03">
+<summary><span class="lvl warm">Warm-up</span> What would you put in a trace span for a model call?</summary>
+<div class="answer"><p>Input (or reference), output including tool calls and reasoning where available, model and version, sampling parameters, token counts (cached, uncached, output), cost, start and end times, time to first token, parent span, agent release identifier, and any errors or retries. Redact personal data and secrets.</p></div>
+</details>
+
+<details class="qa" data-id="ch21-qa-04">
+<summary><span class="lvl core">Core</span> Where does an agent's latency go, and how do you cut it?</summary>
+<div class="answer"><p>Per turn: \(\Delta n/v_{\text{pre}}+n_{\text{out}}/v_{\text{dec}}+\ell_{\text{tool}}\); with caching, decode dominates. Cut output tokens (concise reasoning, compact formats), use faster models for routine nodes, parallelise independent tool calls, reduce turns (better tools, plans), cap tails with timeouts and turn limits, and improve perceived latency with streaming, progress messages or asynchronous delivery. Use the trace critical path to find what matters.</p></div>
+</details>
+
+<details class="qa" data-id="ch21-qa-05">
+<summary><span class="lvl core">Core</span> When does a model cascade pay?</summary>
+<div class="answer"><p>Cost \(c_s+(1-a)c_l\) beats \(c_l\) when \(a&gt;c_s/c_l\), almost always true for large price ratios. Quality is the constraint: the acceptance check must accept mostly correct small-model outputs. Compute total cost including failure costs: in the support example the cascade saved $0.18 in tokens and lost $0.08 to extra escalations. A worse check made it a net loss. Measure check precision on held-out data.</p></div>
+</details>
+
+<details class="qa" data-id="ch21-qa-06">
+<summary><span class="lvl core">Core</span> Compare the kinds of caching available to an agent.</summary>
+<div class="answer"><p>Prefix caching: no correctness risk, needs stable prefixes and deterministic serialisation; monitor hit rate. Tool-result caching: safe for pure reads with explicit TTL, never for writes. Semantic caching: serves whole answers to similar requests; only for stateless informational queries, with a tuned threshold and measured false-hit rate. Plan reuse: saves turns, needs validation against environment changes.</p></div>
+</details>
+
+<details class="qa" data-id="ch21-qa-07">
+<summary><span class="lvl core">Core</span> How do you find the right level of human review?</summary>
+<div class="answer"><p>Selective automation: rank tasks by agent confidence, automate the top fraction \(c\); cost \(c(C+e(c)C_{\text{err}})+(1-c)C_h\); optimum where the marginal task's expected cost equals a person's. Estimate \(e(c)\) from labelled data (risk–coverage curve). Errors that cost more push coverage down; better ranking pushes it up. The curve is flat near the optimum; revisit as models and costs change.</p></div>
+</details>
+
+<details class="qa" data-id="ch21-qa-08">
+<summary><span class="lvl core">Core</span> Where do guardrails go and how do you evaluate them?</summary>
+<div class="answer"><p>Input (abuse, scope, injection), action (policy on each tool call, deterministic where possible), output (schema, PII, unsupported claims, policy). Evaluate like verifiers: false-positive rate on legitimate traffic, false-negative rate on known-bad cases, added latency; count model-based guardrails as correlated with the agent. Blocks return actionable reasons.</p></div>
+</details>
+
+<details class="qa" data-id="ch21-qa-09">
+<summary><span class="lvl core">Core</span> How do you roll out a new model version for a production agent?</summary>
+<div class="answer"><p>Pin current version. Run the offline suite with paired comparison and regression gates on critical criteria (violations, resolution, cost, latency). Shadow on real traffic and compare decisions. Canary a small share with metrics and statistical stopping rules; staged rollout; keep the old version warm for rollback; update prompts if needed and version all components together; monitor for drift after rollout.</p></div>
+</details>
+
+<details class="qa" data-id="ch21-qa-10">
+<summary><span class="lvl core">Core</span> How would you detect and diagnose a cost regression?</summary>
+<div class="answer"><p>Alert on cost per task and cache hit rate. Aggregate spans by type, model, tool and node to locate the change (input vs output vs tools). For input: check cache hit rate and prefix diffs between consecutive calls (timestamps, reordered tool definitions, non-deterministic serialisation). For output: reasoning length, verbosity changes after a model update. For turns: changes in tool behaviour causing loops. Fix and add a guard alert.</p></div>
+</details>
+
+<details class="qa" data-id="ch21-qa-11">
+<summary><span class="lvl deep">Deep</span> Why do cost and latency optimisation target different spans?</summary>
+<div class="answer"><p>A trace is a tree; latency is the max-plus value along the critical path, while cost is additive over all spans. Parallel tool calls off the critical path cost money but not time; a cheap but sequential slow tool costs time but little money. Optimise latency on the critical path (often model decode), cost on the largest summed spans (often cached history re-reads or long outputs).</p></div>
+</details>
+
+<details class="qa" data-id="ch21-qa-12">
+<summary><span class="lvl deep">Deep</span> How long should a canary run, and how can you shorten it?</summary>
+<div class="answer"><p>Long enough for the canary arm to detect the smallest regression you care about: \(n\ge p(1-p)z^2/\delta^2\) roughly; for 30%→33% escalations, ~1,830 conversations, ~22 days at 84/day. Shorten with a larger canary share, sharper metrics (paired shadow comparison of decisions on identical inputs, which removes between-task variance), sequential tests, or by accepting that small regressions are caught offline and the canary catches large ones.</p></div>
+</details>
+
+<details class="qa" data-id="ch21-qa-13">
+<summary><span class="lvl deep">Deep</span> What goes wrong with human-in-the-loop systems over time?</summary>
+<div class="answer"><p>Rubber-stamping (attention falls as volume rises, \(p_{\text{catch}}\to0\)); deskilling (humans see only hard cases and lose context); queue growth when coverage or traffic shifts; feedback loops where human decisions are not captured as data. Remedies: show only decisions needing judgement with key facts, seed known-bad cases to measure attention, rotate staff through routine review, size queues with Little's law, and log human decisions for evaluation and training.</p></div>
+</details>
+
+<details class="qa" data-id="ch21-qa-14">
+<summary><span class="lvl design">Design</span> Design the production stack for the airline support agent.</summary>
+<div class="answer"><p>Entry: input guardrails and identity verification workflow. Agent: frontier model on hard nodes, small model for extraction and classification, cascade on simple intents; cached stable prefix. Tools: read tools with short-TTL result cache; write tools behind deterministic policy guardrails and caps; approvals above caps. Selective automation with confidence threshold near the cost optimum; human queue sized by workload and Little's law. Observability: OpenTelemetry traces, cost and cache dashboards, online graders on samples, alerts. Releases: pinned versions, shadow and canary. Targets: cost per resolved conversation, resolution, violations, p95 latency.</p></div>
+</details>
+
+<details class="qa" data-id="ch21-qa-15">
+<summary><span class="lvl design">Design</span> A coding agent's monthly bill tripled. Walk through your investigation.</summary>
+<div class="answer"><p>Split by volume vs cost per task. If per task: traces aggregated by span type; check cache hit rate and prefix stability; check turns per task (loops after a tool change?), output tokens (reasoning budget, model change), tool output sizes (a test runner now printing full logs). If volume: new triggers or duplicated events (idempotency, §16.7). Fix root cause, add alerts on hit rate, turns per task and tokens per span, and budget limits per task.</p></div>
+</details>
+
+<details class="qa" data-id="ch21-qa-16">
+<summary><span class="lvl design">Design</span> How would you decide between a frontier model with escalation and a cheaper model with more human review?</summary>
+<div class="answer"><p>Compute total cost per task for each: tokens + (1−resolution)×escalation cost + review costs, using measured resolution and error rates on your own traffic with intervals. Include error costs that reach customers, latency differences and staffing implications. Consider a cascade combining both. Choose on the Pareto frontier of cost, quality and risk; re-evaluate when prices or models change.</p></div>
+</details>
+
+<details class="qa" data-id="ch21-qa-17">
+<summary><span class="lvl core">Core</span> What metrics would you put on an agent's production dashboard?</summary>
+<div class="answer"><p>Outcome: resolution/success rate, escalation rate, user feedback, policy violations. Reliability: tool error rates, retries, loops, timeouts. Cost: per task (distribution), tokens by type, cache hit rate. Latency: time to first token, p50/p95 per turn and per episode. Safety: guardrail block rates, injection detections, approval rates. Human channel: queue length, wait time, coverage. All by agent release and traffic segment, with alerts on shifts.</p></div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="ref-frugal">L. Chen, M. Zaharia and J. Zou. FrugalGPT: How to Use Large Language Models While Reducing Cost and Improving Performance. 2023. <a href="https://arxiv.org/abs/2305.05176">arXiv:2305.05176</a>.</li>
+<li id="ref-routellm">I. Ong et al. RouteLLM: Learning to Route LLMs with Preference Data. 2024. <a href="https://arxiv.org/abs/2406.18665">arXiv:2406.18665</a>.</li>
+<li id="ref-otel">OpenTelemetry. Semantic Conventions for Generative AI Systems. 2024–2025. <a href="https://opentelemetry.io/docs/specs/semconv/gen-ai/">opentelemetry.io</a>.</li>
+<li>Further reading: B. H. Sigelman et al., Dapper, a Large-Scale Distributed Systems Tracing Infrastructure, Google Technical Report, 2010; R. El-Yaniv and Y. Wiener, On the Foundations of Noise-free Selective Classification, <em>JMLR</em>, 2010; B. Beyer et al. (eds.), <em>Site Reliability Engineering</em>, O'Reilly, 2016 (canaries and release engineering); Anthropic and OpenAI prompt-caching documentation (2024–2025).</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

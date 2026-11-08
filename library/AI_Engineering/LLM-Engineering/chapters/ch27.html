@@ -1,0 +1,735 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 16 · Fine-Tuning and Parameter-Efficient Adaptation — Introduction to LLM Engineering</title>
+<meta name="description" content="Chapter 16 of Introduction to LLM Engineering: supervised fine-tuning, the 16-byte memory bill of full fine-tuning, ZeRO and FSDP, the low-rank hypothesis, LoRA derived, rank and learning rates, QLoRA and NF4, adapters, prefix and prompt tuning, IA³, DoRA, and what adaptation costs to serve.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script defer src="/library/assets/book-shim.js" data-library="/library/" data-field="/library/AI_Engineering/" data-field-title="AI Engineering"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-chapter="ch27" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Part V · Making Models Smaller and Adapting Them — Chapter 16</div>
+<h1 id="top">Fine-Tuning and Parameter-Efficient Adaptation</h1>
+<p class="lede">A pre-trained model knows a great deal, but it rarely behaves exactly as a product needs: it follows the wrong format, ignores a house style, or lacks a skill that a few thousand examples could teach. Changing its behaviour means changing its weights, and changing all of its weights is expensive in memory, in storage and in serving. This chapter derives what full fine-tuning costs, shows why the change it makes is usually of low rank, and develops the methods, LoRA above all, that adapt a model by training a fraction of a per cent of its parameters.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Chapters 14 and 15 made a fixed model cheaper to run. Distillation, at the end of Chapter 15, was the first technique that changed the weights, and it raised a question that the rest of the book has so far avoided: almost nobody serves a base model exactly as it was released. A customer-support assistant must answer in a company's tone and refuse questions outside its scope; a code model must follow a repository's conventions; a medical summariser must use a particular template. Prompting can do some of this, and retrieval can supply missing facts, but behaviour that must be reliable, compact and cheap at inference time is usually trained into the weights. That training is called <strong>fine-tuning</strong>.</p>
+<p>The history of fine-tuning is a history of making it cheaper. In 2018, ULMFiT<span class="cite"><a href="#r-ulmfit">[23]</a></span> and BERT established the recipe of pre-training once and fine-tuning all parameters for each task. That was affordable for a model of 340 million parameters. By 2020, GPT-3 had 175 billion, and a full fine-tune needed a cluster and produced a 350 GB copy of the model for every task. Two responses appeared. One avoided training entirely: in-context learning, in which the task is described in the prompt. The other trained only a small number of new parameters while freezing the rest: adapters (2019), prefix tuning and prompt tuning (2021), and, in 2021, low-rank adaptation (LoRA), which became the default because it adds no inference cost once merged. In 2023 QLoRA combined LoRA<span class="cite"><a href="#r-qlora">[2]</a></span> with the 4-bit quantisation of Chapter 14, so that a 65-billion-parameter model could be fine-tuned on a single 48 GB GPU.</p>
+<p>For an inference engineer this chapter matters twice. First, interviews ask about it directly: what full fine-tuning costs in memory, why LoRA works, what its rank means, what QLoRA quantises and what it does not. Second, the choices made in fine-tuning determine what must be served. A merged LoRA is just a dense model; an unmerged one is a small extra matrix product per layer that can be swapped per request, which is what makes serving thousands of customer-specific variants from one copy of the base model possible (§27.4).</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>State the supervised fine-tuning objective, including loss masking, and decide when fine-tuning is preferable to prompting or retrieval.</li>
+<li>Derive the memory bill of full fine-tuning with mixed-precision Adam (16 bytes per parameter), estimate activation memory, and explain activation checkpointing.</li>
+<li>Compute per-GPU memory under ZeRO stages 1–3 and FSDP.</li>
+<li>State the low-rank hypothesis, relate it to intrinsic dimension and the Eckart–Young theorem, and explain what it does and does not claim.</li>
+<li>Derive LoRA's forward pass, gradients, parameter count, initialisation and \(\alpha_a/r_a\) scaling, and show that LoRA performs projected gradient descent on \(\Delta W\).</li>
+<li>Choose target matrices, ranks and learning rates, and explain rsLoRA, LoRA+ and DoRA.</li>
+<li>Explain QLoRA (NF4, double quantisation, paged optimisers) and compute its memory for a 70B model.</li>
+<li>Compare adapters, prefix tuning, prompt tuning and IA³ by parameters, mergeability and inference cost, and choose a method for a given task and budget.</li>
+</ol>
+<p class="small muted">Uses: Chapters 2, 3, 6 and 14 (especially §14.3), and §15.5 on distillation. Symbols: <a href="../notation.html">notation page</a>.</p>
+</div>
+
+<h2 id="s16-1">16.1 What fine-tuning is, and when to do it</h2>
+<p>A pre-trained model is a distribution over continuations of text, and a base model continues whatever it is given. Ask it a question and it may answer, or it may produce three more questions, because questions in its training data were often followed by more questions. The first fine-tuning that nearly every deployed model receives is therefore <strong>supervised fine-tuning</strong> (SFT), also called instruction tuning: training on examples of the behaviour we want, written as a prompt followed by an ideal response. Google's FLAN (2021)<span class="cite"><a href="#r-flan">[21]</a></span> showed that instruction tuning on many tasks made models follow unseen instructions far better, and OpenAI's InstructGPT (2022) made SFT the first stage of the pipeline that Chapter 24 develops.</p>
+<p>The objective is the familiar next-token cross-entropy of pre-training, with one change. An SFT example is a sequence \(x_1,\dots,x_T\) in which positions belong either to the prompt or to the response, and we want the model to learn to produce responses, not to imitate prompts. So the loss is summed only over response positions \(\mathcal I\subseteq\{1,\dots,T\}\):</p>
+\[ \mathcal L_{\text{SFT}}(\theta)\;=\;-\frac{1}{|\mathcal I|}\sum_{t\in\mathcal I}\log p_\theta(x_t\mid x_{&lt;t}). \]
+<p>In code this is a mask: the labels at prompt positions are set to an ignore value, so they contribute neither loss nor gradient, although the model still reads them as context. Figure 16.1 shows a chat example laid out as one sequence. The special tokens of the chat template, which mark where the system message, the user turn and the assistant turn begin and end, are part of the sequence, and the model learns them too: a fine-tuned model ends its turn because it was trained to emit the end-of-turn token at the end of every response.</p>
+
+<figure class="diagram" id="fig-16-1">
+<svg class="dg" viewBox="0 0 720 200" role="img" aria-label="An SFT example as one token sequence with a loss mask that is zero on the prompt and one on the response">
+<text x="20" y="22" class="t-b">One SFT example, packed as a single sequence</text>
+<rect x="20" y="40" width="70" height="40" rx="4" class="bx"/><text x="55" y="64" text-anchor="middle" class="t-xs">&lt;system&gt;</text>
+<rect x="94" y="40" width="130" height="40" rx="4" class="bx"/><text x="159" y="64" text-anchor="middle" class="t-xs">You are a helpful…</text>
+<rect x="228" y="40" width="62" height="40" rx="4" class="bx"/><text x="259" y="64" text-anchor="middle" class="t-xs">&lt;user&gt;</text>
+<rect x="294" y="40" width="130" height="40" rx="4" class="bx"/><text x="359" y="64" text-anchor="middle" class="t-xs">Summarise this note</text>
+<rect x="428" y="40" width="80" height="40" rx="4" class="bx"/><text x="468" y="64" text-anchor="middle" class="t-xs">&lt;assistant&gt;</text>
+<rect x="512" y="40" width="130" height="40" rx="4" class="bx3"/><text x="577" y="64" text-anchor="middle" class="t-xs">The patient reports…</text>
+<rect x="646" y="40" width="54" height="40" rx="4" class="bx3"/><text x="673" y="64" text-anchor="middle" class="t-xs">&lt;eot&gt;</text>
+<text x="20" y="108" class="t-sm">loss mask</text>
+<rect x="94" y="94" width="414" height="22" rx="3" class="fill-muted" opacity=".35"/><text x="301" y="110" text-anchor="middle" class="t-xs">0: read as context, no loss</text>
+<rect x="512" y="94" width="188" height="22" rx="3" class="fill-s3" opacity=".55"/><text x="606" y="110" text-anchor="middle" class="t-xs">1: loss on every token</text>
+<line x1="20" y1="140" x2="700" y2="140" class="ln dash"/>
+<text x="20" y="162" class="t-xs">Gradient flows from response tokens only, but through the whole sequence: every layer still reads the prompt.</text>
+<text x="20" y="180" class="t-xs">Several short examples are usually packed into one long sequence, with attention masks that stop them seeing each other.</text>
+</svg>
+<figcaption><b>Figure 16.1 — Supervised fine-tuning data.</b> The prompt and the chat-template tokens are input; only the response and its end-of-turn token are targets. Learning to emit the end-of-turn token is what teaches a fine-tuned model to stop.</figcaption>
+</figure>
+
+<p>Figure 16.1 also makes a point about cost that we will need throughout the chapter. Every token of the sequence passes through the forward and backward passes, whether or not it carries loss, so the compute of a fine-tuning run is set by the total tokens processed, not by the response tokens alone. Long system prompts are paid for in every example.</p>
+<p>How much data does fine-tuning need? Less than one might think, for behaviour, and more than one might hope, for knowledge. The LIMA study (2023)<span class="cite"><a href="#r-lima">[22]</a></span> fine-tuned a 65B model on only 1,000 carefully chosen examples and obtained a chat model competitive with far more heavily tuned ones, which led its authors to the <em>superficial alignment hypothesis</em>: a model's knowledge is learned in pre-training, and fine-tuning mostly selects a format and style in which to express it. The hypothesis is too strong as stated, since fine-tuning on large domain corpora does add skills, but it captures the practical rule. Format, tone, refusals and task structure can be taught with thousands of examples. New facts are better supplied by retrieval at inference time, because fine-tuning on facts is expensive, hard to update and prone to teaching the model to state things confidently that it does not reliably know.</p>
+<p>The decision between prompting, retrieval and fine-tuning is therefore an engineering one with a cost model behind it. Prompting costs nothing to train but pays for its instructions in every request: a 1,500-token system prompt, at the prefill costs of Chapter 3, is a real fraction of the cost of a short request, although prefix caching (§10.6) recovers much of it. Retrieval adds a search and a longer prompt per request but keeps facts current. Fine-tuning costs a training run and, unless merged, a small per-token overhead, but it can make the prompt short and the behaviour dependable. The question this section leaves is how much a training run actually costs.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — the compute of a fine-tuning run</div>
+<p><strong>Setup.</strong> We fine-tune Llama 3 8B (\(N\approx8.03\times10^9\)) on 50,000 examples averaging 1,000 tokens, for 3 epochs: \(1.5\times10^8\) tokens processed.</p>
+<p><strong>FLOPs.</strong> Training costs about \(6N\) FLOPs per token: \(2N\) for the forward pass and \(4N\) for the backward pass, which computes gradients with respect to both activations and weights (§2.10). The run therefore needs \(6\times8.03\times10^9\times1.5\times10^8\approx7.2\times10^{18}\) FLOPs.</p>
+<p><strong>Time and price.</strong> At 40% MFU on an H100 (about 396 TFLOP/s of BF16), that is \(7.2\times10^{18}/3.96\times10^{14}\approx18{,}000\) s, about 5 GPU-hours, or roughly $13 at $2.50 per GPU-hour.</p>
+<p><strong>Consequence.</strong> The arithmetic of fine-tuning is cheap; it is five orders of magnitude below the \(6\times8.03\times10^9\times1.5\times10^{13}\approx7.2\times10^{23}\) FLOPs of pre-training Llama 3 8B on 15 trillion tokens. What makes full fine-tuning hard is not compute but memory: as the next section shows, those 5 GPU-hours cannot be spent on one GPU at all.</p>
+</div>
+
+<h2 id="s16-2">16.2 The memory bill of full fine-tuning</h2>
+<p>Inference needs the weights and the KV cache. Training needs much more, and it is worth deriving exactly what, because the bill explains every method in the rest of the chapter. Modern training uses <strong>mixed precision</strong> (Micikevicius et al., 2017)<span class="cite"><a href="#r-mp">[8]</a></span> and the <strong>Adam</strong> optimiser in its AdamW form<span class="cite"><a href="#r-adamw">[9]</a></span>. Mixed precision runs the forward and backward passes in BF16 for speed, but keeps an FP32 "master" copy of the weights, because the updates applied at each step are often smaller than the BF16 spacing near the weight's value and would be rounded away. Adam keeps, for every parameter, running estimates of the first moment (mean) and second moment (uncentred variance) of its gradient, in FP32.</p>
+<p>Count the bytes per parameter. The BF16 weights used by the forward pass take 2 bytes; the BF16 gradients take 2; the FP32 master weights take 4; Adam's two moments take 4 each. The total is</p>
+\[ 2+2+4+4+4\;=\;16\ \text{bytes per parameter}, \]
+<p>eight times the 2 bytes of BF16 inference. Figure 16.2 draws the bill. For Llama 3 8B it is \(16\times8.03\times10^9\approx128\) GB, before a single activation is stored; for Llama 3 70B (\(N\approx70.6\)B) it is 1.13 TB. A single 80 GB H100 can hold the inference weights of the 8B model five times over, yet it cannot hold the training state even once.</p>
+
+<figure class="diagram" id="fig-16-2">
+<svg class="dg" viewBox="0 0 720 210" role="img" aria-label="Bytes per parameter for full fine-tuning, LoRA and QLoRA">
+<text x="20" y="22" class="t-b">Bytes per base-model parameter (excluding activations)</text>
+<text x="20" y="58" class="t-sm">full fine-tune</text>
+<rect x="150" y="42" width="60" height="26" class="fill-acc"/><text x="180" y="59" text-anchor="middle" class="t-xs t-on">W 2</text>
+<rect x="210" y="42" width="60" height="26" class="fill-s2"/><text x="240" y="59" text-anchor="middle" class="t-xs t-on">∇ 2</text>
+<rect x="270" y="42" width="120" height="26" class="fill-s3"/><text x="330" y="59" text-anchor="middle" class="t-xs t-on-dark">FP32 master 4</text>
+<rect x="390" y="42" width="120" height="26" class="fill-s4"/><text x="450" y="59" text-anchor="middle" class="t-xs t-on-dark">Adam m 4</text>
+<rect x="510" y="42" width="120" height="26" class="fill-s5"/><text x="570" y="59" text-anchor="middle" class="t-xs t-on">Adam v 4</text>
+<text x="640" y="59" class="t-sm t-b">16 B</text>
+<text x="20" y="108" class="t-sm">LoRA (BF16 base)</text>
+<rect x="150" y="92" width="60" height="26" class="fill-acc"/><text x="180" y="109" text-anchor="middle" class="t-xs t-on">W 2</text>
+<rect x="210" y="92" width="3" height="26" class="fill-s5"/>
+<text x="222" y="109" class="t-xs">+ adapter state ≈ 0.08 B</text>
+<text x="640" y="109" class="t-sm t-b">≈ 2.1 B</text>
+<text x="20" y="158" class="t-sm">QLoRA (NF4 base)</text>
+<rect x="150" y="142" width="15.5" height="26" class="fill-acc"/>
+<rect x="165.5" y="142" width="3" height="26" class="fill-s5"/>
+<text x="176" y="159" class="t-xs">NF4 + double-quantised scales ≈ 0.52 B, + adapter state</text>
+<text x="640" y="159" class="t-sm t-b">≈ 0.6 B</text>
+<text x="20" y="196" class="t-xs">Scale: 30 px per byte. Adapter state assumes rank 16 on all linear layers of Llama 3 8B (42M parameters at 16 bytes each, 0.67 GB).</text>
+</svg>
+<figcaption><b>Figure 16.2 — The memory bill per parameter.</b> Full fine-tuning keeps a gradient, an FP32 master copy and two Adam moments for every weight. LoRA keeps them only for the adapter, so the frozen base costs its inference size; QLoRA stores the frozen base in 4 bits as well.</figcaption>
+</figure>
+
+<p>Figure 16.2 already contains the idea of this chapter. Twelve of the sixteen bytes, the master copy and the two moments, exist only because the parameter is being trained, and two more, the gradient, exist only during the backward pass. If most parameters are frozen, they cost what they cost at inference, 2 bytes or less, and the training state shrinks to that of the few parameters that remain.</p>
+<p>The bill has a second component that grows with the batch: <strong>activations</strong>. The backward pass needs, for every layer, the inputs that the forward pass saw, because the gradient of a matrix product \(Y=XW\) with respect to \(W\) is \(X^\top\,\partial\mathcal L/\partial Y\). For a GPT-style block in 16-bit precision, Korthikanti et al. (2022) count<span class="cite"><a href="#r-korthikanti">[10]</a></span> about \(34\,T d\) bytes of saved tensors per layer and per sequence of \(T\) tokens when attention scores are not stored, which FlashAttention ensures (Chapter 9). For Llama 3 8B at \(T=2048\), that is \(34\times2048\times4096\approx285\) MB per layer, about 9 GB for 32 layers, and more in practice because its SwiGLU MLP is wider than the GPT block the formula assumes. A batch of 8 such sequences needs over 70 GB of activations.</p>
+<p>The standard remedy is <strong>activation checkpointing</strong> (also called rematerialisation). Instead of saving every intermediate tensor, the forward pass saves only each layer's input, \(Td\) values or 16.8 MB per layer per sequence here, about 0.5 GB for the whole model, and the backward pass recomputes each layer's internals from its input just before it needs them. The price is one extra forward pass, raising compute from \(6N\) to about \(8N\) FLOPs per token, a third more. It is almost always worth paying, because memory, not compute, is the binding constraint.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — what Adam's state is</div>
+<p>Adam is a diagonal preconditioner estimated online. For each parameter it maintains exponential moving averages \(m\leftarrow\beta_1m+(1-\beta_1)g\) and \(v\leftarrow\beta_2v+(1-\beta_2)g^2\) of the gradient \(g\) and its square, and steps by \(-\eta_{\text{lr}}\,\hat m/(\sqrt{\hat v}+\epsilon)\), where hats denote bias corrections. Coordinate by coordinate, the step is a signal-to-noise-normalised gradient, roughly \(\eta_{\text{lr}}\) times the sign of a persistent gradient, which is why one learning rate works across parameters whose gradients differ by orders of magnitude. The price of that invariance is two extra numbers per parameter, which is exactly the 8 bytes in Figure 16.2. (Here \(\beta_1,\beta_2\) are Adam's decay rates; we use them only in this box, and they are unrelated to the bandwidth \(\beta\).)</p>
+</div>
+
+<p>We now know why full fine-tuning of a large model does not fit on one GPU. There are two ways out. We can keep training every parameter and spread the 16 bytes over many GPUs, which is the subject of the next section. Or we can train far fewer parameters, which is the subject of the rest of the chapter.</p>
+
+<h2 id="s16-3">16.3 Sharding the bill: ZeRO and FSDP</h2>
+<p>The oldest way to train on many GPUs is <strong>data parallelism</strong>: every GPU holds a full replica of the model and its training state, processes a different slice of the batch, and the GPUs average their gradients with an all-reduce (the collective of §17.2) before each step. Data parallelism divides the activations but not the 16 bytes per parameter, which every replica duplicates. Rajbhandari et al. observed in 2019 that this duplication is pure waste, and their <strong>ZeRO</strong> (Zero Redundancy Optimizer)<span class="cite"><a href="#r-zero">[6]</a></span> removes it in three stages. Let \(n_{\text{DP}}\) GPUs share the work and let \(N\) be the parameter count.</p>
+<ul>
+<li><strong>Stage 1</strong> shards the optimiser state (master weights and both moments, 12 bytes per parameter): each GPU keeps and updates only its \(1/n_{\text{DP}}\) slice. Memory per GPU: \(4N+12N/n_{\text{DP}}\) bytes.</li>
+<li><strong>Stage 2</strong> also shards the gradients: instead of an all-reduce, the GPUs perform a reduce-scatter, so each receives the summed gradient only for its own slice. Memory: \(2N+14N/n_{\text{DP}}\).</li>
+<li><strong>Stage 3</strong> shards the BF16 weights as well. Each layer's weights are gathered from all GPUs with an all-gather just before the layer runs, and discarded afterwards. Memory: \(16N/n_{\text{DP}}\).</li>
+</ul>
+<p>PyTorch's <strong>FSDP</strong> (Fully Sharded Data Parallel, 2023)<span class="cite"><a href="#r-fsdp">[7]</a></span> implements stage 3 natively and is the most common way to fine-tune large models fully. The communication cost is moderate: stages 1 and 2 move the same bytes as a plain all-reduce (a reduce-scatter plus an all-gather, §17.4), and stage 3 adds one more all-gather of the weights in the backward pass, about 1.5 times the traffic of plain data parallelism, which can be overlapped with computation layer by layer.</p>
+
+<figure class="chart" id="fig-16-3">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Training-state memory per GPU for Llama 3 70B (excluding activations)","height":340,
+ "x":{"label":"Number of data-parallel GPUs n_DP (log)","log":true,"min":1,"max":64,"ticks":[1,2,4,8,16,32,64]},
+ "y":{"label":"GB per GPU (log)","log":true,"min":10,"max":2000},
+ "hlines":[{"y":80,"text":"H100 80 GB"}],
+ "series":[
+  {"name":"Plain data parallelism (16N)","color":"s2","dash":true,"points":[[1,1130],[2,1130],[4,1130],[8,1130],[16,1130],[32,1130],[64,1130]]},
+  {"name":"ZeRO-1 (4N + 12N/n)","color":"s4","points":[[1,1130],[2,706],[4,494],[8,388],[16,335],[32,309],[64,296]]},
+  {"name":"ZeRO-2 (2N + 14N/n)","color":"s3","points":[[1,1130],[2,635],[4,388],[8,265],[16,203],[32,172],[64,156]]},
+  {"name":"ZeRO-3 / FSDP (16N/n)","color":"s1","points":[[1,1130],[2,565],[4,282],[8,141],[16,70.6],[32,35.3],[64,17.7]]}
+ ]}
+</script>
+<figcaption><b>Figure 16.3 — Sharding the training state.</b> Stages 1 and 2 leave a floor of BF16 weights (and gradients) on every GPU; only stage 3 divides everything. A full fine-tune of a 70B model needs at least 16 H100s under ZeRO-3, and more once activations are added.</figcaption>
+</figure>
+
+<p>Figure 16.3 shows the consequence for Llama 3 70B. Stages 1 and 2 flatten out at the BF16 copies that every GPU still holds, 282 GB and 141 GB respectively, both above an H100's capacity however many GPUs we add. Only stage 3 keeps dividing, reaching 70.6 GB per GPU on 16 GPUs, which leaves almost no room for activations; in practice such a fine-tune uses 32 or 64 GPUs, or combines FSDP with the tensor parallelism of Chapter 18. A full fine-tune of a 70B model is thus a multi-node job, even though its compute, by the arithmetic of §16.1, might take only a few hundred GPU-hours.</p>
+
+<details class="drill">
+<summary>Drill 16.1 — Fitting a full fine-tune of Llama 3 8B</summary>
+<p>You have one server with eight 80 GB H100s and want to fully fine-tune Llama 3 8B on 4,096-token sequences, with activation checkpointing. Which ZeRO stage do you need, and how many sequences can each GPU process per micro-batch?</p>
+<p><em>Solution.</em> The training state is 128 GB. Under ZeRO-1 each GPU holds \(4N+12N/8=32.1+12.0=44.2\) GB; under ZeRO-2, \(16.1+14.1=30.1\) GB; under ZeRO-3, \(16.1\) GB. With checkpointing, each sequence saves its layer inputs, \(4096\times4096\times2\) B ≈ 33.6 MB per layer, about 1.1 GB for 32 layers, plus the working memory of one layer being recomputed, a few GB at this length (the MLP's intermediate activations are \(T\times14{,}336\) values per tensor). ZeRO-1 leaves about 30 GB of headroom, enough for a micro-batch of 4 to 8 sequences; ZeRO-2 leaves about 45 GB, and ZeRO-3 about 60 GB. All three work; ZeRO-2 is the usual choice because it needs no weight gathering, and larger micro-batches are traded against gradient accumulation to reach the desired global batch.</p>
+</details>
+
+<p>Sharding answers the memory question by buying more GPUs. It leaves two problems untouched. Every task still produces a complete copy of the model, 16 GB for an 8B model and 141 GB for a 70B one, so a provider with a thousand customers would need a thousand copies to store and, worse, to serve. And a full update to every parameter is far more than most adaptations need. The second observation, made precise, is the key to the first problem.</p>
+
+<h2 id="s16-4">16.4 The low-rank hypothesis</h2>
+<p>How much does fine-tuning actually change a model? Write the weights of one matrix after fine-tuning as \(W_0+\Delta W\), where \(W_0\in\mathbb R^{d_{\text{in}}\times d_{\text{out}}}\) is the pre-trained matrix. A full fine-tune lets \(\Delta W\) be any matrix, with \(d_{\text{in}}d_{\text{out}}\) free entries, 16.8 million for one \(4096\times4096\) projection. But the data that drives the change is small, a few thousand examples that mostly ask the model to express what it already knows in a new format, and it would be surprising if such data needed the whole space.</p>
+<p>Two lines of evidence made this precise before LoRA. Li et al. (2018) introduced the<span class="cite"><a href="#r-li18">[4]</a></span> <strong>intrinsic dimension</strong> of a training problem: restrict the parameters to a random affine subspace \(\theta=\theta_0+Pz\), with \(P\) a fixed random matrix and only \(z\in\mathbb R^{k}\) trained, and find the smallest \(k\) that reaches 90% of the full solution's performance. Aghajanyan et al. (2020) measured it<span class="cite"><a href="#r-intrinsic">[3]</a></span> for fine-tuning pre-trained language models and found it astonishingly small: about 200 parameters sufficed for RoBERTa-large on the MRPC paraphrase task, out of 355 million. Moreover, the intrinsic dimension <em>fell</em> as pre-training progressed and as models grew, so that larger, better-trained models were easier to adapt. Pre-training, in this view, builds a representation in which most tasks are a short step away.</p>
+<p>LoRA's hypothesis is a structured version of the same idea: the update \(\Delta W\) of each matrix has low <em>rank</em>. The mathematics of what that buys is the Eckart–Young–Mirsky theorem. If \(\Delta W\) has singular values \(\sigma_1\ge\sigma_2\ge\dots\ge0\), the best approximation of rank at most \(r\) in Frobenius norm is the truncated singular value decomposition \(\Delta W_r\), and its error is</p>
+\[ \min_{\operatorname{rank}(M)\le r}\lVert\Delta W-M\rVert_F^2\;=\;\lVert\Delta W-\Delta W_r\rVert_F^2\;=\;\sum_{i>r}\sigma_i^2. \]
+<p>If the spectrum of \(\Delta W\) decays fast, a small \(r\) captures almost all of the update, and a rank-\(r\) matrix needs only \(r(d_{\text{in}}+d_{\text{out}})\) numbers. For \(r=16\) and a \(4096\times4096\) matrix that is 131,072 numbers instead of 16.8 million, a factor of 128. Hu et al. checked the hypothesis on GPT-3 175B: updates of rank 1 to 4 applied to two of the attention matrices matched full fine-tuning on their benchmarks, and the subspaces learned at rank 8 and rank 64 overlapped strongly in their top directions, which is what one expects if the true update is nearly low-rank.</p>
+<p>Two cautions keep the hypothesis honest. First, it is an empirical claim about typical adaptation tasks, not a theorem. Biderman et al. (2024), in a paper aptly titled "LoRA Learns Less and Forgets Less"<span class="cite"><a href="#r-learnsless">[5]</a></span>, measured the spectra of full fine-tuning updates on large code and mathematics corpora and found them to have ranks 10 to 100 times higher than typical LoRA configurations; on those tasks, which teach genuinely new skills from billions of tokens, LoRA underperformed full fine-tuning. Second, LoRA does not compute the SVD of a full update and truncate it; it optimises directly within the set of low-rank matrices, a different and non-convex problem whose solution need not equal \(\Delta W_r\). How it does so is the subject of the next section.</p>
+
+<h2 id="s16-5">16.5 LoRA</h2>
+<p>Low-rank adaptation (Hu et al., 2021)<span class="cite"><a href="#r-lora">[1]</a></span> freezes \(W_0\) and parameterises the update of a chosen matrix as a product of two thin matrices, in the notation of §27.4:</p>
+\[ h\;=\;xW_0\;+\;s\,xW_{\downarrow}W_{\uparrow},\qquad W_{\downarrow}\in\mathbb R^{d_{\text{in}}\times r_a},\quad W_{\uparrow}\in\mathbb R^{r_a\times d_{\text{out}}},\quad s=\frac{\alpha_a}{r_a}. \]
+<p>Here \(x\) is a row vector of activations, \(r_a\) is the adapter rank, and \(\alpha_a\) is a fixed scaling constant whose role we explain below. The down-projection \(W_{\downarrow}\) maps the input into an \(r_a\)-dimensional space and the up-projection \(W_{\uparrow}\) maps it back, so the update \(\Delta W=sW_{\downarrow}W_{\uparrow}\) has rank at most \(r_a\). Figure 16.4 draws the computation.</p>
+
+<figure class="diagram" id="fig-16-4">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="LoRA forward pass: frozen W0 in parallel with a trainable low-rank path down-projection then up-projection, scaled and added">
+<text x="20" y="22" class="t-b">A LoRA layer: frozen dense path plus trainable low-rank path</text>
+<rect x="20" y="105" width="70" height="40" rx="6" class="bx"/><text x="55" y="129" text-anchor="middle" class="t-sm">x</text>
+<text x="55" y="160" text-anchor="middle" class="t-xs">1 × d_in</text>
+<rect x="170" y="40" width="260" height="56" rx="6" class="fill-muted" opacity=".3"/>
+<text x="300" y="64" text-anchor="middle" class="t-sm t-b">W₀ (frozen, BF16 or NF4)</text>
+<text x="300" y="82" text-anchor="middle" class="t-xs">d_in × d_out, no gradient, no optimiser state</text>
+<rect x="170" y="160" width="110" height="56" rx="6" class="bx3"/>
+<text x="225" y="184" text-anchor="middle" class="t-sm t-b">W↓</text>
+<text x="225" y="202" text-anchor="middle" class="t-xs">d_in × r_a, random init</text>
+<rect x="320" y="160" width="110" height="56" rx="6" class="bx3"/>
+<text x="375" y="184" text-anchor="middle" class="t-sm t-b">W↑</text>
+<text x="375" y="202" text-anchor="middle" class="t-xs">r_a × d_out, zero init</text>
+<line x1="90" y1="120" x2="168" y2="70" class="ln"/>
+<line x1="90" y1="130" x2="168" y2="188" class="ln-acc"/>
+<line x1="280" y1="188" x2="318" y2="188" class="ln-acc"/>
+<text x="299" y="178" text-anchor="middle" class="t-xs">r_a</text>
+<rect x="470" y="160" width="70" height="56" rx="6" class="bx4"/><text x="505" y="192" text-anchor="middle" class="t-sm">× s</text>
+<line x1="430" y1="188" x2="468" y2="188" class="ln-acc"/>
+<circle cx="600" cy="125" r="18" class="bx2"/><text x="600" y="131" text-anchor="middle" class="t-b">+</text>
+<line x1="430" y1="68" x2="584" y2="116" class="ln"/>
+<line x1="540" y1="188" x2="586" y2="138" class="ln-acc"/>
+<rect x="640" y="105" width="64" height="40" rx="6" class="bx"/><text x="672" y="129" text-anchor="middle" class="t-sm">h</text>
+<line x1="618" y1="125" x2="638" y2="125" class="ln"/>
+<text x="20" y="240" class="t-xs">s = α_a / r_a. After training, W₀ + s W↓W↑ can be merged into one dense matrix: zero extra inference cost.</text>
+</svg>
+<figcaption><b>Figure 16.4 — Low-rank adaptation.</b> Only the coloured path is trained. Because \(W_{\uparrow}\) starts at zero, the adapted model starts exactly at the pre-trained model, and the update grows from there.</figcaption>
+</figure>
+
+<p>Figure 16.4 shows the three design decisions that make LoRA work. The first is <strong>initialisation</strong>. \(W_{\downarrow}\) is initialised randomly (a scaled Gaussian or Kaiming-uniform) and \(W_{\uparrow}\) at zero, so \(\Delta W=0\) at the start: training begins exactly at the pre-trained model, with no random perturbation to undo. Both factors cannot be zero, for then neither would ever receive a gradient, as the derivation below shows. The second is that the low-rank path runs <strong>in parallel</strong> with the frozen one and is added to its output, so the adapted function is still a linear map of \(x\) and can be merged. The third is the scale \(s\).</p>
+<p><strong>Gradients.</strong> Take a batch of inputs \(X\in\mathbb R^{m\times d_{\text{in}}}\), outputs \(H=XW_0+sXW_{\downarrow}W_{\uparrow}\), and let \(G=\partial\mathcal L/\partial H\). By the rules for matrix products,</p>
+\[ \frac{\partial\mathcal L}{\partial W_{\uparrow}}=s\,(XW_{\downarrow})^{\top}G,\qquad \frac{\partial\mathcal L}{\partial W_{\downarrow}}=s\,X^{\top}G\,W_{\uparrow}^{\top},\qquad \frac{\partial\mathcal L}{\partial X}=G\,W_0^{\top}+s\,G\,W_{\uparrow}^{\top}W_{\downarrow}^{\top}. \]
+<p>The gradient with respect to the frozen \(W_0\) would be \(\nabla_W=X^\top G\), and it is never formed or stored. But it is illuminating to express LoRA's gradients through it: \(\partial\mathcal L/\partial W_{\uparrow}=sW_{\downarrow}^\top\nabla_W\) and \(\partial\mathcal L/\partial W_{\downarrow}=s\nabla_WW_{\uparrow}^\top\). A small gradient step on both factors with learning rate \(\eta_{\text{lr}}\) therefore changes the effective update, to first order, by</p>
+\[ \delta(\Delta W)\;=\;s\,(\delta W_{\downarrow}W_{\uparrow}+W_{\downarrow}\,\delta W_{\uparrow})\;=\;-\eta_{\text{lr}}s^2\big(\nabla_W\,W_{\uparrow}^{\top}W_{\uparrow}\;+\;W_{\downarrow}W_{\downarrow}^{\top}\,\nabla_W\big). \]
+<p>This is the full gradient, multiplied on the right by the positive semi-definite matrix \(W_{\uparrow}^\top W_{\uparrow}\) and on the left by \(W_{\downarrow}W_{\downarrow}^\top\). LoRA is therefore a form of <em>preconditioned, projected</em> gradient descent on \(\Delta W\): each step moves only within the column space of \(W_{\downarrow}\) or the row space of \(W_{\uparrow}\), whose dimensions are at most \(r_a\). At initialisation, \(W_{\uparrow}=0\), so only the second term survives: the first steps project the full gradient onto the random \(r_a\)-dimensional subspace spanned by \(W_{\downarrow}\), which is the random-subspace training of Li et al. with a subspace that then rotates as \(W_{\downarrow}\) learns. The formula also shows why both factors cannot start at zero: both terms would vanish and training would never leave the origin.</p>
+<p><strong>The scale \(s=\alpha_a/r_a\).</strong> With Adam, each entry of \(W_{\uparrow}\) moves by roughly \(\eta_{\text{lr}}\) per step regardless of the gradient's size (the box in §16.2). An entry of \(xW_{\downarrow}W_{\uparrow}\) is a sum of \(r_a\) such terms, so for a fixed learning rate the update grows with the rank. Dividing by \(r_a\) was Hu et al.'s way of making \(\alpha_a\) and the learning rate roughly transferable across ranks: practitioners set \(\alpha_a\) once (often \(\alpha_a=r_a\) or \(2r_a\), giving \(s=1\) or 2) and vary \(r_a\) without retuning. Kalajdzievski (2023) showed that \(1/r_a\) over-corrects at high rank: when the \(r_a\) terms add with random signs, their sum grows like \(\sqrt{r_a}\), and with \(s\propto1/r_a\) the effective learning rate shrinks as rank grows, so high ranks learn slowly and appear no better than low ones. His <strong>rank-stabilised LoRA</strong> (rsLoRA)<span class="cite"><a href="#r-rslora">[11]</a></span> uses \(s=\alpha_a/\sqrt{r_a}\), under which larger ranks do improve results.</p>
+<p><strong>Parameters and memory.</strong> A LoRA on one matrix has \(r_a(d_{\text{in}}+d_{\text{out}})\) parameters. Applied to all seven projections of every Llama 3 8B layer (queries, keys, values, output, gate, up and down), whose \(d_{\text{in}}+d_{\text{out}}\) sum to 81,920, a rank-16 adapter has \(16\times81{,}920\times32\approx42\) million parameters, 0.52% of the model, and 84 MB in BF16. Its training state at 16 bytes per parameter is 0.67 GB, against 128 GB for the full model. The frozen base costs its 16.06 GB of BF16 weights, and the activations are what they were before, because the backward pass must still propagate gradients through every frozen layer to reach the adapters below it.</p>
+<p><strong>Compute.</strong> The forward pass costs \(2N\) FLOPs per token, plus a negligible \(2r_a\sum(d_{\text{in}}+d_{\text{out}})\) for the adapters. The backward pass still computes \(\partial\mathcal L/\partial X\) through every layer, \(2N\), but skips the weight gradients of frozen matrices, which would have cost another \(2N\). LoRA training thus costs about \(4N\) FLOPs per token instead of \(6N\), a third less; its savings are overwhelmingly in memory, not time.</p>
+<p><strong>Merging.</strong> After training, \(W_0+sW_{\downarrow}W_{\uparrow}\) can be computed once and stored as an ordinary dense matrix, so the merged model has exactly the architecture, size and speed of the base model. Alternatively the adapter can be kept separate, at a cost of two thin matrix products per adapted layer, which lets one deployment switch adapters per request (§27.4). That choice, merge for one task or keep separate for many, is the main inference-side decision LoRA creates.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — LoRA training memory for Llama 3 8B</div>
+<p><strong>Setup.</strong> Rank 16 on all linear layers, BF16 base, activation checkpointing, micro-batches of 4 sequences of 2,048 tokens.</p>
+<p><strong>Base weights.</strong> 16.06 GB, frozen. <strong>Adapter state.</strong> 42M parameters × 16 bytes ≈ 0.67 GB (the adapter is usually kept in FP32 with Adam, so its weights double as the master copy).</p>
+<p><strong>Activations.</strong> With checkpointing, each sequence saves 32 layer inputs of \(2048\times4096\times2\) B = 16.8 MB, 0.54 GB, so four sequences save 2.1 GB. The layer being recomputed needs its full internal activations for four sequences, of the order of \(4\times285\) MB plus the wider MLP, a few GB. The logits are a hidden cost: \(4\times2048\times128{,}256\) values in FP32 is 4.2 GB, so fused or chunked cross-entropy kernels that never materialise all of them are worth using.</p>
+<p><strong>Total.</strong> About 25–30 GB, which fits on a 40 GB A100 or a 32 GB consumer card with care, and comfortably on an H100. The same run as a full fine-tune needed 128 GB of state alone.</p>
+</div>
+
+<h2 id="s16-6">16.6 Rank, targets and learning rates</h2>
+<p>LoRA has three choices that matter in practice: which matrices receive adapters, what rank they have, and how fast they learn. The original paper adapted only the query and value projections of attention, on the evidence that, for a fixed parameter budget, spreading rank over several matrices beat concentrating it in one. Later work reversed the emphasis on attention. Dettmers et al. found in the QLoRA study (2023) that adapting <em>all</em> linear layers, including the MLP, was necessary to match full fine-tuning on instruction-following benchmarks, and that once all layers were adapted, the rank mattered surprisingly little. The MLP holds about two thirds of a dense Transformer's parameters (§2.7), and it is plausible that it holds a similar share of what fine-tuning needs to change.</p>
+<p>Figure 16.5 shows what these choices cost in trainable parameters for Llama 3 8B. Adapting only queries and values at rank 8 trains 3.4 million parameters, 0.04% of the model; adapting all linear layers at rank 64 trains 168 million, 2.1%. Even the largest configurations in common use are an order of magnitude below the 1% line at modest ranks, and two orders below the full model.</p>
+
+<figure class="chart" id="fig-16-5">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Trainable parameters of a LoRA on Llama 3 8B","height":330,
+ "x":{"label":"Adapter rank r_a (log)","log":true,"min":1,"max":256,"ticks":[1,2,4,8,16,32,64,128,256]},
+ "y":{"label":"Trainable parameters, millions (log)","log":true,"min":0.1,"max":1000},
+ "hlines":[{"y":80.3}],
+ "notes":[{"x":1.08,"y":110,"text":"1% of the model (80M)"}],
+ "series":[
+  {"name":"All linear layers (7 per block)","color":"s1","points":[[1,2.62],[2,5.24],[4,10.5],[8,21],[16,41.9],[32,83.9],[64,168],[128,336],[256,671]]},
+  {"name":"Queries and values only","color":"s2","points":[[1,0.426],[2,0.852],[4,1.7],[8,3.41],[16,6.82],[32,13.6],[64,27.3],[128,54.5],[256,109]]}
+ ]}
+</script>
+<figcaption><b>Figure 16.5 — Adapter size against rank.</b> Parameters grow linearly with rank: \(2.62\)M per unit of rank for all linear layers, \(0.43\)M for queries and values only. A typical rank-16 all-linear adapter is 42M parameters, 84 MB in BF16.</figcaption>
+</figure>
+
+<p>What rank to choose depends on how far the task is from the base model's behaviour. For instruction following, style and format, ranks of 8 to 32 on all linear layers usually match full fine-tuning, consistent with the low intrinsic dimension of §16.4. For continued pre-training on a new domain or language, where billions of tokens teach new knowledge, the updates have high rank and LoRA falls short at any practical rank; full fine-tuning, or a very large rank with rsLoRA scaling, is then the better tool. The forgetting side of the trade is the welcome one: because a low-rank update can only change the model in a few directions, LoRA forgets less of what the base model knew outside the fine-tuning domain, which Biderman et al. measured directly.</p>
+<p><strong>Learning rates.</strong> LoRA is trained with learning rates around \(10^{-4}\) to \(3\times10^{-4}\), roughly ten times those of full fine-tuning, because its parameters start at or near zero and must travel further. Hayou et al. (2024) analysed the dynamics of the two factors in the limit of large width and found that a single learning rate is inefficient: \(W_{\uparrow}\), which multiplies an \(r_a\)-dimensional input, should learn much faster than \(W_{\downarrow}\), which multiplies a \(d_{\text{in}}\)-dimensional one. Their <strong>LoRA+</strong><span class="cite"><a href="#r-loraplus">[12]</a></span> sets \(\eta_{\uparrow}=\lambda\,\eta_{\downarrow}\) with \(\lambda\) around 16, which improved both speed and final quality at no cost. The gradient formula of §16.5 explains why such asymmetries matter: the two factors play different roles in the preconditioner, and the parameterisation is redundant (replacing \(W_{\downarrow}\) by \(W_{\downarrow}Q\) and \(W_{\uparrow}\) by \(Q^{-1}W_{\uparrow}\) for any invertible \(Q\) gives the same \(\Delta W\)), so the optimiser's behaviour depends on more than the update it represents.</p>
+
+<details class="drill">
+<summary>Drill 16.2 — Counting a LoRA on Llama 3 70B</summary>
+<p>Llama 3 70B has 80 layers, \(d=8192\), 8 KV heads of dimension 128 and an MLP width of 28,672. How many parameters does a rank-16 LoRA on all linear layers have, and what fraction of the model is it?</p>
+<p><em>Solution.</em> Per layer, \(d_{\text{in}}+d_{\text{out}}\) is 16,384 for queries, 9,216 for keys, 9,216 for values (output dimension \(8\times128=1024\)), 16,384 for the attention output, and 36,864 for each of gate, up and down: 161,792 in total. At rank 16 and 80 layers, \(16\times161{,}792\times80\approx207\)M parameters, 0.29% of 70.6B, 414 MB in BF16. The fraction is smaller than for the 8B model (0.52%) because adapter size grows with the width \(d\), while the matrices it adapts grow with \(d^2\).</p>
+</details>
+
+<h2 id="s16-7">16.7 QLoRA: fine-tuning on a quantised base</h2>
+<p>LoRA removed the training state of the frozen weights, but the frozen weights themselves remain: 16 GB for an 8B model, 141 GB for a 70B one. The 70B model still needs two H100s merely to hold its frozen base. Dettmers et al. asked in 2023 whether the frozen base could be stored in the 4-bit formats of Chapter 14, since it is only read, never updated. Their <strong>QLoRA</strong> showed that it can, with three ingredients, and fine-tuned a 65B model on a single 48 GB GPU in about a day.</p>
+<p><strong>NF4.</strong> The base weights are stored in a 4-bit format called NormalFloat. Pre-trained weights within a block are close to normally distributed, so instead of 16 evenly spaced levels (INT4), NF4 places its 16 levels at quantiles of the standard normal distribution, rescaled to \([-1,1]\), with an exact zero. For a normal input this makes every level equally likely, which maximises the entropy of the 4-bit code and hence the information it carries; Drill 16.3 works through the construction. Each block of 64 weights is scaled by its absolute maximum, exactly as in the per-group scaling of §14.3.</p>
+<p><strong>Double quantisation.</strong> A 32-bit scale per 64 weights costs \(32/64=0.5\) bits per weight, an eighth of the 4-bit payload. QLoRA quantises the scales themselves to 8 bits, in blocks of 256 scales sharing one 32-bit second-level scale, which reduces the overhead to \(8/64+32/(64\times256)\approx0.127\) bits per weight, for a total of about 4.13 bits.</p>
+<p><strong>Paged optimisers.</strong> Memory use during training is spiky: a long sequence or the logits of a large vocabulary can briefly exceed the GPU's capacity. QLoRA allocates the optimiser state in NVIDIA unified memory, which pages to CPU memory under pressure and back when needed, so that a spike slows a step instead of crashing the run.</p>
+<p>The computation itself is in BF16. In each forward and backward pass, every frozen block is dequantised to BF16 on the fly, multiplied, and discarded; gradients flow through the dequantised weights to the BF16 adapters, which are the only trained parameters. The quantisation error of the base is therefore present throughout training, and the adapters learn in its presence, partly compensating for it. The cost is speed: dequantisation adds work to every matrix product, so a QLoRA step is noticeably slower than a LoRA step on a BF16 base. QLoRA trades time for memory, which is the right trade when memory is what prevents the job from running at all.</p>
+
+<figure class="chart" id="fig-16-6">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Memory to fine-tune, by method and model size (weights and training state only)","height":340,
+ "x":{"label":"Model parameters, billions (log)","log":true,"min":1,"max":100,"ticks":[1,3,8,14,32,70]},
+ "y":{"label":"GB (log)","log":true,"min":0.5,"max":2000},
+ "hlines":[{"y":80},{"y":24}],
+ "notes":[{"x":1.05,"y":105,"text":"H100 80 GB"},{"x":1.05,"y":31,"text":"24 GB GPU"}],
+ "series":[
+  {"name":"Full fine-tune (16 B/param)","color":"s2","points":[[1,16],[3,48],[8,128],[14,224],[32,512],[70,1130]]},
+  {"name":"LoRA, BF16 base (≈2.1 B/param)","color":"s1","points":[[1,2.1],[3,6.3],[8,16.9],[14,29.4],[32,67.2],[70,147]]},
+  {"name":"QLoRA, NF4 base (≈0.6 B/param)","color":"s3","points":[[1,0.6],[3,1.8],[8,4.8],[14,8.4],[32,19.2],[70,42]]}
+ ]}
+</script>
+<figcaption><b>Figure 16.6 — What fits where.</b> Activations come on top, a few GB with checkpointing at moderate batch sizes. Full fine-tuning of an 8B model already needs a multi-GPU server; LoRA fits a 32B model on one H100; QLoRA fits a 70B model on one H100 and an 8B model on a consumer GPU.</figcaption>
+</figure>
+
+<p>Figure 16.6 summarises the three regimes and is worth committing to memory, because interview questions about fine-tuning budgets reduce to reading it. Each line is a constant number of bytes per parameter; the horizontal lines are devices. The full fine-tune line crosses the H100 line between 3B and 8B parameters, the LoRA line between 32B and 70B, and the QLoRA line not at all for dense models up to about 120B. The step from LoRA to QLoRA is the step from Chapter 14's BF16 baseline to 4-bit weights, applied to training.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — QLoRA on Llama 3 70B with one H100</div>
+<p><strong>Base.</strong> Of 70.6B parameters, about 2.1B are the input embedding and output matrices (\(2\times128{,}256\times8192\)), which QLoRA usually keeps in BF16: 4.2 GB. The remaining 68.5B linear-layer weights at 4.13 bits cost \(68.5\times10^9\times4.13/8\approx35.4\) GB. The frozen base is therefore about 39.6 GB.</p>
+<p><strong>Adapter.</strong> Rank 16 on all linear layers: 207M parameters (Drill 16.2), at 16 bytes each about 3.3 GB.</p>
+<p><strong>Activations.</strong> With checkpointing, a 2,048-token sequence saves 80 layer inputs of \(2048\times8192\times2\) B ≈ 33.6 MB, 2.7 GB in total, plus a few GB of working memory for the layer being recomputed and for the logits.</p>
+<p><strong>Total.</strong> About 50 GB for a micro-batch of one or two sequences, so the job fits on one 80 GB H100, where LoRA on a BF16 base would need at least two GPUs and full fine-tuning at least sixteen. The price is time: at roughly \(4N\) FLOPs per token plus dequantisation, one H100 processes on the order of a few hundred tokens per second, so a 10-million-token fine-tune takes many hours rather than minutes.</p>
+</div>
+
+<p>One practical subtlety concerns merging. An adapter trained on an NF4 base has learned to correct a quantised model. Merging it into the 4-bit weights would require requantising \(W_0+\Delta W\), which adds new quantisation error the adapter never saw; merging it into the original BF16 weights gives a model slightly different from the one trained, usually harmlessly. Serving the adapter unmerged on top of the same quantised base reproduces training exactly. LoftQ (Li et al., 2023)<span class="cite"><a href="#r-loftq">[18]</a></span> goes further and initialises the adapters to approximate the quantisation residual \(W_0-\operatorname{dequant}(Q(W_0))\) by a low-rank matrix, so that training starts from a closer approximation to the BF16 model.</p>
+
+<details class="drill">
+<summary>Drill 16.3 — Why NF4 uses normal quantiles</summary>
+<p>Suppose the weights of a block, after division by a scale, are distributed as \(\mathcal N(0,\sigma^2)\). Show that the 4-bit code with the highest entropy places its 16 bins at equal-probability intervals, and compute the bits per weight of NF4 with and without double quantisation for blocks of 64.</p>
+<p><em>Solution.</em> A code with 16 bins has entropy \(-\sum_ip_i\log_2p_i\), where \(p_i\) is the probability that a weight falls in bin \(i\); it is maximised, at 4 bits, when every \(p_i=1/16\). The bin boundaries are therefore the \(k/16\) quantiles of \(\mathcal N(0,\sigma^2)\), and each level is placed inside its bin (NF4 uses quantile midpoints, adjusted so that zero is represented exactly). Since \(\sigma\) is unknown and varies by block, the weights are first scaled by the block's absolute maximum into \([-1,1]\), and the levels are the normalised quantiles. Uniform INT4 levels waste code space on the tails, which few weights occupy. Bits per weight: \(4+32/64=4.5\) with FP32 block scales; with 8-bit scales in groups of 256 and an FP32 second-level scale, \(4+8/64+32/16{,}384\approx4.127\).</p>
+</details>
+
+<h2 id="s16-8">16.8 The other parameter-efficient methods</h2>
+<p>LoRA is not the only way to train a small number of parameters, and the alternatives are worth knowing for two reasons: interviewers ask about them, and their inference costs differ in ways an inference engineer must recognise. Figure 16.7 shows where each method attaches to a Transformer block.</p>
+
+<figure class="diagram" id="fig-16-7">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-label="Where adapters, prefix tuning, prompt tuning, LoRA, IA3 and DoRA attach in a Transformer block">
+<text x="20" y="22" class="t-b">Where parameter-efficient methods attach</text>
+<rect x="20" y="250" width="160" height="34" rx="6" class="bx"/><text x="100" y="272" text-anchor="middle" class="t-sm">token embeddings</text>
+<rect x="20" y="200" width="160" height="34" rx="6" class="bx5"/><text x="100" y="216" text-anchor="middle" class="t-xs">prompt tuning: l_p learned</text><text x="100" y="229" text-anchor="middle" class="t-xs">input vectors</text>
+<rect x="230" y="160" width="220" height="110" rx="8" class="bx"/>
+<text x="340" y="180" text-anchor="middle" class="t-sm t-b">attention</text>
+<rect x="245" y="192" width="44" height="28" rx="4" class="bx3"/><text x="267" y="210" text-anchor="middle" class="t-xs">W_Q</text>
+<rect x="295" y="192" width="44" height="28" rx="4" class="bx3"/><text x="317" y="210" text-anchor="middle" class="t-xs">W_K</text>
+<rect x="345" y="192" width="44" height="28" rx="4" class="bx3"/><text x="367" y="210" text-anchor="middle" class="t-xs">W_V</text>
+<rect x="395" y="192" width="44" height="28" rx="4" class="bx3"/><text x="417" y="210" text-anchor="middle" class="t-xs">W_O</text>
+<rect x="295" y="230" width="94" height="28" rx="4" class="bx4"/><text x="342" y="248" text-anchor="middle" class="t-xs">prefix K, V</text>
+<rect x="490" y="160" width="210" height="110" rx="8" class="bx"/>
+<text x="595" y="180" text-anchor="middle" class="t-sm t-b">MLP</text>
+<rect x="505" y="192" width="54" height="28" rx="4" class="bx3"/><text x="532" y="210" text-anchor="middle" class="t-xs">gate</text>
+<rect x="567" y="192" width="54" height="28" rx="4" class="bx3"/><text x="594" y="210" text-anchor="middle" class="t-xs">up</text>
+<rect x="629" y="192" width="58" height="28" rx="4" class="bx3"/><text x="658" y="210" text-anchor="middle" class="t-xs">down</text>
+<rect x="540" y="230" width="110" height="28" rx="4" class="bx2"/><text x="595" y="248" text-anchor="middle" class="t-xs">IA³ scale on hidden</text>
+<rect x="230" y="60" width="220" height="40" rx="6" class="bx4"/><text x="340" y="78" text-anchor="middle" class="t-xs">adapter: bottleneck MLP after</text><text x="340" y="91" text-anchor="middle" class="t-xs">attention (not mergeable)</text>
+<rect x="490" y="60" width="210" height="40" rx="6" class="bx4"/><text x="595" y="78" text-anchor="middle" class="t-xs">adapter: bottleneck MLP after</text><text x="595" y="91" text-anchor="middle" class="t-xs">MLP (not mergeable)</text>
+<line x1="340" y1="100" x2="340" y2="158" class="ln dash"/><line x1="595" y1="100" x2="595" y2="158" class="ln dash"/>
+<line x1="180" y1="250" x2="228" y2="230" class="ln"/><line x1="450" y1="215" x2="488" y2="215" class="ln"/>
+<text x="20" y="130" class="t-xs">green: LoRA / DoRA targets (mergeable)</text>
+<text x="20" y="146" class="t-xs">IA³ also rescales K and V (mergeable)</text>
+</svg>
+<figcaption><b>Figure 16.7 — Attachment points.</b> Methods that modify a linear map (LoRA, DoRA, IA³) can be folded into the weights after training. Methods that add computation (adapters) or tokens (prefix and prompt tuning) cannot, and they cost something at every inference step.</figcaption>
+</figure>
+
+<p>The earliest method, the <strong>adapter</strong> of Houlsby et al. (2019)<span class="cite"><a href="#r-houlsby">[14]</a></span>, inserts a small bottleneck MLP, \(h\leftarrow h+\phi(hW_a)W_b\) with a nonlinearity \(\phi\) and a bottleneck of perhaps 64 dimensions, after the attention and MLP sublayers of every block. On the GLUE benchmark it came within 0.4% of full fine-tuning while training 3.6% of the parameters per task. Its weakness, visible in Figure 16.7, is that the inserted layers are nonlinear and sequential: they cannot be merged into the existing weights, and at batch size 1 each adds kernel launches and latency to every decode step (§7.8), a small but permanent tax.</p>
+<p><strong>Prefix tuning</strong> (Li and Liang, 2021)<span class="cite"><a href="#r-prefix">[15]</a></span> learns, for every layer, a sequence of \(l_p\) key and value vectors that are prepended to the keys and values of the real tokens, so every query can attend to them. It trains about 0.1% of the parameters. For an inference engineer it has a precise cost: the prefix occupies \(l_p\) positions of KV cache in every layer, exactly like \(l_p\) extra prompt tokens, and every attention step reads them. With \(l_p=20\) on Llama 3 8B that is \(20\times128\) KiB = 2.5 MiB per sequence, or nothing extra if the engine stores the prefix once and shares it across requests through prefix caching (§10.6). <strong>Prompt tuning</strong> (Lester et al., 2021)<span class="cite"><a href="#r-prompt">[16]</a></span> is the minimal version: \(l_p\) learned vectors at the input embedding layer only, \(l_p\times d\) parameters, 82 thousand for \(l_p=20\) on Llama 3 8B. Its striking finding was that the gap to full fine-tuning closed as models grew, disappearing for T5 models of about 11 billion parameters, more evidence for the low intrinsic dimension of adaptation in large models.</p>
+<p><strong>IA³</strong> (Liu et al., 2022)<span class="cite"><a href="#r-ia3">[17]</a></span> learns three vectors per layer that rescale, element-wise, the keys, the values and the MLP's intermediate activations. Each rescaling is equivalent to scaling the columns of \(W_K\), \(W_V\) or the gate output, so it can be merged; for Llama 3 8B it trains only \(32\times(1024+1024+14{,}336)\approx0.52\)M parameters. It is the most parameter-frugal method that is still mergeable, and it works well in few-shot settings, though LoRA usually wins when data is plentiful.</p>
+<p>Among LoRA's descendants, <strong>DoRA</strong> (Liu et al., 2024)<span class="cite"><a href="#r-dora">[13]</a></span> is the most widely adopted. It decomposes each weight matrix into a magnitude and a direction, \(W=m\odot\big(V/\lVert V\rVert_c\big)\), where \(\lVert V\rVert_c\) is the vector of column norms and \(m\) a trainable magnitude vector, and applies LoRA to the direction only:</p>
+\[ W'=m'\odot\frac{W_0+sW_{\downarrow}W_{\uparrow}}{\lVert W_0+sW_{\downarrow}W_{\uparrow}\rVert_c}. \]
+<p>The motivation came from analysing full fine-tuning, in which changes of magnitude and direction were negatively correlated, whereas in LoRA they moved together; decoupling them let DoRA imitate full fine-tuning more closely, with the largest gains at low ranks. It remains mergeable, at a small extra training cost for the norms. Other variants trade parameters for structure: <strong>VeRA</strong><span class="cite"><a href="#r-vera">[20]</a></span> shares one pair of frozen random matrices across all layers and trains only scaling vectors; <strong>PiSSA</strong><span class="cite"><a href="#r-pissa">[19]</a></span> initialises \(W_{\downarrow},W_{\uparrow}\) from the top singular vectors of \(W_0\) and freezes the residual, so training starts in the most important directions.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Method</th><th class="num">Trainable params (Llama 3 8B)</th><th>Mergeable</th><th>Inference cost if not merged</th></tr></thead>
+<tbody>
+<tr><td>Full fine-tune</td><td class="num">8,030M</td><td>n/a</td><td>a full model copy per task</td></tr>
+<tr><td>LoRA, rank 16, all linear</td><td class="num">42M</td><td>yes</td><td>two thin matmuls per layer; adapter bytes per step</td></tr>
+<tr><td>DoRA, rank 16, all linear</td><td class="num">43M</td><td>yes</td><td>as LoRA, plus a column rescale</td></tr>
+<tr><td>Adapters, bottleneck 64</td><td class="num">34M</td><td>no</td><td>two extra sequential layers per block</td></tr>
+<tr><td>Prefix tuning, \(l_p=20\)</td><td class="num">1.3M</td><td>no</td><td>20 extra KV positions per layer</td></tr>
+<tr><td>IA³</td><td class="num">0.52M</td><td>yes</td><td>element-wise scales</td></tr>
+<tr><td>Prompt tuning, \(l_p=20\)</td><td class="num">0.08M</td><td>no</td><td>20 extra input tokens</td></tr>
+</tbody></table></div>
+
+<p>The table makes the practical conclusion clear. Mergeable methods cost nothing at inference once merged, and the choice among them is about training quality per parameter. Non-mergeable methods impose a cost on every request that the serving system must budget for, which is why they have largely given way to LoRA and its variants in production.</p>
+
+<h2 id="s16-9">16.9 Choosing a method, and what adaptation costs to serve</h2>
+<p>We can now assemble a decision procedure. Start with the cheapest intervention that could work. If the model lacks <em>facts</em>, retrieval is usually better than training, because it is current, attributable and cheap to update. If the model has the knowledge but not the <em>behaviour</em> (format, tone, task structure, tool use, refusals), supervised fine-tuning with LoRA on all linear layers at a rank of 8 to 32 is the default, and QLoRA is the default when memory is scarce. If the task requires substantial new <em>skill or knowledge</em> from a large corpus, such as a new programming language or continued pre-training on a domain, full fine-tuning (with FSDP) is the stronger choice, at the price of more forgetting and a full-size artefact. And if the desired behaviour cannot be demonstrated but only <em>judged</em>, as when we can say which of two answers is better without being able to write the best one, demonstrations are not enough, and we need the preference and reinforcement learning methods of Part VIII.</p>
+<p>Whatever is trained must then be served, and here the inference engineer's cost model returns. A merged adapter produces an ordinary model, so one fine-tune served at scale costs the same as the base model. Many fine-tunes are a different matter. Merging each would multiply the weights by the number of tasks, whereas serving them unmerged shares one base model across all of them, at the cost of extra adapter computation and memory traffic that grows with the number of <em>distinct</em> adapters in a batch.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — 200 customer adapters on Llama 3 8B</div>
+<p><strong>Merged.</strong> 200 merged models need \(200\times16.06\) GB ≈ 3.2 TB of weights: 40 H100s just to hold them, most of them idle most of the time, since each customer's traffic is small.</p>
+<p><strong>Unmerged.</strong> One base model (16.06 GB) plus 200 rank-16 adapters at 84 MB each (16.8 GB) fit on a single H100 alongside a modest KV cache, or the adapters can live in CPU memory and be paged in on demand (§27.4).</p>
+<p><strong>Per-step overhead.</strong> Each token pays \(2\times42\)M ≈ 84 MFLOPs for its adapter, 0.5% of the base model's 16 GFLOPs. In a memory-bound decode step, each <em>distinct</em> adapter in the batch must also be read: a batch drawing on 16 different adapters reads \(16\times84\) MB ≈ 1.3 GB on top of 16.06 GB of base weights, about 8% more bytes, so about 8% more step time at the roofline. A batch in which every request uses a different adapter pays the most; a scheduler that groups requests by adapter pays the least.</p>
+<p><strong>Consequence.</strong> Unmerged multi-LoRA serving turns a 40-GPU problem into a one-GPU problem at a single-digit percentage overhead. This is why LoRA, rather than full fine-tuning, is the unit in which customised models are delivered, and why Chapter 27 returns to the kernels and memory managers that make it efficient.</p>
+</div>
+
+<details class="drill">
+<summary>Drill 16.4 — The KV cost of prefix tuning</summary>
+<p>A team serves Llama 3 8B with prefix tuning at \(l_p=64\) for 50 tasks, at 64 concurrent sequences of 2,000 tokens. Compare the KV-cache memory and decode bytes with a rank-16 LoRA, assuming the engine does not share prefixes across requests.</p>
+<p><em>Solution.</em> Each sequence carries 64 extra positions at 128 KiB: 8 MiB, against 2,000 × 128 KiB ≈ 250 MiB for its own tokens, a 3.2% increase in cache memory and in the cache bytes read per step. For 64 sequences that is 512 MiB, more than the 84 MB of one LoRA adapter, and it scales with concurrency rather than with the number of distinct tasks in the batch. With prefix caching, sequences of the same task share one copy, which removes the memory cost but not the attention reads. Prefix tuning also lengthens every attention computation by 64 positions, while a merged LoRA costs nothing. The general lesson: methods that add tokens cost KV cache and attention, methods that add layers cost latency, and methods that modify linear maps can be merged away.</p>
+</details>
+
+<p>Fine-tuning by demonstration has one more limitation that will shape Part VIII. It teaches the model to imitate, and imitation is bounded by the demonstrations: an SFT model cannot learn to be better than its examples, and it learns only from correct behaviour, never from the consequences of its own mistakes. Methods that learn from judgements of the model's own outputs, rather than from demonstrations, remove both limits, and they will turn out to be inference systems in their own right. Before we reach them, however, we must deal with models and fine-tunes that do not fit on one GPU at all.</p>
+
+<h2 id="looking-ahead" class="unnumbered">Looking ahead</h2>
+<p>Part V made models smaller and showed how to adapt them cheaply. Yet the largest models of 2025 remain far too big for one GPU: DeepSeek-V3 has 671 billion parameters, 671 GB even in FP8, and frontier dense and mixture-of-experts models are larger still. Some workloads also need more memory bandwidth or compute per request than one GPU can supply, to meet a latency target. And even fine-tuning, as §16.3 showed, spreads its 16 bytes per parameter over many GPUs with all-gathers and reduce-scatters that we have so far used without analysing. When a model, its cache or its training state must span many GPUs, the GPUs must communicate, and communication has its own costs, topologies and algorithms. Part VI begins with Chapter 17, which develops the foundations: interconnects such as NVLink and InfiniBand, the collective operations (all-reduce, all-gather, all-to-all) that parallel inference relies on, and a cost model for them, so that Chapters 18 and 19 can derive when each form of parallelism pays.</p>
+
+<h2 id="summary">Chapter summary</h2>
+<ul>
+<li>Supervised fine-tuning minimises next-token cross-entropy on response tokens only; prompts and template tokens are context. Fine-tune for behaviour; retrieve for facts.</li>
+<li>Training compute is about \(6N\) FLOPs per token (\(8N\) with activation checkpointing): a 150M-token fine-tune of an 8B model costs about 5 H100-hours. Memory, not compute, is the obstacle.</li>
+<li>Mixed-precision Adam costs 16 bytes per parameter (2 weights, 2 gradients, 4 master, 4 + 4 moments): 128 GB for 8B, 1.13 TB for 70B, plus activations (about \(34Td\) bytes per layer per sequence, or \(2Td\) with checkpointing).</li>
+<li>ZeRO shards the state over \(n_{\text{DP}}\) GPUs: \(4N+12N/n_{\text{DP}}\) (stage 1), \(2N+14N/n_{\text{DP}}\) (stage 2), \(16N/n_{\text{DP}}\) (stage 3 / FSDP).</li>
+<li>Fine-tuning updates have low intrinsic dimension; LoRA parameterises \(\Delta W=sW_{\downarrow}W_{\uparrow}\) with rank \(r_a\), \(s=\alpha_a/r_a\) (\(\alpha_a/\sqrt{r_a}\) in rsLoRA), \(W_{\uparrow}\) initialised to zero.</li>
+<li>LoRA's step is projected, preconditioned gradient descent: \(\delta\Delta W=-\eta_{\text{lr}}s^2(\nabla_WW_{\uparrow}^\top W_{\uparrow}+W_{\downarrow}W_{\downarrow}^\top\nabla_W)\). It costs about \(4N\) FLOPs per token and stores state only for \(r_a\sum(d_{\text{in}}+d_{\text{out}})\) parameters (42M for Llama 3 8B at rank 16).</li>
+<li>Adapt all linear layers; ranks 8–32 suffice for behaviour, not for large-corpus skill learning; use learning rates near \(10^{-4}\), and LoRA+ gives \(W_{\uparrow}\) a larger one.</li>
+<li>QLoRA stores the frozen base in NF4 (normal quantiles, blocks of 64) with double-quantised scales, about 4.13 bits per weight, and computes in BF16: a 70B fine-tune fits on one H100.</li>
+<li>Mergeable methods (LoRA, DoRA, IA³) cost nothing at inference once merged; adapters add sequential layers, prefix and prompt tuning add KV positions and tokens.</li>
+<li>Unmerged multi-LoRA serving shares one base model across many tasks; its overhead grows with the number of distinct adapters per batch.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+<div class="mcq" data-id="ch27-mcq-01" data-topic="§16.1 SFT objective">
+<p class="q">In supervised fine-tuning on chat data, which tokens contribute to the loss?</p>
+<ol class="opts"><li>All tokens, including the system prompt</li><li data-correct>Only the response tokens, including the end-of-turn token</li><li>Only the user's tokens</li><li>Only the first token of the response</li></ol>
+<div class="explain">Prompt and template tokens are masked: they are read as context but carry no loss. Training on the end-of-turn token teaches the model to stop.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-02" data-topic="§16.1 Compute">
+<p class="q">Why do masked prompt tokens still cost compute during fine-tuning?</p>
+<ol class="opts"><li>They are trained with a smaller learning rate</li><li data-correct>Every token passes through the forward and backward passes, because response tokens attend to them</li><li>Masking is applied only at evaluation</li><li>They do not cost compute</li></ol>
+<div class="explain">The mask removes loss terms, not computation; the run's FLOPs scale with all tokens processed.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-03" data-topic="§16.1 When to fine-tune">
+<p class="q">A support bot must know a product catalogue that changes weekly. The best primary tool is:</p>
+<ol class="opts"><li>Full fine-tuning every week</li><li>Prompt tuning</li><li data-correct>Retrieval at inference time, with fine-tuning (if any) for format and behaviour</li><li>A larger LoRA rank</li></ol>
+<div class="explain">Facts that change belong in retrieval; fine-tuning is best for stable behaviour.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-04" data-topic="§16.1 LIMA">
+<p class="q">The "superficial alignment hypothesis" of the LIMA study says that:</p>
+<ol class="opts"><li>Alignment requires RLHF</li><li data-correct>Most knowledge comes from pre-training, and fine-tuning mainly selects the format and style in which to express it</li><li>Fine-tuning must use millions of examples</li><li>Small models cannot be aligned</li></ol>
+<div class="explain">LIMA fine-tuned a 65B model on 1,000 curated examples. The hypothesis is too strong for skill learning from large corpora.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-05" data-topic="§16.1 Compute">
+<p class="q">About how many FLOPs does it take to fine-tune Llama 3 8B on \(1.5\times10^8\) tokens (no checkpointing)?</p>
+<ol class="opts"><li>\(2.4\times10^{18}\)</li><li data-correct>\(7.2\times10^{18}\)</li><li>\(7.2\times10^{21}\)</li><li>\(7.2\times10^{23}\)</li></ol>
+<div class="explain">\(6N\) per token: \(6\times8.03\times10^9\times1.5\times10^8\). The last option is pre-training on 15T tokens.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-06" data-topic="§16.2 Memory bill">
+<p class="q">With mixed-precision AdamW, how many bytes per parameter does full fine-tuning keep, excluding activations?</p>
+<ol class="opts"><li>2</li><li>4</li><li>8</li><li data-correct>16</li></ol>
+<div class="explain">BF16 weights 2 + BF16 gradients 2 + FP32 master 4 + two FP32 moments 8.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-07" data-topic="§16.2 Master weights">
+<p class="q">Why does mixed-precision training keep an FP32 copy of the weights?</p>
+<ol class="opts"><li>Tensor cores require FP32 inputs</li><li data-correct>Many updates are smaller than the BF16 spacing near a weight's value and would be rounded away</li><li>To store Adam's moments</li><li>For checkpointing activations</li></ol>
+<div class="explain">BF16 has only 8 significant bits; small updates accumulate correctly only in FP32.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-08" data-topic="§16.2 Memory bill">
+<p class="q">The training state (excluding activations) of a full fine-tune of Llama 3 70B is about:</p>
+<ol class="opts"><li>141 GB</li><li>282 GB</li><li data-correct>1.13 TB</li><li>2.26 TB</li></ol>
+<div class="explain">\(16\times70.6\times10^9\) bytes.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-09" data-topic="§16.2 Checkpointing">
+<p class="q">Activation checkpointing trades:</p>
+<ol class="opts"><li>Accuracy for memory</li><li data-correct>About one extra forward pass (\(6N\to8N\) FLOPs per token) for storing only each layer's input</li><li>Optimiser state for gradients</li><li>Communication for compute</li></ol>
+<div class="explain">Layer internals are recomputed in the backward pass from saved layer inputs.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-10" data-topic="§16.2 Activations">
+<p class="q">Why must the backward pass have the forward pass's inputs to each matrix product \(Y=XW\)?</p>
+<ol class="opts"><li>To recompute the loss</li><li data-correct>Because \(\partial\mathcal L/\partial W=X^\top\,\partial\mathcal L/\partial Y\)</li><li>Because \(W\) changes during the forward pass</li><li>To normalise the gradients</li></ol>
+<div class="explain">The weight gradient is an outer-product sum involving the inputs.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-11" data-topic="§16.3 ZeRO">
+<p class="q">Which ZeRO stage is the first to shard the BF16 weights themselves?</p>
+<ol class="opts"><li>Stage 1</li><li>Stage 2</li><li data-correct>Stage 3 (as in FSDP)</li><li>None; weights are always replicated</li></ol>
+<div class="explain">Stage 1 shards optimiser state, stage 2 adds gradients, stage 3 adds weights, gathered per layer when needed.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-12" data-topic="§16.3 ZeRO">
+<p class="q">Under ZeRO-2 on \(n_{\text{DP}}\) GPUs, per-GPU training-state memory is:</p>
+<ol class="opts"><li>\(16N/n_{\text{DP}}\)</li><li data-correct>\(2N+14N/n_{\text{DP}}\)</li><li>\(4N+12N/n_{\text{DP}}\)</li><li>\(16N\)</li></ol>
+<div class="explain">BF16 weights stay replicated (2N); gradients and optimiser state (14N) are sharded.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-13" data-topic="§16.3 ZeRO">
+<p class="q">For Llama 3 70B, why can ZeRO-1 never fit on 80 GB GPUs, however many are used?</p>
+<ol class="opts"><li>Its communication grows too fast</li><li data-correct>Each GPU still holds BF16 weights and gradients, \(4N\approx282\) GB</li><li>Activations cannot be sharded</li><li>Adam moments are replicated</li></ol>
+<div class="explain">The unsharded floor is \(4N\) under stage 1 and \(2N\approx141\) GB under stage 2.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-14" data-topic="§16.4 Intrinsic dimension">
+<p class="q">The intrinsic dimension of a fine-tuning problem is:</p>
+<ol class="opts"><li>The rank of the model's weight matrices</li><li data-correct>The smallest dimension of a random parameter subspace in which training reaches 90% of full performance</li><li>The hidden size \(d\)</li><li>The number of examples needed</li></ol>
+<div class="explain">Aghajanyan et al. found it to be very small for pre-trained language models, and smaller for larger and better-trained ones.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-15" data-topic="§16.4 Eckart–Young">
+<p class="q">If \(\Delta W\) has singular values \(\sigma_i\), the squared Frobenius error of the best rank-\(r\) approximation is:</p>
+<ol class="opts"><li>\(\sigma_{r+1}\)</li><li data-correct>\(\sum_{i>r}\sigma_i^2\)</li><li>\(\sum_{i\le r}\sigma_i^2\)</li><li>\(r\sigma_1^2\)</li></ol>
+<div class="explain">Eckart–Young–Mirsky: truncated SVD is optimal, and the error is the discarded energy.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-16" data-topic="§16.4 Limits">
+<p class="q">On which tasks did Biderman et al. find LoRA falling clearly short of full fine-tuning?</p>
+<ol class="opts"><li>Short instruction-following datasets</li><li data-correct>Continued pre-training and large-scale training on code and mathematics</li><li>Sentiment classification</li><li>Few-shot prompting</li></ol>
+<div class="explain">Those updates had ranks 10–100× higher than typical LoRA configurations. LoRA also forgot less.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-17" data-topic="§16.5 Initialisation">
+<p class="q">Why is \(W_{\uparrow}\) initialised to zero and \(W_{\downarrow}\) randomly?</p>
+<ol class="opts"><li>To save memory</li><li data-correct>So that \(\Delta W=0\) at the start (training begins at the pre-trained model) while gradients can still flow</li><li>Because \(W_{\downarrow}\) is never trained</li><li>To make the update full-rank</li></ol>
+<div class="explain">If both were zero, neither factor would receive a gradient.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-18" data-topic="§16.5 Gradients">
+<p class="q">With \(H=XW_0+sXW_{\downarrow}W_{\uparrow}\) and \(G=\partial\mathcal L/\partial H\), the gradient with respect to \(W_{\uparrow}\) is:</p>
+<ol class="opts"><li>\(sX^\top G\)</li><li data-correct>\(s(XW_{\downarrow})^\top G\)</li><li>\(sX^\top GW_{\uparrow}^\top\)</li><li>\(GW_0^\top\)</li></ol>
+<div class="explain">\(W_{\uparrow}\) multiplies the projected input \(XW_{\downarrow}\).</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-19" data-topic="§16.5 Projected descent">
+<p class="q">At initialisation (\(W_{\uparrow}=0\)), the first LoRA step changes \(\Delta W\) by approximately:</p>
+<ol class="opts"><li>\(-\eta_{\text{lr}}\nabla_W\)</li><li data-correct>\(-\eta_{\text{lr}}s^2W_{\downarrow}W_{\downarrow}^\top\nabla_W\): the full gradient projected onto a random \(r_a\)-dimensional subspace</li><li>Zero</li><li>\(-\eta_{\text{lr}}s^2\nabla_WW_{\uparrow}^\top W_{\uparrow}\)</li></ol>
+<div class="explain">The term with \(W_{\uparrow}^\top W_{\uparrow}\) vanishes at initialisation.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-20" data-topic="§16.5 Parameters">
+<p class="q">A rank-16 LoRA on all seven linear projections of every layer of Llama 3 8B has about:</p>
+<ol class="opts"><li>4.2M parameters</li><li data-correct>42M parameters</li><li>420M parameters</li><li>4.2B parameters</li></ol>
+<div class="explain">\(16\times81{,}920\times32\approx41.9\)M, about 84 MB in BF16.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-21" data-topic="§16.5 Compute">
+<p class="q">Why does LoRA training still cost about \(4N\) FLOPs per token, not \(2N\)?</p>
+<ol class="opts"><li>The adapters are large</li><li data-correct>Gradients must still propagate through every frozen layer (activation gradients, \(2N\)); only the frozen weight gradients are skipped</li><li>LoRA requires two forward passes</li><li>Adam doubles the compute</li></ol>
+<div class="explain">LoRA saves about a third of the compute; its main saving is memory.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-22" data-topic="§16.5 Merging">
+<p class="q">Which statements about merging a LoRA adapter are true?</p>
+<ol class="opts"><li data-correct>The merged model has the same size and speed as the base model</li><li>Merging requires retraining</li><li data-correct>Keeping the adapter unmerged lets one deployment switch adapters per request</li><li>Merged adapters cannot be served by standard engines</li></ol>
+<div class="explain">\(W_0+sW_{\downarrow}W_{\uparrow}\) is an ordinary dense matrix; unmerged adapters enable multi-LoRA serving.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-23" data-topic="§16.5 Scaling">
+<p class="q">rsLoRA replaces the scale \(\alpha_a/r_a\) by \(\alpha_a/\sqrt{r_a}\) because:</p>
+<ol class="opts"><li>It saves memory</li><li data-correct>With \(1/r_a\), the effective learning rate shrinks as the rank grows, so high ranks learn too slowly</li><li>It allows merging</li><li>It is required by Adam</li></ol>
+<div class="explain">Sums of \(r_a\) roughly independent terms grow like \(\sqrt{r_a}\).</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-24" data-topic="§16.6 Targets">
+<p class="q">The QLoRA study found that matching full fine-tuning on instruction tasks required:</p>
+<ol class="opts"><li>Rank above 256</li><li data-correct>Adapting all linear layers, including the MLP</li><li>Adapting only queries and values</li><li>Full-precision base weights</li></ol>
+<div class="explain">With all layers adapted, the rank mattered relatively little.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-25" data-topic="§16.6 LoRA+">
+<p class="q">LoRA+ improves training by:</p>
+<ol class="opts"><li>Using a larger rank</li><li data-correct>Giving \(W_{\uparrow}\) a learning rate about 16 times that of \(W_{\downarrow}\)</li><li>Freezing \(W_{\downarrow}\)</li><li>Quantising the adapters</li></ol>
+<div class="explain">The two factors have different roles and input dimensions; one learning rate is inefficient.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-26" data-topic="§16.7 QLoRA">
+<p class="q">In QLoRA, what is stored in 4 bits?</p>
+<ol class="opts"><li>The adapters</li><li data-correct>The frozen base weights (NF4), dequantised to BF16 for each matrix product</li><li>The gradients</li><li>The activations</li></ol>
+<div class="explain">Computation and adapters are BF16; only the frozen base is quantised.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-27" data-topic="§16.7 NF4">
+<p class="q">Why does NF4 place its levels at quantiles of a normal distribution?</p>
+<ol class="opts"><li>To represent outliers exactly</li><li data-correct>For normally distributed weights, equal-probability bins maximise the information carried by a 4-bit code</li><li>Tensor cores require it</li><li>To avoid needing scales</li></ol>
+<div class="explain">Every level is used equally often; uniform INT4 wastes levels on the sparse tails.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-28" data-topic="§16.7 Double quantisation">
+<p class="q">NF4 with blocks of 64 and double-quantised scales costs about how many bits per weight?</p>
+<ol class="opts"><li>4.0</li><li data-correct>4.13</li><li>4.5</li><li>5.0</li></ol>
+<div class="explain">\(4+8/64+32/(64\times256)\approx4.127\); without double quantisation it would be 4.5.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-29" data-topic="§16.7 Memory">
+<p class="q">Roughly what is the smallest single-GPU setup on which a 70B model can be fine-tuned with QLoRA?</p>
+<ol class="opts"><li>A 24 GB consumer GPU</li><li data-correct>One 80 GB H100 (about 40 GB base plus adapter state and activations)</li><li>Two H100s</li><li>It requires 16 GPUs</li></ol>
+<div class="explain">The NF4 base is about 35 GB plus 4 GB of BF16 embeddings; the total is around 50 GB.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-30" data-topic="§16.8 Mergeability">
+<p class="q">Which methods can be merged into the base weights after training?</p>
+<ol class="opts"><li data-correct>LoRA</li><li>Bottleneck adapters with a nonlinearity</li><li data-correct>IA³</li><li>Prefix tuning</li></ol>
+<div class="explain">LoRA, DoRA and IA³ modify linear maps. Adapters add nonlinear layers; prefixes add attention positions.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-31" data-topic="§16.8 Prefix tuning">
+<p class="q">At inference, prefix tuning with \(l_p\) prefix vectors costs:</p>
+<ol class="opts"><li>Nothing</li><li data-correct>\(l_p\) extra KV positions in every layer, read by every attention step</li><li>An extra layer per block</li><li>A full model copy</li></ol>
+<div class="explain">It behaves like \(l_p\) extra prompt tokens; prefix caching can share them across requests of the same task.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-32" data-topic="§16.8 DoRA">
+<p class="q">DoRA differs from LoRA by:</p>
+<ol class="opts"><li>Quantising the base model</li><li data-correct>Splitting each weight into a trainable magnitude vector and a direction, and applying LoRA to the direction</li><li>Using a nonlinear adapter</li><li>Training only biases</li></ol>
+<div class="explain">This decoupling imitates the magnitude–direction behaviour of full fine-tuning, and DoRA remains mergeable.</div>
+</div>
+
+<div class="mcq" data-id="ch27-mcq-33" data-topic="§16.9 Serving">
+<p class="q">In unmerged multi-LoRA serving, the extra bytes read per decode step grow mainly with:</p>
+<ol class="opts"><li>The total number of adapters stored</li><li data-correct>The number of distinct adapters used in the batch</li><li>The sequence length</li><li>The base model's vocabulary</li></ol>
+<div class="explain">Each distinct adapter in the batch must be read once per step; grouping requests by adapter reduces the overhead.</div>
+</div>
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+<details class="qa" data-id="ch27-qa-01">
+<summary><span class="lvl warm">Warm-up</span> What is supervised fine-tuning, and what exactly is the loss?</summary>
+<div class="answer">
+<p>SFT trains a pre-trained model on examples of desired behaviour, each a prompt followed by an ideal response, usually formatted with a chat template. The loss is next-token cross-entropy averaged over response positions only, \(-\frac1{|\mathcal I|}\sum_{t\in\mathcal I}\log p_\theta(x_t\mid x_{&lt;t})\). Prompt and template tokens are masked out of the loss, though they are still processed as context and so still cost compute. The response's end-of-turn token is included, which is how the model learns to stop. Short examples are typically packed into long sequences with attention masks that prevent cross-example attention.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch27-qa-02">
+<summary><span class="lvl warm">Warm-up</span> When would you fine-tune rather than prompt or use retrieval?</summary>
+<div class="answer">
+<p>Use retrieval for facts, especially changing or attributable ones. Use prompting when the behaviour is easy to describe and the extra prompt tokens are affordable (prefix caching makes long fixed prompts cheaper). Fine-tune when behaviour must be reliable, compact and cheap at inference: format, tone, task structure, tool use, refusals. Fine-tuning can also replace a long system prompt, saving prefill on every request. Fine-tune with large corpora (full FT) only when new skills or knowledge are needed, and accept more forgetting. If quality can be judged but not demonstrated, move to preference or RL methods.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch27-qa-03">
+<summary><span class="lvl core">Core</span> Derive the memory needed to fully fine-tune Llama 3 8B with AdamW, and say how you would fit it on one 8-GPU server.</summary>
+<div class="answer">
+<p>Per parameter: BF16 weights 2 B, BF16 gradients 2 B, FP32 master weights 4 B, and Adam's first and second moments 4 B each: 16 B. For \(8.03\times10^9\) parameters that is 128 GB before activations. Activations are about \(34Td\) bytes per layer per sequence without checkpointing (around 9 GB per 2k-token sequence for this model, more with SwiGLU), or \(2Td\) per layer with checkpointing (about 0.5 GB). On 8 × 80 GB GPUs: ZeRO-2 leaves about 30 GB of state per GPU (\(2N+14N/8\)), ZeRO-3 about 16 GB; with activation checkpointing and micro-batches of a few sequences plus gradient accumulation, either fits. I would choose ZeRO-2 or FSDP with checkpointing, BF16 compute, and fused cross-entropy to avoid materialising full-vocabulary logits.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch27-qa-04">
+<summary><span class="lvl core">Core</span> Explain ZeRO's three stages and their communication cost.</summary>
+<div class="answer">
+<p>Data parallelism replicates everything. ZeRO removes the redundancy. Stage 1 shards the 12 bytes per parameter of optimiser state, so each GPU updates only its slice: \(4N+12N/n_{\text{DP}}\). Stage 2 also shards gradients by replacing the all-reduce with a reduce-scatter: \(2N+14N/n_{\text{DP}}\). Stage 3 shards the weights too, all-gathering each layer just in time and freeing it after use: \(16N/n_{\text{DP}}\). Stages 1 and 2 move the same bytes as an all-reduce (which is itself a reduce-scatter plus an all-gather). Stage 3 adds another all-gather in the backward pass, about 1.5 times the traffic, which is usually overlapped with computation layer by layer. FSDP is PyTorch's native implementation of stage 3.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch27-qa-05">
+<summary><span class="lvl core">Core</span> What is LoRA? Write its forward pass and explain its initialisation and scaling.</summary>
+<div class="answer">
+<p>LoRA freezes a weight matrix \(W_0\in\mathbb R^{d_{\text{in}}\times d_{\text{out}}}\) and learns a low-rank update: \(h=xW_0+s\,xW_{\downarrow}W_{\uparrow}\), with \(W_{\downarrow}\in\mathbb R^{d_{\text{in}}\times r_a}\), \(W_{\uparrow}\in\mathbb R^{r_a\times d_{\text{out}}}\) and \(s=\alpha_a/r_a\). \(W_{\downarrow}\) is random and \(W_{\uparrow}\) is zero, so training starts at the pre-trained model while gradients still flow (if both were zero, both gradients would vanish). The scale makes the learning rate roughly transferable across ranks; rsLoRA uses \(\alpha_a/\sqrt{r_a}\) so that high ranks are not under-trained. Only \(r_a(d_{\text{in}}+d_{\text{out}})\) parameters per matrix are trained, so optimiser state and gradients are tiny. After training, the update can be merged into \(W_0\) at zero inference cost, or kept separate for per-request adapter switching.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch27-qa-06">
+<summary><span class="lvl deep">Deep-dive</span> Derive LoRA's gradients and show what update to \(\Delta W\) a gradient step makes.</summary>
+<div class="answer">
+<p>With \(H=XW_0+sXW_{\downarrow}W_{\uparrow}\) and \(G=\partial\mathcal L/\partial H\): \(\partial\mathcal L/\partial W_{\uparrow}=s(XW_{\downarrow})^\top G=sW_{\downarrow}^\top\nabla_W\), and \(\partial\mathcal L/\partial W_{\downarrow}=sX^\top GW_{\uparrow}^\top=s\nabla_WW_{\uparrow}^\top\), where \(\nabla_W=X^\top G\) is the gradient full fine-tuning would use. A step of size \(\eta_{\text{lr}}\) on both factors changes \(\Delta W=sW_{\downarrow}W_{\uparrow}\) to first order by \(-\eta_{\text{lr}}s^2(\nabla_WW_{\uparrow}^\top W_{\uparrow}+W_{\downarrow}W_{\downarrow}^\top\nabla_W)\). So LoRA is projected, preconditioned gradient descent: the full gradient is multiplied by PSD matrices of rank at most \(r_a\) on the left and right. At initialisation only the left term survives, projecting the gradient onto the random column space of \(W_{\downarrow}\). The parameterisation has a gauge symmetry, \((W_{\downarrow}Q,Q^{-1}W_{\uparrow})\), so the dynamics depend on how the factors are initialised and scaled; this motivates LoRA+'s separate learning rates.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch27-qa-07">
+<summary><span class="lvl core">Core</span> Why does LoRA work at all? What is the evidence for low-rank updates, and where does it fail?</summary>
+<div class="answer">
+<p>The evidence: fine-tuning has a low intrinsic dimension. Aghajanyan et al. reached 90% of full performance training only about 200 parameters in a random subspace for RoBERTa-large on MRPC, and the dimension falls as models grow and pre-train longer. Hu et al. found that ranks 1–4 on GPT-3's attention matrices matched full fine-tuning on their benchmarks, with learned subspaces at different ranks overlapping strongly. Eckart–Young explains the payoff: if the spectrum of \(\Delta W\) decays fast, a rank-\(r\) matrix captures most of the update in \(r(d_{\text{in}}+d_{\text{out}})\) numbers. It fails when the task teaches substantial new knowledge or skill from large corpora (continued pre-training, large code or maths sets), where full fine-tuning updates have much higher rank (Biderman et al.). LoRA then underperforms, although it forgets less.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch27-qa-08">
+<summary><span class="lvl core">Core</span> How do you choose LoRA's rank, targets and learning rate?</summary>
+<div class="answer">
+<p>Targets: all linear layers (attention projections and the three MLP matrices). The QLoRA study found that this was needed to match full fine-tuning, and that rank then mattered little. Rank: 8–32 for behaviour, format and instruction following; higher with rsLoRA scaling for harder tasks; switch to full fine-tuning for large-corpus skill learning. Learning rate: around \(10^{-4}\) to \(3\times10^{-4}\), roughly ten times full fine-tuning, with warm-up and cosine decay. LoRA+ uses a larger rate for \(W_{\uparrow}\) (about 16×). Set \(\alpha_a\) once (often \(r_a\) or \(2r_a\)) and vary the rank. Validate on held-out task data and on a general benchmark, to measure forgetting.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch27-qa-09">
+<summary><span class="lvl core">Core</span> Explain QLoRA. What is quantised, what is not, and what does it cost?</summary>
+<div class="answer">
+<p>QLoRA freezes the base model in NF4, a 4-bit format whose levels are normal quantiles, in blocks of 64 with absmax scales. The scales are themselves quantised to 8 bits (double quantisation), for about 4.13 bits per weight. The LoRA adapters, the gradients and all arithmetic are BF16: each frozen block is dequantised on the fly for each matrix product. Paged optimisers place optimiser state in unified memory to survive memory spikes. Embeddings and the output layer typically stay BF16. The benefit: a 70B fine-tune needs about 40 GB for the base plus a few GB of adapter state and activations, so it fits one H100, and an 8B fine-tune fits a consumer GPU. The costs are slower steps (dequantisation) and a train/serve subtlety: the adapter learned on a quantised base, so it is exact only when served on the same quantised base, unmerged.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch27-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> Why is NF4 information-theoretically motivated, and when would INT4 or FP4 be better?</summary>
+<div class="answer">
+<p>For a fixed 16-level code, entropy \(-\sum p_i\log_2p_i\) is maximised when the levels are used equally often, so for normally distributed weights the bin boundaries should be equal-probability quantiles. NF4 places levels at normal quantiles (with an exact zero) after absmax scaling per block, so it wastes fewer levels on the tails than uniform INT4. This suits storing a frozen base whose weights are near-normal. INT4 or FP4 are better when the kernel matters more than the code: NF4 needs a lookup during dequantisation and has no native tensor-core support, whereas INT4 with group scales has mature W4A16 kernels, and FP4 (MXFP4, NVFP4) is native on Blackwell. For serving, a model is usually re-quantised to a kernel-friendly format; NF4 is mainly a training-memory format.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch27-qa-11">
+<summary><span class="lvl core">Core</span> Compare adapters, prefix tuning, prompt tuning, IA³, LoRA and DoRA from an inference engineer's point of view.</summary>
+<div class="answer">
+<p>Mergeable methods change linear maps and vanish at inference once merged: LoRA (low-rank update), DoRA (LoRA on the direction, plus a magnitude vector) and IA³ (element-wise scales on K, V and the MLP hidden layer, about 0.5M parameters for an 8B model). Bottleneck adapters add nonlinear layers after sublayers. They cannot be merged and add kernel launches and latency per decode step. Prefix tuning adds \(l_p\) learned key/value positions per layer, costing KV memory and attention reads like \(l_p\) prompt tokens; prefix caching can share them. Prompt tuning adds \(l_p\) learned input vectors, the cheapest in parameters, and works well only for large models. Unmerged LoRA costs two thin matmuls per adapted layer plus adapter reads. In production, LoRA and DoRA dominate because they are cheap to train, good in quality, and either free (merged) or shareable (multi-LoRA).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch27-qa-12">
+<summary><span class="lvl design">Design</span> A SaaS company wants per-customer fine-tunes of an 8B model for 500 customers with uneven traffic. Design training and serving.</summary>
+<div class="answer">
+<p>Training: per customer, SFT with LoRA (rank 16, all linear layers) or QLoRA if GPUs are small, on that customer's data mixed with some general data to limit forgetting. That is a few GPU-hours each, run as a queue on a shared training pool, with an evaluation gate (task metrics plus a general regression suite) before release. Serving: one base model per replica, adapters unmerged, stored in object storage and cached in CPU memory, paged into GPU memory on demand. Use batched LoRA kernels (SGMV/BGMV) so one batch mixes adapters. Route requests with adapter affinity so that replicas keep hot adapters resident and batches have few distinct adapters, since per-step overhead grows with distinct adapters (each rank-16 adapter is about 84 MB). Give the largest customers dedicated replicas, optionally with merged weights for zero overhead. Monitor per-adapter latency and load times, and cap the adapters resident per GPU alongside the KV cache. Merging all 500 would need about 8 TB of weights; unmerged needs one base model plus about 42 GB of adapters.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch27-qa-13">
+<summary><span class="lvl design">Design</span> You have one 80 GB GPU and must adapt a 70B model to a domain. Walk through the options and what you would do.</summary>
+<div class="answer">
+<p>Full fine-tuning needs about 1.13 TB of state, so it is out. LoRA on a BF16 base needs 141 GB for the frozen weights alone, also out. QLoRA fits: about 35 GB of NF4 linear weights plus 4 GB of BF16 embeddings, about 3 GB of adapter state at rank 16 on all linear layers, and a few GB of activations with checkpointing at micro-batch 1–2, around 50 GB in total. Use paged optimisers and fused cross-entropy. Expect a few hundred tokens per second, so keep the dataset to millions of tokens of high-quality data. If the goal is new domain knowledge from a large corpus, warn that LoRA at any rank may fall short; consider retrieval for facts, or a smaller model fully fine-tuned. For deployment, either serve the adapter on the same NF4 base, or merge into BF16 and re-quantise to a serving format, then re-evaluate.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch27-qa-14">
+<summary><span class="lvl deep">Deep-dive</span> Why do LoRA's two factors want different learning rates, and what does the gauge symmetry imply?</summary>
+<div class="answer">
+<p>\(\Delta W=sW_{\downarrow}W_{\uparrow}\) is unchanged by \(W_{\downarrow}\to W_{\downarrow}Q\), \(W_{\uparrow}\to Q^{-1}W_{\uparrow}\) for invertible \(Q\), so many factorisations represent the same update, but gradient descent is not invariant under this reparameterisation. The factors also differ in shape: \(W_{\downarrow}\) maps a \(d_{\text{in}}\)-dimensional input and \(W_{\uparrow}\) an \(r_a\)-dimensional one. Hayou et al.'s large-width analysis shows that with one learning rate, either \(W_{\uparrow}\) learns too slowly or \(W_{\downarrow}\) becomes unstable. Setting \(\eta_{\uparrow}\approx16\eta_{\downarrow}\) (LoRA+) balances feature learning in both. The symmetry also explains why initialisation schemes (zero \(W_{\uparrow}\), PiSSA's SVD initialisation, LoftQ's quantisation-residual initialisation) change results despite representing the same starting \(\Delta W\) family: they place the optimiser at different points of the same fibre, with different preconditioners.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch27-qa-15">
+<summary><span class="lvl core">Core</span> What does unmerged LoRA cost at inference, and how should a scheduler account for it?</summary>
+<div class="answer">
+<p>Compute: \(2r_a\sum(d_{\text{in}}+d_{\text{out}})\) FLOPs per token, about 84 MFLOPs for a rank-16 all-linear adapter on Llama 3 8B, 0.5% of the base. This is small, but the thin matmuls run far below peak, so real overheads exceed the FLOP ratio. Memory traffic: each distinct adapter in a decode batch is read once per step, about 84 MB each, so 16 distinct adapters add about 1.3 GB to 16 GB of base weights, roughly 8% at the roofline. Memory capacity: resident adapters compete with the KV cache. A scheduler should group requests by adapter, keep popular adapters resident, page cold ones from CPU memory asynchronously, and possibly cap distinct adapters per batch. Very high-traffic adapters can be merged into dedicated replicas.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch27-qa-16">
+<summary><span class="lvl warm">Warm-up</span> Why does LoRA forget less than full fine-tuning?</summary>
+<div class="answer">
+<p>A rank-\(r_a\) update can change each weight matrix only within an \(r_a\)-dimensional subspace of its row and column spaces, so most directions of the pre-trained map are untouched. Full fine-tuning can move every direction, and with enough steps on narrow data it overwrites behaviour useful elsewhere (catastrophic forgetting). Biderman et al. measured this: LoRA learned less of the target domain than full fine-tuning on large code and maths corpora, but preserved more of the base model's performance on other tasks. The low rank acts as a strong regulariser toward the pre-trained model, much as the KL penalty in RL fine-tuning does (Chapter 23).</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-lora">E. J. Hu et al. LoRA: Low-Rank Adaptation of Large Language Models. <em>ICLR</em>, 2022. <a href="https://arxiv.org/abs/2106.09685">arXiv:2106.09685</a>.</li>
+<li id="r-qlora">T. Dettmers, A. Pagnoni, A. Holtzman, L. Zettlemoyer. QLoRA: Efficient Finetuning of Quantized LLMs. <em>NeurIPS</em>, 2023. <a href="https://arxiv.org/abs/2305.14314">arXiv:2305.14314</a>.</li>
+<li id="r-intrinsic">A. Aghajanyan, L. Zettlemoyer, S. Gupta. Intrinsic Dimensionality Explains the Effectiveness of Language Model Fine-Tuning. <em>ACL</em>, 2021. <a href="https://arxiv.org/abs/2012.13255">arXiv:2012.13255</a>.</li>
+<li id="r-li18">C. Li, H. Farkhoor, R. Liu, J. Yosinski. Measuring the Intrinsic Dimension of Objective Landscapes. <em>ICLR</em>, 2018. <a href="https://arxiv.org/abs/1804.08838">arXiv:1804.08838</a>.</li>
+<li id="r-learnsless">D. Biderman et al. LoRA Learns Less and Forgets Less. <em>TMLR</em>, 2024. <a href="https://arxiv.org/abs/2405.09673">arXiv:2405.09673</a>.</li>
+<li id="r-zero">S. Rajbhandari, J. Rasley, O. Ruwase, Y. He. ZeRO: Memory Optimizations Toward Training Trillion Parameter Models. <em>SC</em>, 2020. <a href="https://arxiv.org/abs/1910.02054">arXiv:1910.02054</a>.</li>
+<li id="r-fsdp">Y. Zhao et al. PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel. <em>VLDB</em>, 2023. <a href="https://arxiv.org/abs/2304.11277">arXiv:2304.11277</a>.</li>
+<li id="r-mp">P. Micikevicius et al. Mixed Precision Training. <em>ICLR</em>, 2018. <a href="https://arxiv.org/abs/1710.03740">arXiv:1710.03740</a>.</li>
+<li id="r-adamw">I. Loshchilov, F. Hutter. Decoupled Weight Decay Regularization (AdamW). <em>ICLR</em>, 2019. <a href="https://arxiv.org/abs/1711.05101">arXiv:1711.05101</a>.</li>
+<li id="r-korthikanti">V. Korthikanti et al. Reducing Activation Recomputation in Large Transformer Models. <em>MLSys</em>, 2023. <a href="https://arxiv.org/abs/2205.05198">arXiv:2205.05198</a>.</li>
+<li id="r-rslora">D. Kalajdzievski. A Rank Stabilization Scaling Factor for Fine-Tuning with LoRA. 2023. <a href="https://arxiv.org/abs/2312.03732">arXiv:2312.03732</a>.</li>
+<li id="r-loraplus">S. Hayou, N. Ghosh, B. Yu. LoRA+: Efficient Low Rank Adaptation of Large Models. <em>ICML</em>, 2024. <a href="https://arxiv.org/abs/2402.12354">arXiv:2402.12354</a>.</li>
+<li id="r-dora">S.-Y. Liu et al. DoRA: Weight-Decomposed Low-Rank Adaptation. <em>ICML</em>, 2024. <a href="https://arxiv.org/abs/2402.09353">arXiv:2402.09353</a>.</li>
+<li id="r-houlsby">N. Houlsby et al. Parameter-Efficient Transfer Learning for NLP (adapters). <em>ICML</em>, 2019. <a href="https://arxiv.org/abs/1902.00751">arXiv:1902.00751</a>.</li>
+<li id="r-prefix">X. L. Li, P. Liang. Prefix-Tuning: Optimizing Continuous Prompts for Generation. <em>ACL</em>, 2021. <a href="https://arxiv.org/abs/2101.00190">arXiv:2101.00190</a>.</li>
+<li id="r-prompt">B. Lester, R. Al-Rfou, N. Constant. The Power of Scale for Parameter-Efficient Prompt Tuning. <em>EMNLP</em>, 2021. <a href="https://arxiv.org/abs/2104.08691">arXiv:2104.08691</a>.</li>
+<li id="r-ia3">H. Liu et al. Few-Shot Parameter-Efficient Fine-Tuning is Better and Cheaper than In-Context Learning (IA³). <em>NeurIPS</em>, 2022. <a href="https://arxiv.org/abs/2205.05638">arXiv:2205.05638</a>.</li>
+<li id="r-loftq">Y. Li et al. LoftQ: LoRA-Fine-Tuning-Aware Quantization for Large Language Models. <em>ICLR</em>, 2024. <a href="https://arxiv.org/abs/2310.08659">arXiv:2310.08659</a>.</li>
+<li id="r-pissa">F. Meng, Z. Wang, M. Zhang. PiSSA: Principal Singular Values and Singular Vectors Adaptation of Large Language Models. <em>NeurIPS</em>, 2024. <a href="https://arxiv.org/abs/2404.02948">arXiv:2404.02948</a>.</li>
+<li id="r-vera">D. J. Kopiczko, T. Blankevoort, Y. M. Asano. VeRA: Vector-based Random Matrix Adaptation. <em>ICLR</em>, 2024. <a href="https://arxiv.org/abs/2310.11454">arXiv:2310.11454</a>.</li>
+<li id="r-flan">J. Wei et al. Finetuned Language Models Are Zero-Shot Learners (FLAN). <em>ICLR</em>, 2022. <a href="https://arxiv.org/abs/2109.01652">arXiv:2109.01652</a>.</li>
+<li id="r-lima">C. Zhou et al. LIMA: Less Is More for Alignment. <em>NeurIPS</em>, 2023. <a href="https://arxiv.org/abs/2305.11206">arXiv:2305.11206</a>.</li>
+<li id="r-ulmfit">J. Howard, S. Ruder. Universal Language Model Fine-tuning for Text Classification (ULMFiT). <em>ACL</em>, 2018. <a href="https://arxiv.org/abs/1801.06146">arXiv:1801.06146</a>.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

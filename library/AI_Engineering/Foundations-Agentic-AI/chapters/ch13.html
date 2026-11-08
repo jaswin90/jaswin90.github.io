@@ -1,0 +1,586 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 13 · Memory Architectures — Foundations of Agentic AI</title>
+<meta name="description" content="Chapter 13 of Foundations of Agentic AI: working, episodic, semantic and procedural memory; MemGPT; Generative Agents retrieval and reflection; fact stores and reconciliation; write, retrieval and forgetting policies; memory poisoning; and evaluation.">
+<script>try{var t=localStorage.getItem('aai-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script defer src="/library/assets/book-shim.js" data-library="/library/" data-field="/library/AI_Engineering/" data-field-title="AI Engineering"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-chapter="ch13" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Part IV · Memory and State — Chapter 13</div>
+<h1 id="top">Memory Architectures</h1>
+<p class="lede">An agent's context is its working memory: everything it currently knows, held in a finite, expensive buffer that is erased when the episode ends. Useful agents need more: to remember a customer's preferences next month, to recall how a repository's tests are run, to learn from last week's mistakes. This chapter builds the memory systems that give agents a past, drawing on the psychology of human memory for its vocabulary and on the rest of this book for its engineering.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Part III ended with an agent that can act through tools, retrieval, code, interfaces and protocols, and every one of those capabilities fills the same finite buffer. Chapter 4 showed how to manage that buffer within an episode: budget it, cache it, prune and compact it. But the deeper limitation is temporal. When an episode ends, the context is discarded. The support agent that learned in the morning that a customer always wants aisle seats and is travelling with a service dog starts the afternoon's conversation knowing nothing. The coding agent that spent twenty minutes discovering that a project's tests need a particular environment variable rediscovers it the next day. The research agent that found three excellent sources on a topic finds them again from scratch.</p>
+<p>Memory is what turns a sequence of independent episodes into an agent that accumulates knowledge and competence. It is also where some of the subtlest failures live: memories that were true and became stale, memories that were never true, memories planted by an attacker, memories of one user leaking to another. This chapter starts from a taxonomy borrowed from cognitive science, examines each kind of memory with its canonical system (MemGPT for working memory, Generative Agents for episodic memory, fact stores for semantic memory, skill libraries for procedural memory), then turns to the policies that decide what to write, what to retrieve and what to forget, the risks, and how memory is evaluated.</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Distinguish working, episodic, semantic and procedural memory, and map each to an agent mechanism using the CoALA framework.</li>
+<li>Explain MemGPT's treatment of the context as a cache over an external memory hierarchy, with the model managing its own paging.</li>
+<li>Compute the Generative Agents retrieval score (recency, importance, relevance) and explain reflection as memory consolidation.</li>
+<li>Design semantic memory with extraction, update and conflict resolution, and procedural memory with verified skills and lessons.</li>
+<li>Specify write, retrieval and forgetting policies, and reason about their effect on cost and on performance over many sessions.</li>
+<li>Identify memory failure modes (staleness, false memories, poisoning, cross-user leakage) and their mitigations, and describe how memory is evaluated.</li>
+</ol>
+</div>
+<p>We use the POMDP and sufficient-statistic view of Chapter 2, in-context learning (§3.3), context management (§4.8), retrieval (Chapter 9), Reflexion (§7.6) and skill libraries (§10.9).</p>
+
+<h2 id="s13-1">13.1 What memory is for</h2>
+<p>In the formal picture of Chapter 2, an agent's policy acts on a context \(c_t=f(h_t)\) built from the history. An ideal agent would condition on its entire history, across all episodes, since anything it has ever observed might bear on the current decision. Memory is the machinery that approximates this: it stores information from the past outside the context and brings the relevant parts back when they are needed, so that the context can stay small while the agent behaves as if it remembered everything that matters. In Chapter 2's language, memory extends the context map \(f\) across episodes, and its design is the same problem of keeping a sufficient statistic within a budget, now with a much longer history.</p>
+<p>Memory serves three purposes, and they correspond to the three running examples. <strong>Continuity</strong>: the support agent should remember the customer's situation across conversations, so that the customer need not repeat it. <strong>Personalisation</strong>: it should remember preferences (aisle seats, a loyalty number, a preferred language) and apply them without being asked. <strong>Learning</strong>: the coding agent should get better at working in a repository over time, remembering how things are done there and what went wrong before, and the research agent should build up knowledge of a field across questions. The first two are about facts concerning the world and the user; the third is about competence. Different kinds of memory serve each, as psychologists noticed long before agents existed.</p>
+
+<h2 id="s13-2">13.2 A taxonomy from cognitive science</h2>
+<p>Psychology distinguishes several memory systems, and the distinctions, though developed for human minds, map remarkably well onto agent design. Atkinson and Shiffrin's 1968 model separated a short-term store of limited capacity from a long-term store of effectively unlimited capacity, with rehearsal moving information between them; Baddeley later refined the short-term store into <strong>working memory</strong>, the active workspace for the task at hand<span class="cite"><a href="#ref-atkinson">[1]</a></span>. Within long-term memory, Tulving distinguished <strong>episodic memory</strong>, the record of specific experiences ("the conversation on Tuesday in which the customer complained about the seat"), from <strong>semantic memory</strong>, general knowledge abstracted from experience ("this customer prefers aisle seats")<span class="cite"><a href="#ref-tulving">[2]</a></span>. A further distinction separates these <em>declarative</em> memories, which can be stated, from <strong>procedural memory</strong>, knowledge of how to do things, expressed in skilled performance rather than recall.</p>
+<p>Sumers, Yao, Narasimhan and Griffiths used this taxonomy to organise language agents in their framework CoALA (Cognitive Architectures for Language Agents, 2023)<span class="cite"><a href="#ref-coala">[3]</a></span>. In CoALA, an agent has a working memory (the variables and context of the current decision cycle) and long-term episodic, semantic and procedural memories; its actions include not only external actions on the environment but internal ones: retrieving from long-term memory, reasoning over working memory, and learning by writing to long-term memory. Figure 13.1 shows the mapping we will use throughout the chapter.</p>
+
+<figure class="diagram" id="fig-13-1">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Memory taxonomy mapped to agent mechanisms">
+<defs><marker id="ah131" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="250" y="16" width="220" height="64" rx="10" class="fill-acc"/><text x="360" y="40" text-anchor="middle" class="t-on t-b">working memory</text><text x="360" y="58" text-anchor="middle" class="t-on t-xs">the context cₜ: task, recent history,</text><text x="360" y="72" text-anchor="middle" class="t-on t-xs">retrieved memories, scratchpad</text>
+<rect x="20" y="140" width="210" height="100" rx="10" class="bx2"/><text x="125" y="162" text-anchor="middle" class="t-sm t-b">episodic</text><text x="125" y="182" text-anchor="middle" class="t-xs">what happened: past trajectories,</text><text x="125" y="198" text-anchor="middle" class="t-xs">conversations, observations</text><text x="125" y="218" text-anchor="middle" class="t-xs">timestamped event log + index</text>
+<rect x="255" y="140" width="210" height="100" rx="10" class="bx3"/><text x="360" y="162" text-anchor="middle" class="t-sm t-b">semantic</text><text x="360" y="182" text-anchor="middle" class="t-xs">what is true: facts about the user,</text><text x="360" y="198" text-anchor="middle" class="t-xs">the world, the organisation</text><text x="360" y="218" text-anchor="middle" class="t-xs">fact store, profile, knowledge graph</text>
+<rect x="490" y="140" width="210" height="100" rx="10" class="bx4"/><text x="595" y="162" text-anchor="middle" class="t-sm t-b">procedural</text><text x="595" y="182" text-anchor="middle" class="t-xs">how to act: skills, lessons,</text><text x="595" y="198" text-anchor="middle" class="t-xs">instructions — and model weights</text><text x="595" y="218" text-anchor="middle" class="t-xs">skill library, instruction files</text>
+<line x1="300" y1="80" x2="150" y2="138" class="ln" marker-end="url(#ah131)" marker-start="url(#ah131)"/>
+<line x1="360" y1="80" x2="360" y2="138" class="ln" marker-end="url(#ah131)" marker-start="url(#ah131)"/>
+<line x1="420" y1="80" x2="570" y2="138" class="ln" marker-end="url(#ah131)" marker-start="url(#ah131)"/>
+<text x="190" y="104" text-anchor="middle" class="t-xs">write · retrieve</text><text x="530" y="104" text-anchor="middle" class="t-xs">learn · apply</text>
+<path d="M230,190 L253,190" class="ln dash" marker-end="url(#ah131)"/><text x="242" y="252" text-anchor="middle" class="t-xs">consolidate</text>
+</svg>
+<figcaption><b>Figure 13.1 — Four kinds of memory.</b> The context is working memory. Long-term memory holds episodes (what happened), semantic facts (what is true) and procedures (how to act). The agent writes to and retrieves from long-term stores; episodes are consolidated into facts and lessons.</figcaption></figure>
+
+<p>Figure 13.1 also shows the flows that make the taxonomy useful. Experience enters as episodes. Some of it is <em>consolidated</em> into semantic facts (repeated observations that a customer chooses aisle seats become the fact "prefers aisle") and into procedural knowledge (a failed and then corrected approach becomes the lesson "run the migrations before the tests"). Retrieval brings the relevant parts of all three back into working memory for the current decision. Each kind of memory has a different structure, a different write policy and a different failure mode, which is why lumping them into one undifferentiated "memory" (a vector store of everything) tends to work badly. We take them in turn, starting with the one every agent already has.</p>
+
+<h2 id="s13-3">13.3 Working memory and the context as a cache</h2>
+<p>Working memory is the context, and Chapter 4 treated its management within an episode. One system made the connection to long-term memory explicit and gave the agent itself control over it. <strong>MemGPT</strong> (Packer et al., 2023) took its inspiration from operating systems, which give programs the illusion of a large memory by keeping the active part in fast, small main memory and paging the rest to slow, large disk<span class="cite"><a href="#ref-memgpt">[4]</a></span>. MemGPT divided the context into a fixed system section, a <em>working context</em> of key facts that the agent edits, and a queue of recent messages, and kept everything else in external storage: a <em>recall</em> store of the full conversation history and an <em>archival</em> store of arbitrary documents and notes. The agent was given functions to page information in and out: search the recall store, search and insert into the archival store, edit the working context. When the context approached its limit, the system warned the agent ("memory pressure"), which then saved what mattered to archival storage and let older messages be evicted, summarised into the queue. Figure 13.2 shows the hierarchy.</p>
+
+<figure class="diagram" id="fig-13-2">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="MemGPT memory hierarchy: context as main memory, recall and archival storage as disk">
+<defs><marker id="ah132" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="20" y="20" width="330" height="210" rx="12" class="bx"/><text x="36" y="42" class="t-b">context window ("main memory")</text>
+<rect x="40" y="56" width="290" height="34" rx="6" class="bx4"/><text x="185" y="78" text-anchor="middle" class="t-xs">system instructions + memory functions (fixed)</text>
+<rect x="40" y="98" width="290" height="44" rx="6" class="bx2"/><text x="185" y="116" text-anchor="middle" class="t-xs">working context (agent-edited key facts)</text><text x="185" y="132" text-anchor="middle" class="t-xs">"user: Asha, aisle seat, service dog"</text>
+<rect x="40" y="150" width="290" height="62" rx="6" class="fill-muted"/><text x="185" y="172" text-anchor="middle" class="t-xs">FIFO queue of recent messages</text><text x="185" y="188" text-anchor="middle" class="t-xs">oldest evicted under memory pressure,</text><text x="185" y="202" text-anchor="middle" class="t-xs">replaced by a recursive summary</text>
+<rect x="420" y="30" width="280" height="80" rx="10" class="bx3"/><text x="560" y="56" text-anchor="middle" class="t-sm t-b">recall storage</text><text x="560" y="76" text-anchor="middle" class="t-xs">full message history, searchable</text><text x="560" y="94" text-anchor="middle" class="t-xs">by text and date</text>
+<rect x="420" y="140" width="280" height="80" rx="10" class="bx5"/><text x="560" y="166" text-anchor="middle" class="t-sm t-b">archival storage</text><text x="560" y="186" text-anchor="middle" class="t-xs">documents, notes, facts</text><text x="560" y="204" text-anchor="middle" class="t-xs">vector index; agent inserts and searches</text>
+<line x1="330" y1="180" x2="418" y2="72" class="ln" marker-end="url(#ah132)"/><text x="400" y="150" text-anchor="middle" class="t-xs">evict</text>
+<path d="M420,90 C390,100 360,110 332,118" class="ln dash" marker-end="url(#ah132)"/><text x="372" y="86" text-anchor="middle" class="t-xs">search</text>
+<path d="M418,180 C390,180 360,140 332,126" class="ln dash" marker-end="url(#ah132)" marker-start="url(#ah132)"/><text x="384" y="196" text-anchor="middle" class="t-xs">insert · search</text>
+</svg>
+<figcaption><b>Figure 13.2 — The context as a cache.</b> MemGPT keeps a small, agent-edited set of key facts and the recent messages in the context, and pages everything else to searchable external stores through function calls the agent makes itself, as an operating system pages memory to disk.</figcaption></figure>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — caches and the cost of a miss</div>
+<p>A cache is a small, fast store holding a subset of a large, slow one, chosen so that most accesses hit the small store. If a fraction \(h\) of accesses hit and a hit costs \(c_{\text{hit}}\) while a miss costs \(c_{\text{miss}}\), the expected cost per access is \(hc_{\text{hit}}+(1-h)c_{\text{miss}}\), so a cache is valuable when accesses are concentrated (high \(h\)) and misses are much costlier than hits. For agent memory, a "hit" is information already in the context when needed, and a "miss" is information that must be fetched (a retrieval call, a few seconds and some tokens) or, worse, information that is never fetched because the agent does not know it exists, whose cost is a wrong decision. That last case has no counterpart in hardware caches, and it is the central difficulty: the agent must decide to look before it knows what it would find.</p>
+</div>
+
+<p>MemGPT's lasting contribution is the idea, now standard, that <em>the agent manages its own memory</em> through tools, deciding what to save and when to search, rather than having a fixed pipeline decide for it. Its limitation is the one the bridge box names. Paging works when the agent knows what it needs; it fails when the relevant memory is not suggested by anything in the current context. A support agent that has forgotten the service dog will not search for "service dog". This is why practical systems combine agent-directed retrieval with <em>automatic</em> retrieval: the harness, before each conversation or step, retrieves memories likely to be relevant (the customer's profile, recent interactions) and places them in the context without being asked, and the agent can search for more. The question then becomes which memories to bring in automatically, and that requires a way to score them.</p>
+
+<h2 id="s13-4">13.4 Episodic memory: what happened</h2>
+<p>Episodic memory records experiences: each conversation, each task attempt, each notable observation, with a time stamp. The storage is easy; the hard part is retrieval, because an agent that has lived through thousands of episodes must bring back the few that bear on the present. Park and colleagues confronted this in <strong>Generative Agents</strong> (2023), the simulated village of 25 language agents mentioned in §1.7, each of which lived through simulated days, observed its neighbours, held conversations and planned its time<span class="cite"><a href="#ref-genagents">[5]</a></span>. Every observation went into a <em>memory stream</em>, a list of natural-language records with creation and last-access times. To decide what to place in the context, each memory \(d\) was scored against the current situation by a weighted sum of three components:</p>
+<div class="box formula">
+\[ \operatorname{score}(d)=\alpha_{\text{rec}}\cdot\operatorname{recency}(d)+\alpha_{\text{imp}}\cdot\operatorname{importance}(d)+\alpha_{\text{rel}}\cdot\operatorname{relevance}(d,q), \]
+</div>
+<p>where <em>recency</em> decays exponentially with the time since the memory was last accessed (a factor of 0.995 per simulated hour), <em>importance</em> is a score from 1 to 10 that a model assigned when the memory was written ("brushing teeth" low, "a break-up" high), and <em>relevance</em> is the cosine similarity between the memory's embedding and the current query (Chapter 9). Each component was normalised to \([0,1]\) over the candidate memories, the weights were set to one, and the top-scoring memories that fitted the context budget were retrieved. Figure 13.3 shows how the recency component discounts the past for three decay rates.</p>
+
+<figure class="chart" id="fig-13-3">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Recency weight of a memory as a function of hours since last access","height":320,
+ "x":{"label":"Hours since last access","min":0,"max":720,"ticks":[0,24,72,168,336,720]},
+ "y":{"label":"Recency weight","min":0,"max":1},
+ "series":[
+  {"name":"decay 0.995 per hour (Generative Agents)","color":"s1","points":[[0,1],[24,0.8867],[72,0.697],[168,0.4308],[336,0.1856],[720,0.0271]]},
+  {"name":"0.99 per hour","color":"s3","points":[[0,1],[24,0.7857],[72,0.485],[168,0.1848],[336,0.0342],[720,0.0007]]},
+  {"name":"0.95 per hour","color":"s2","points":[[0,1],[24,0.292],[72,0.0249],[168,0.0002],[336,0],[720,0]]}
+ ]}
+</script>
+<figcaption><b>Figure 13.3 — How fast should memories fade?</b> At 0.995 per hour, a memory untouched for a week keeps 43% of its recency weight and one untouched for a month 3%. At 0.95 per hour, a day-old memory has already lost 70%. The right rate depends on how quickly the world the agent lives in changes.</figcaption></figure>
+
+<p>Figure 13.3 shows why recency alone is a poor retrieval rule for agents whose users return at irregular intervals: a customer who calls once a month would find every memory of them nearly forgotten. The three-part score handles this by letting relevance and importance override recency. A month-old memory that a customer's dog is a registered service animal scores low on recency but high on importance and, when the customer mentions travelling with the dog, high on relevance. The decay rate should match the half-life of the information: a coding agent's memory of yesterday's failing test should fade within days, while a customer's dietary requirement should hardly fade at all, which suggests different rates for different types of memory rather than one global constant.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — scoring three memories</div>
+<p>A customer calls to book a flight for herself and her dog. Three candidate memories, with raw component values:</p>
+<p>(A) "Asked for aisle seat on last booking" — 400 hours ago, importance 4, relevance 0.62.<br>(B) "Travels with a registered service dog; needs bulkhead seat" — 1,500 hours ago, importance 9, relevance 0.81.<br>(C) "Complained about a delayed refund" — 48 hours ago, importance 6, relevance 0.30.</p>
+<p><b>Raw recency</b> at 0.995 per hour: A \(0.995^{400}=0.135\); B \(0.995^{1500}=0.0005\); C \(0.995^{48}=0.786\).</p>
+<p><b>Normalise</b> each component to \([0,1]\) over the three (min–max). Recency: A \((0.135-0.0005)/(0.786-0.0005)=0.171\), B 0, C 1. Importance (4, 9, 6): A 0, B 1, C 0.4. Relevance (0.62, 0.81, 0.30): A 0.627, B 1, C 0.</p>
+<p><b>Scores</b> (weights 1): A \(0.171+0+0.627=0.80\); B \(0+1+1=2.00\); C \(1+0.4+0=1.40\). With room for two memories, B and C are retrieved. The service-dog fact, the one that matters, wins despite being two months old. The complaint, recent but irrelevant to the booking, takes the second slot; the aisle preference is left out, which a semantic profile (§13.5) would fix.</p>
+</div>
+
+<p>Generative Agents added a second mechanism that turned out to be as important as retrieval: <strong>reflection</strong>. Periodically (when the summed importance of recent memories passed a threshold), an agent was prompted to ask itself what high-level questions its recent memories raised, retrieve memories relevant to those questions, and write <em>insights</em> ("Klaus is dedicated to his research on gentrification") back into the memory stream as new memories, with pointers to the memories that supported them. Reflections could themselves be reflected on, forming a hierarchy from raw observations to abstractions. In ablations, removing reflection, planning or observation memory each degraded the believability of the agents' behaviour as judged by human raters. Figure 13.4 shows the structure.</p>
+
+<figure class="diagram" id="fig-13-4">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-label="Reflection turns raw episodic memories into higher-level insights">
+<defs><marker id="ah134" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<g class="t-xs">
+<rect x="20" y="160" width="130" height="50" rx="6" class="fill-muted"/><text x="85" y="182" text-anchor="middle">"chose aisle seat"</text><text x="85" y="198" text-anchor="middle">Mar 3</text>
+<rect x="165" y="160" width="130" height="50" rx="6" class="fill-muted"/><text x="230" y="182" text-anchor="middle">"asked to move</text><text x="230" y="198" text-anchor="middle">to aisle" May 12</text>
+<rect x="310" y="160" width="130" height="50" rx="6" class="fill-muted"/><text x="375" y="182" text-anchor="middle">"declined window</text><text x="375" y="198" text-anchor="middle">upgrade" Jul 8</text>
+<rect x="455" y="160" width="120" height="50" rx="6" class="fill-muted"/><text x="515" y="182" text-anchor="middle">"brought service</text><text x="515" y="198" text-anchor="middle">dog" Jul 8</text>
+<rect x="590" y="160" width="110" height="50" rx="6" class="fill-muted"/><text x="645" y="182" text-anchor="middle">"needed extra</text><text x="645" y="198" text-anchor="middle">legroom" Sep 1</text>
+<rect x="130" y="70" width="210" height="44" rx="8" class="bx2"/><text x="235" y="90" text-anchor="middle" class="t-sm">insight: prefers aisle seats</text><text x="235" y="106" text-anchor="middle">evidence: 3 episodes</text>
+<rect x="450" y="70" width="230" height="44" rx="8" class="bx2"/><text x="565" y="90" text-anchor="middle" class="t-sm">insight: travels with service dog</text><text x="565" y="106" text-anchor="middle">→ needs bulkhead seating</text>
+<rect x="250" y="10" width="300" height="36" rx="8" class="bx3"/><text x="400" y="33" text-anchor="middle" class="t-sm">higher insight: offer bulkhead aisle by default</text>
+</g>
+<line x1="85" y1="160" x2="200" y2="116" class="ln dash"/><line x1="230" y1="160" x2="235" y2="116" class="ln dash"/><line x1="375" y1="160" x2="270" y2="116" class="ln dash"/>
+<line x1="515" y1="160" x2="540" y2="116" class="ln dash"/><line x1="645" y1="160" x2="600" y2="116" class="ln dash"/>
+<line x1="235" y1="70" x2="350" y2="48" class="ln" marker-end="url(#ah134)"/><line x1="565" y1="70" x2="450" y2="48" class="ln" marker-end="url(#ah134)"/>
+</svg>
+<figcaption><b>Figure 13.4 — Reflection as consolidation.</b> Periodically the agent asks what its recent memories imply and writes the answers back as insights, with links to their evidence. Insights can be combined into higher-level ones. Retrieval can then return one insight instead of many raw episodes.</figcaption></figure>
+
+<p>Figure 13.4 is consolidation in the psychologist's sense: turning episodes into general knowledge. For agents it has two practical benefits. It compresses memory, since one insight replaces many episodes in the context. And it makes memory useful at the right level of abstraction: the agent planning a booking needs "prefers bulkhead aisle seats", not three separate anecdotes about seats. It also has a cost and a risk: reflections are model-generated generalisations, and a generalisation from too little evidence is a false memory with a citation. Linking every insight to its evidence, as Generative Agents did, lets the agent (or a person) check it, and lets the system revise it when contrary evidence arrives. Consolidated facts of this kind are the subject of the next section.</p>
+
+<h2 id="s13-5">13.5 Semantic memory: what is true</h2>
+<p>Semantic memory holds facts: about the user (name, preferences, constraints), about the world as the agent has learned it (this API requires authentication; this supplier ships only on weekdays), and about the organisation (who approves exceptions). Unlike episodes, facts are meant to be <em>current</em>: the useful memory is not every address the customer has ever had but the one that is true now. This makes semantic memory a database problem as much as a retrieval problem, with operations for creating, updating and deleting facts, and it is where most production "memory" features for assistants live.</p>
+<p>A typical pipeline has three stages. <em>Extraction</em>: after (or during) an interaction, a model reads the conversation and proposes candidate facts ("user's preferred seat: aisle"; "user is vegetarian"; "project uses Python 3.12"), each with a type, a value, a source and a confidence. <em>Reconciliation</em>: each candidate is compared with existing facts of the same type; it may be new (add it), a duplicate (reinforce it), a refinement (merge it) or a contradiction (decide which is current, usually the more recent explicit statement, and keep the old one in history rather than delete it). <em>Retrieval</em>: at the start of each interaction, the relevant facts (often the whole profile, if small) are placed in the context, typically near the system prompt so that they are cached and read early. Systems built this way, such as Mem0, reported large reductions in tokens and latency relative to keeping full conversation histories, with comparable or better accuracy on long-conversation benchmarks<span class="cite"><a href="#ref-mem0">[6]</a></span>.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — a contradiction in the profile</div>
+<p>The support agent's profile for a customer says <code>seat_preference: aisle</code> (source: three bookings, last March). Today the customer says, "Put me by the window this time, I want to sleep."</p>
+<p><b>Naive append.</b> The store now holds "prefers aisle" and "prefers window". Next month the agent retrieves both and must guess, or picks whichever appears last in its context.</p>
+<p><b>Naive overwrite.</b> The profile says "prefers window". Next month, on a short daytime flight, the agent books a window seat the customer did not want; the request was for <em>this</em> trip.</p>
+<p><b>Reconciliation.</b> The extractor classifies the statement as a <em>trip-specific request</em>, not a change of standing preference, because of "this time". The profile keeps <code>seat_preference: aisle</code> and the booking records the exception. Had the customer said "I've switched to window seats", the preference would be updated with the old value moved to history and a timestamp, so that the change is explainable.</p>
+<p><b>Lesson.</b> Facts need scope (standing or one-off), provenance and time. A memory store that only appends or only overwrites will be wrong in predictable ways.</p>
+</div>
+
+<p>Two further design choices matter. <em>Representation</em>: facts can be stored as free-text sentences retrieved by embedding, as typed key–value records, or as a knowledge graph of entities and relations (the customer, her dog, her usual routes), which makes multi-hop questions ("which of my frequent flyers travel with animals?") answerable. Typed records are the most reliable for facts that drive actions; free text is the most flexible. <em>Visibility</em>: users should be able to see what an agent remembers about them and correct or delete it. Beyond being good practice and, in many jurisdictions, a legal requirement for personal data, it is the most effective error-correction mechanism available, since the user is the authority on their own preferences.</p>
+
+<h2 id="s13-6">13.6 Procedural memory: how to act</h2>
+<p>Procedural memory holds the agent's know-how: how to do things well in its environment. We have met several forms already, and it helps to see them as one kind of memory. <strong>Lessons</strong> from experience, such as Reflexion's verbal reflections (§7.6), are procedural memories in the form of advice: "in this repository, run the database migrations before the tests". <strong>Skills</strong>, such as Voyager's verified functions (§10.9), are procedural memories in executable form. <strong>Instruction files</strong> written by people for agents (§12.7) are procedural memories supplied from outside. And the model's <strong>weights</strong> are procedural memory in the deepest sense: fine-tuning on an agent's successful trajectories, the subject of Chapter 17, writes experience into the policy itself rather than into its context.</p>
+<p>The forms differ in how they are retrieved and how much they cost. Lessons and instructions are text that must be placed in the context, so they compete for budget and, if numerous, must be retrieved by relevance; they are easy to write, read and correct. Skills extend the action space and need only a short description in the context until used. Weights cost nothing at inference time but are expensive and slow to update, hard to inspect and impossible to edit precisely. A sensible progression is from the cheap and inspectable to the expensive and opaque: capture a lesson as text first; if it is applied often and reliably, turn it into a skill or an instruction; if a large body of such knowledge accumulates and the volume justifies it, distil it into the weights.</p>
+<p>Procedural memories need validation more than any other kind, because they change behaviour on every future task they touch. A wrong lesson ("tests in this repository are flaky, ignore failures") can do more damage than a wrong fact, since it is applied with confidence in situations where it does not hold. Practical safeguards are those of §7.6 and §10.9: write lessons only from verified outcomes, scope them (this repository, this tool, this customer type), record their evidence, and retire lessons whose use correlates with failure.</p>
+
+<h2 id="s13-7">13.7 Policies: what to write, what to retrieve, what to forget</h2>
+<p>A memory system is defined less by its storage than by its policies. Three decisions recur, and each has a characteristic failure on either side.</p>
+<p><strong>Write policy.</strong> Writing everything (every message, every observation) makes storage cheap and retrieval hard: the relevant memory is buried among trivia, and the score of §13.4 must work harder to find it. Writing too little loses information that turns out to matter. Good write policies are selective and typed: store episodes in full in a cheap log (for audit and later re-extraction), but write to the retrievable stores only what passes a salience test, such as an importance score, an explicit user statement ("remember that…"), a verified outcome (a lesson from a fixed failure), or a fact that changes the profile. The agent itself can decide, MemGPT-style, by calling a memory-writing tool; or a background process can extract after each interaction, which keeps the agent's own steps focused on the task.</p>
+<p><strong>Retrieval policy.</strong> How many memories, of which kinds, enter the context, and when? Automatic retrieval at the start of an interaction (the profile, the last few interactions) handles the cases the agent would not think to search for (§13.3); agent-directed search handles the rest. The budget principle of Chapter 4 applies: memories compete with everything else for tokens and attention, and a context crowded with marginal memories suffers the same rot as one crowded with stale tool outputs. Retrieved memories should be marked as such, with dates and provenance, so that the model can weigh an eighteen-month-old preference differently from yesterday's explicit request.</p>
+<p><strong>Forgetting policy.</strong> Memories should not all live forever. Some become false (an address changes), some become irrelevant (a resolved complaint), some must be deleted on request or by regulation (personal data), and an ever-growing store degrades retrieval precision, as the distractor arithmetic of §9.5 predicts. Mechanisms include decay in retrieval scores (Figure 13.3), explicit expiry for time-bound facts, consolidation that replaces many episodes with one insight, and deletion on contradiction or request. Forgetting is also the main defence against the slow accumulation of errors. Figure 13.5 makes this concrete with a simple model of an agent that learns lessons across sessions.</p>
+
+<figure class="chart" id="fig-13-5">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Task success over sessions with accumulated lessons (model)","height":340,
+ "x":{"label":"Session k","min":0,"max":20,"ticks":[0,2,4,6,8,10,15,20]},
+ "y":{"label":"Success rate","min":0.55,"max":0.9,"fmt":"pct"},
+ "series":[
+  {"name":"only correct lessons","color":"s1","points":[[0,0.6],[1,0.675],[2,0.7275],[3,0.7642],[4,0.79],[6,0.8206],[8,0.8356],[10,0.8429],[15,0.8488],[20,0.8498]]},
+  {"name":"wrong lessons filtered (80% caught)","color":"s3","points":[[0,0.6],[1,0.6732],[2,0.7239],[3,0.7589],[4,0.7828],[6,0.8098],[8,0.8212],[10,0.8249],[15,0.8218],[20,0.8138]]},
+  {"name":"wrong lessons kept","color":"s2","points":[[0,0.6],[1,0.666],[2,0.7095],[3,0.7372],[4,0.754],[6,0.7666],[8,0.7636],[10,0.7529],[15,0.7138],[20,0.6698]]}
+ ]}
+</script>
+<figcaption><b>Figure 13.5 — Memory helps until its errors accumulate.</b> Correct lessons close 30% of the remaining gap each session, from 60% towards 85%. If each session also adds a wrong lesson with probability 0.3, each costing 3 points, success peaks around session 6 and then declines below where it started; catching 80% of wrong lessons keeps most of the benefit.</figcaption></figure>
+
+<p>Figure 13.5 is a model, with illustrative parameters, but its shape is the important lesson. The benefit of memory saturates (there is only so much to learn about one environment), while the harm of uncorrected errors accumulates linearly, so an agent that only ever adds to its memory eventually gets worse. The two remedies are validation at write time (only store lessons backed by verified outcomes) and correction over time (forget or revise memories whose use correlates with failure). The same arithmetic applies to semantic facts: a store with a small rate of wrong extractions, never corrected, becomes less reliable the longer the agent runs.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — memory versus full history for a returning customer</div>
+<p>A customer has had 30 previous conversations with the support agent, averaging 4,000 tokens each. The agent could (a) include the full history in context, (b) retrieve the 5 most relevant past exchanges (500 tokens each) plus a 600-token profile, or (c) use only the profile.</p>
+<p><b>Tokens per call.</b> (a) 120,000 tokens, most of a 200,000 window. (b) 3,100 tokens. (c) 600 tokens.</p>
+<p><b>Cost per 12-turn conversation</b> (memory block cached after the first call). (a) First call \(0.12\times\$3=\$0.36\), then \(11\times0.12\times\$0.30=\$0.40\): about $0.76 for memory alone. (b) \(0.0031\times\$3+11\times0.0031\times\$0.30\approx\$0.02\). (c) under a cent.</p>
+<p><b>Quality.</b> (a) contains everything but buries it (§4.7); (b) contains what is relevant if retrieval works; (c) contains only consolidated facts. A well-built system uses (c) always and (b) on demand, which covers nearly all needs at about a fortieth of the cost of (a).</p>
+</div>
+
+<h3 id="assembled">Putting the pieces together</h3>
+<p>The previous sections described each memory type separately; a working system combines them into two paths, drawn in Figure 13.6. The <strong>write path</strong> runs mostly after each interaction, off the critical path of the user's conversation: the full transcript goes to an episodic log; an extractor proposes facts and lessons; a reconciler merges them into the semantic profile and the procedural store, applying the scope, provenance and validation rules of §13.5–§13.6; and periodically a consolidation job reflects over recent episodes, writes insights and expires what should be forgotten. The <strong>read path</strong> runs at the start of each interaction and during it: the harness loads the profile and the most relevant lessons automatically, places them in a marked block after the system prompt, and the agent can search episodic memory and the archival store through tools when it needs more. Keeping writes off the critical path matters for latency, since extraction and reconciliation take model calls, and keeping reads small matters for every reason in Chapter 4.</p>
+
+<figure class="diagram" id="fig-13-6">
+<svg class="dg" viewBox="0 0 720 270" role="img" aria-label="Memory system: write path after interactions and read path before and during them">
+<defs><marker id="ah136" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker>
+<marker id="ah136a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead-acc"/></marker></defs>
+<rect x="20" y="105" width="130" height="60" rx="10" class="fill-acc"/><text x="85" y="130" text-anchor="middle" class="t-on t-sm">interaction</text><text x="85" y="148" text-anchor="middle" class="t-on t-xs">agent + context</text>
+<rect x="200" y="20" width="130" height="44" rx="8" class="bx2"/><text x="265" y="47" text-anchor="middle" class="t-xs">episodic log (all)</text>
+<rect x="200" y="80" width="130" height="44" rx="8" class="bx3"/><text x="265" y="100" text-anchor="middle" class="t-xs">extract facts</text><text x="265" y="114" text-anchor="middle" class="t-xs">and lessons</text>
+<rect x="370" y="80" width="130" height="44" rx="8" class="bx4"/><text x="435" y="100" text-anchor="middle" class="t-xs">reconcile, validate</text><text x="435" y="114" text-anchor="middle" class="t-xs">scope, provenance</text>
+<rect x="550" y="20" width="150" height="40" rx="8" class="bx3"/><text x="625" y="45" text-anchor="middle" class="t-xs">semantic profile</text>
+<rect x="550" y="70" width="150" height="40" rx="8" class="bx4"/><text x="625" y="95" text-anchor="middle" class="t-xs">procedural lessons, skills</text>
+<rect x="550" y="120" width="150" height="40" rx="8" class="bx2"/><text x="625" y="145" text-anchor="middle" class="t-xs">insights (reflection)</text>
+<rect x="370" y="20" width="130" height="44" rx="8" class="bx5"/><text x="435" y="40" text-anchor="middle" class="t-xs">consolidate, expire</text><text x="435" y="54" text-anchor="middle" class="t-xs">(periodic)</text>
+<line x1="150" y1="120" x2="198" y2="44" class="ln" marker-end="url(#ah136)"/><line x1="150" y1="128" x2="198" y2="102" class="ln" marker-end="url(#ah136)"/>
+<line x1="330" y1="102" x2="368" y2="102" class="ln" marker-end="url(#ah136)"/>
+<line x1="500" y1="96" x2="548" y2="44" class="ln" marker-end="url(#ah136)"/><line x1="500" y1="102" x2="548" y2="90" class="ln" marker-end="url(#ah136)"/>
+<line x1="330" y1="42" x2="368" y2="42" class="ln" marker-end="url(#ah136)"/><line x1="500" y1="44" x2="548" y2="136" class="ln" marker-end="url(#ah136)"/>
+<text x="350" y="186" text-anchor="middle" class="t-xs">write path: after the interaction, off the critical path</text>
+<rect x="370" y="200" width="160" height="50" rx="8" class="bx"/><text x="450" y="222" text-anchor="middle" class="t-xs">retrieve: profile + lessons auto,</text><text x="450" y="238" text-anchor="middle" class="t-xs">episodes and notes via tools</text>
+<path d="M625,160 C625,225 560,225 532,225" class="ln-acc" marker-end="url(#ah136a)"/>
+<path d="M370,225 C200,225 85,210 85,167" class="ln-acc" marker-end="url(#ah136a)"/><text x="220" y="244" text-anchor="middle" class="t-xs t-acc">read path: before and during</text>
+</svg>
+<figcaption><b>Figure 13.6 — A complete memory system.</b> After each interaction, transcripts are logged and facts and lessons are extracted, validated and reconciled into typed stores, with periodic consolidation and expiry. Before and during an interaction, the profile and relevant lessons are loaded automatically and the agent can search for more.</figcaption></figure>
+
+<p>Figure 13.6 also makes it clear where to look when memory misbehaves. A wrong fact in the profile points to extraction or reconciliation; a correct fact that was not used points to retrieval or to its placement in the context; a memory that should have expired points to the consolidation job. Each stage can be evaluated separately with the methods of §13.9, and each can be improved without touching the others.</p>
+<p>Two extensions are worth naming. <strong>Shared memory</strong> across agents, such as a team's support agents sharing knowledge of a recurring outage, or a coding agent and a review agent sharing notes on a repository, multiplies the value of each lesson and the damage of each error, and needs the same provenance and validation, plus access control so that each agent reads only what its users are entitled to see. And <strong>memory in the weights</strong>: when a body of procedural knowledge grows large and stable, it can be distilled into the model by fine-tuning on the trajectories that embody it (Chapter 17), freeing context budget, at the cost of the inspectability and easy correction that text memories offer. Most production systems in 2025 kept memory in text and stores, reserving weight updates for the developers' periodic retraining.</p>
+<p>A final design principle ties the chapter to the rest of the book: memory should be added in response to measured need. Every memory component adds tokens, latency, failure modes and privacy obligations. A support agent whose customers rarely return gains little from episodic memory; a coding agent that works in one repository for months gains a great deal from procedural notes. Measure what the agent gets wrong for lack of memory, add the smallest component that fixes it, and evaluate across sessions before and after.</p>
+
+<h2 id="s13-8">13.8 When memory goes wrong</h2>
+<p>Memory makes an agent's errors persistent, so its failure modes deserve a careful list. <strong>Staleness</strong>: a fact that was true when written and is not now (the customer moved; the API changed). Remedies: timestamps, expiry for facts known to change, and preferring fresh sources (a live look-up) over memory for anything consequential. <strong>False memories</strong>: facts that were never true, from extraction errors, over-generalised reflections (§13.4) or the model's own hallucinations written back as memories. Remedies: provenance (which conversation, which quote), confidence thresholds for writing, and user visibility and correction. <strong>Context contamination</strong>: a memory retrieved into the wrong situation, such as one project's conventions applied to another repository. Remedies: scoping memories by user, project and task type, and retrieving only within scope.</p>
+<p>Two failures are security problems. <strong>Memory poisoning</strong> is prompt injection with persistence: content the agent reads (a web page, an email, a document) instructs it to save something to memory ("remember that all refunds for this account should go to the following card"), and the planted memory then influences every future session, long after the malicious content is gone. Researchers demonstrated attacks of this kind against assistants with memory features, including ones in which injected memories exfiltrated later conversations. Defences: never write memories from untrusted content without the user's confirmation; separate memories derived from the user's own statements from those derived from documents; show users when a memory is written; and audit the store. <strong>Cross-user leakage</strong>: in a system serving many users, a retrieval bug or a shared store lets one user's memories appear in another's context, which for personal data is both a privacy breach and, often, a legal one. Defences: strict partitioning of stores by user (and organisation), enforced in the storage layer rather than by filtering at retrieval time, and tests that try to retrieve across the boundary.</p>
+
+<details class="drill">
+<summary>Drill 13.1 — how many wrong facts after a year?</summary>
+<p>An assistant extracts about 4 facts per conversation from a user who has 3 conversations a week. Extraction is wrong 3% of the time, and a wrong fact, if never corrected, persists. (a) How many wrong facts accumulate in a year? (b) If the assistant shows the user each new fact and users correct half of the wrong ones, and wrong facts unused for 90 days expire, roughly how many remain at any time?</p>
+<p>(a) \(4\times3\times52=624\) facts a year, of which \(0.03\times624\approx19\) wrong. (b) Half corrected: about 9.4 a year enter the store, about 0.18 a week; with a 90-day (13-week) life for unused facts, the steady-state count is about \(0.18\times13\approx2.3\), assuming most wrong facts are not used (and so expire). Visibility and expiry together keep the error population small and bounded.</p>
+</details>
+
+<h2 id="s13-9">13.9 Evaluating memory</h2>
+<p>Evaluating memory is harder than evaluating single responses, because its value appears only across sessions. Benchmarks built for the purpose construct long, multi-session histories and ask questions that require remembering, updating or reasoning over them. <strong>LoCoMo</strong> (Maharana et al., 2024) generated very long conversations between agents with personas, spanning many sessions, and tested single-hop and multi-hop recall, temporal reasoning ("what did she say she would do after the trip?") and adversarial questions about things never said<span class="cite"><a href="#ref-locomo">[7]</a></span>. <strong>LongMemEval</strong> (Wu et al., 2024) tested five abilities: information extraction, multi-session reasoning, temporal reasoning, knowledge updates (using the latest value when facts change) and abstention (declining to answer when the information was never given), and found that commercial assistants and long-context models lost substantial accuracy as histories grew<span class="cite"><a href="#ref-longmemeval">[8]</a></span>.</p>
+<p>For a deployed agent, the useful evaluation follows the same structure on the agent's own domain: replay or simulate multi-session histories, then measure whether the agent uses what it should (a preference stated three sessions ago), updates what it should (a changed address), forgets what it should (a one-off request), and declines to invent what it was never told. Two operational metrics complement these: the precision of written memories (what fraction of stored facts are correct, from audits) and the cost and latency of memory per interaction. Above all, memory should be evaluated with ablations: the same agent with and without each memory component, on the same multi-session tasks, since memory that adds tokens and risk without improving outcomes should be removed.</p>
+
+<details class="drill">
+<summary>Drill 13.2 — the right decay rate</summary>
+<p>A coding agent stores observations about a repository ("test X is flaky"; "module Y is being refactored"). Such observations remain true for about two weeks on average. What hourly decay factor gives a recency weight of one half after two weeks (336 hours)? What would it be for customer preferences that last about two years?</p>
+<p>Solve \(r^{336}=0.5\): \(r=0.5^{1/336}=e^{-0.693/336}=e^{-0.00206}\approx0.99794\). For two years (about 17,500 hours): \(r=e^{-0.693/17{,}500}\approx0.99996\). One decay rate cannot serve both; use rates per memory type.</p>
+</details>
+
+<details class="drill">
+<summary>Drill 13.3 — budget for memories</summary>
+<p>A research agent has a 200,000-token window and wants to keep memory under 5% of it. Its profile of the user's interests is 800 tokens, and past findings are stored as 300-token notes. How many notes can it retrieve per call? If retrieval precision is 0.6 (the fraction of retrieved notes that are relevant), how many relevant notes does that give, and how many tokens are spent on irrelevant ones?</p>
+<p>Budget 10,000 tokens; minus 800 for the profile leaves 9,200, or 30 notes. Relevant: \(0.6\times30=18\); irrelevant: 12 notes, 3,600 tokens per call. A reranker that raised precision to 0.85 for the same 18 relevant notes would need only 21 notes, saving about 2,700 tokens per call and reducing distraction.</p>
+</details>
+
+<h2 id="s13-10">13.10 Privacy and user control</h2>
+<p>An agent that remembers is an agent that holds personal data, and memory changes the privacy properties of a system in ways a stateless assistant never had to consider. A user who tells a stateless chatbot about a medical condition has disclosed it for one conversation; a user who tells an agent with memory has, unless the design prevents it, disclosed it to every future conversation, to any sub-agent that reads the memory store, and possibly to anyone who can influence what the agent retrieves. The engineering of memory therefore includes four controls that are as much a part of the design as the retrieval policy.</p>
+<p><strong>Visibility and editing.</strong> Users should be able to see what the agent has stored about them, in plain language, and correct or delete it. This is both a legal requirement in many jurisdictions and a correctness mechanism: users are the best detectors of wrong memories (§13.8). <strong>Consent and scope.</strong> Some information should never be written without asking (health, finances, other people's details), and memories should be scoped: a fact learned in a work context should not surface in a personal one. <strong>Isolation.</strong> Memories must be partitioned by user and tenant at the storage layer, with access enforced by the retrieval service, not by the prompt; a retrieval bug that returns another user's memory is a data breach, whatever the model then does with it. <strong>Retention and deletion.</strong> Memories should expire unless they remain useful, and deletion must propagate.</p>
+<p>Deletion is harder than it looks, because memory systems derive new records from old ones: summaries of episodes, consolidated facts, reflections (§13.4–§13.5). If a user deletes a fact, every derived record that contains it must be found and rewritten or removed. The clean way to guarantee this is <em>lineage</em>: each derived memory records the identifiers of the records it was derived from, so the set of records affected by a deletion is the descendants of the deleted node in a directed acyclic graph, computable by a graph traversal. Without lineage, deletion is best effort, and a consolidated profile may keep repeating a fact the user asked to forget. Embeddings deserve the same treatment: an embedding of a deleted text must be deleted with it, since embeddings can leak information about their source.</p>
+<p>These controls cost little if designed in and a great deal if retrofitted. They also shape what memory is worth building: a feature that stores sensitive facts must earn the privacy obligations it creates, which is one more reason, alongside cost and error, to add memory only where it is measured to help.</p>
+
+<h2 id="looking-ahead" class="unnumbered">Looking ahead</h2>
+<p>Memory lets an agent carry knowledge across episodes. A different problem arises within a single episode that is simply too long: a coding task that takes four hours and hundreds of steps, a research project spanning days, a migration of a large code base. Such tasks overflow any context, accumulate errors (§1.8) over hundreds of steps, and outlast the processes, sessions and even machines they run on. How do agents work for hours without losing the thread: how do they compact their context, keep notes, delegate sub-tasks to fresh agents, checkpoint their progress and resume after interruption? And what does the evidence say about how long agents can now work? Chapter 14 takes up long-horizon agents.</p>
+
+<h2 id="summary">Chapter summary</h2>
+<ul>
+<li>Memory extends the context map across episodes, giving continuity, personalisation and learning. Use psychology's taxonomy: <b>working</b> (the context), <b>episodic</b> (what happened), <b>semantic</b> (what is true), <b>procedural</b> (how to act); CoALA maps it onto agents.</li>
+<li><b>MemGPT</b> treats the context as a cache over recall and archival stores, with the agent paging via memory tools; combine with automatic retrieval, since agents cannot search for what they do not know exists.</li>
+<li><b>Generative Agents</b> retrieve by recency (decay 0.995/hour) + importance + relevance, normalised; <b>reflection</b> consolidates episodes into linked insights.</li>
+<li><b>Semantic memory</b> needs extraction, reconciliation (add, reinforce, merge, supersede with history), scope (standing vs one-off), provenance and user visibility.</li>
+<li><b>Procedural memory</b> spans lessons, skills, instruction files and weights, from cheap and inspectable to expensive and opaque; validate before writing.</li>
+<li>Policies: selective, typed writes; automatic plus agent-directed retrieval within a budget; forgetting by decay, expiry, consolidation and deletion. Unvalidated memory eventually makes an agent worse.</li>
+<li>Failures: staleness, false memories, contamination across scopes, <b>memory poisoning</b> (persistent injection) and cross-user leakage; defences include provenance, confirmation for writes from untrusted content, and storage-level partitioning.</li>
+<li>Evaluate across sessions (LoCoMo, LongMemEval; extraction, multi-session reasoning, temporal reasoning, updates, abstention) and by ablation.</li>
+<li>Memory brings privacy obligations: user visibility and editing, consent and scope, storage-level isolation, retention, and deletion that propagates through derived records via lineage.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ch13-mcq-01" data-topic="§13.1 Purpose">
+<p class="q">In the language of Chapter 2, long-term memory:</p>
+<ol class="opts"><li>Changes the environment's transition kernel</li><li data-correct>Extends the context map across episodes, approximating conditioning on the whole history within a budget</li><li>Replaces the policy</li><li>Removes partial observability</li></ol>
+<div class="explain">It is the sufficient-statistic problem with a much longer history.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-02" data-topic="§13.2 Taxonomy">
+<p class="q">"This customer prefers aisle seats" is an example of which kind of memory?</p>
+<ol class="opts"><li>Episodic</li><li data-correct>Semantic</li><li>Procedural</li><li>Working</li></ol>
+<div class="explain">A general fact abstracted from episodes.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-03" data-topic="§13.2 Taxonomy">
+<p class="q">"In this repository, run the migrations before the tests" is best classified as:</p>
+<ol class="opts"><li>Episodic</li><li>Semantic</li><li data-correct>Procedural</li><li>Working</li></ol>
+<div class="explain">Know-how about acting.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-04" data-topic="§13.2 CoALA">
+<p class="q">In CoALA, which of these is an <em>internal</em> action?</p>
+<ol class="opts"><li>Clicking a button</li><li>Sending an email</li><li data-correct>Retrieving from long-term memory</li><li>Running a shell command</li></ol>
+<div class="explain">Internal actions include retrieval, reasoning and learning (writing to memory).</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-05" data-topic="§13.2 Consolidation">
+<p class="q">Consolidation refers to:</p>
+<ol class="opts"><li>Deleting all memories</li><li data-correct>Turning episodes into general facts and lessons</li><li>Merging two users' stores</li><li>Compressing embeddings</li></ol>
+<div class="explain">Episodic → semantic and procedural.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-06" data-topic="§13.3 MemGPT">
+<p class="q">MemGPT's central analogy is:</p>
+<ol class="opts"><li>A database index</li><li data-correct>Operating-system virtual memory: the context as main memory, external stores as disk, with paging</li><li>A web cache</li><li>A compiler</li></ol>
+<div class="explain">The agent pages information in and out with memory functions.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-07" data-topic="§13.3 MemGPT">
+<p class="q">The main limitation of purely agent-directed memory retrieval is that:</p>
+<ol class="opts"><li>It is too fast</li><li data-correct>The agent cannot search for a memory it does not know exists</li><li>It requires fine-tuning</li><li>It uses no tokens</li></ol>
+<div class="explain">Hence automatic retrieval of likely-relevant memories as well.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-08" data-topic="§13.3 Cache">
+<p class="q">For agent memory, the costliest kind of "cache miss" is:</p>
+<ol class="opts"><li>A retrieval that takes a second</li><li data-correct>Relevant information that is never fetched, leading to a wrong decision</li><li>A memory written twice</li><li>A cached prompt</li></ol>
+<div class="explain">Unlike hardware caches, misses may go unnoticed.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-09" data-topic="§13.4 Retrieval score">
+<p class="q">The Generative Agents retrieval score combines:</p>
+<ol class="opts"><li>Length, frequency and position</li><li data-correct>Recency, importance and relevance</li><li>Price, latency and accuracy</li><li>Precision, recall and F1</li></ol>
+<div class="explain">Each normalised to [0,1] and summed with weights.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-10" data-topic="§13.4 Recency">
+<p class="q">At a decay of 0.995 per hour, a memory not accessed for a week (168 hours) keeps about what recency weight?</p>
+<ol class="opts"><li>0.99</li><li>0.70</li><li data-correct>0.43</li><li>0.03</li></ol>
+<div class="explain">\(0.995^{168}\approx0.43\).</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-11" data-topic="§13.4 Recency">
+<p class="q">Why is a single global decay rate a poor choice?</p>
+<ol class="opts"><li>It is expensive</li><li data-correct>Different kinds of information stay true for very different lengths of time</li><li>Decay is irrelevant</li><li>It breaks caching</li></ol>
+<div class="explain">Use per-type rates matched to each type's half-life.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-12" data-topic="§13.4 Worked example">
+<p class="q">In the worked example, why was the two-month-old service-dog memory retrieved?</p>
+<ol class="opts"><li>It was the most recent</li><li data-correct>Its importance and relevance scores outweighed its low recency</li><li>It was the shortest</li><li>Recency was ignored</li></ol>
+<div class="explain">Score 2.0 against 1.4 and 0.8.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-13" data-topic="§13.4 Reflection">
+<p class="q">Reflection in Generative Agents:</p>
+<ol class="opts"><li>Re-reads the whole memory each step</li><li data-correct>Periodically synthesises higher-level insights from recent memories and stores them with links to their evidence</li><li>Deletes unimportant memories</li><li>Is a form of RL</li></ol>
+<div class="explain">Consolidation into a hierarchy of abstractions.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-14" data-topic="§13.4 Reflection risk">
+<p class="q">The main risk of reflections is:</p>
+<ol class="opts"><li>They are too short</li><li data-correct>Over-generalisation from little evidence creates false memories that look well supported</li><li>They are never retrieved</li><li>They break embeddings</li></ol>
+<div class="explain">Link insights to evidence and revise on contrary evidence.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-15" data-topic="§13.5 Semantic memory">
+<p class="q">The three stages of a typical semantic-memory pipeline are:</p>
+<ol class="opts"><li>Embed, cluster, delete</li><li data-correct>Extract, reconcile, retrieve</li><li>Tokenise, cache, decode</li><li>Plan, act, reflect</li></ol>
+<div class="explain">Reconciliation handles duplicates, refinements and contradictions.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-16" data-topic="§13.5 Contradiction">
+<p class="q">The customer says "put me by the window this time". The best memory update is:</p>
+<ol class="opts"><li>Append "prefers window"</li><li>Overwrite the preference with "window"</li><li data-correct>Keep the standing aisle preference and record a trip-specific exception</li><li>Delete the profile</li></ol>
+<div class="explain">Facts need scope: standing or one-off.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-17" data-topic="§13.5 Visibility">
+<p class="q">Why should users be able to see and edit what an agent remembers about them?</p>
+<ol class="opts"><li>It saves tokens</li><li data-correct>Users are the authority on their own facts, making visibility the most effective error correction, and it is often legally required</li><li>It speeds retrieval</li><li>It avoids embeddings</li></ol>
+<div class="explain">Correction by the user bounds false memories.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-18" data-topic="§13.5 Representation">
+<p class="q">For facts that drive actions (a loyalty number, a dietary requirement), the most reliable representation is usually:</p>
+<ol class="opts"><li>Free-text sentences only</li><li data-correct>Typed key–value records with provenance and timestamps</li><li>Raw conversation logs</li><li>Model weights</li></ol>
+<div class="explain">Free text is flexible; typed records are precise and updatable.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-19" data-topic="§13.6 Procedural">
+<p class="q">Order these forms of procedural memory from cheapest and most inspectable to most expensive and opaque.</p>
+<ol class="opts"><li>Weights, skills, lessons</li><li data-correct>Text lessons, executable skills, model weights</li><li>Skills, weights, lessons</li><li>Weights, lessons, skills</li></ol>
+<div class="explain">Capture as text; promote to skills; distil into weights at volume.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-20" data-topic="§13.6 Validation">
+<p class="q">Why do procedural memories need validation more than other kinds?</p>
+<ol class="opts"><li>They are longer</li><li data-correct>They change behaviour on every future task they touch and are applied with confidence</li><li>They cost more tokens</li><li>They are rarely used</li></ol>
+<div class="explain">A wrong lesson can do more damage than a wrong fact.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-21" data-topic="§13.7 Write policy">
+<p class="q">A good write policy:</p>
+<ol class="opts"><li>Stores everything in the retrievable store</li><li>Stores nothing</li><li data-correct>Logs full episodes cheaply but writes only salient, typed items to retrievable stores</li><li>Writes only reflections</li></ol>
+<div class="explain">Selective writes keep retrieval precise.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-22" data-topic="§13.7 Retrieval policy">
+<p class="q">Why mark retrieved memories with dates and provenance in the context?</p>
+<ol class="opts"><li>For formatting</li><li data-correct>So the model can weigh old memories differently from recent explicit statements</li><li>To increase tokens</li><li>To improve caching</li></ol>
+<div class="explain">An 18-month-old preference is weaker evidence than yesterday's request.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-23" data-topic="§13.7 Accumulation">
+<p class="q">Figure 13.5 shows that if wrong lessons are kept:</p>
+<ol class="opts"><li>Success rises forever</li><li data-correct>Success peaks and then declines, eventually below where it started</li><li>Nothing changes</li><li>Success drops immediately</li></ol>
+<div class="explain">Benefits saturate; uncorrected errors accumulate linearly.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-24" data-topic="§13.7 Forgetting">
+<p class="q">Select all legitimate reasons for an agent to forget a memory.</p>
+<ol class="opts"><li data-correct>It has become false</li><li data-correct>The user asked for deletion</li><li data-correct>It was consolidated into an insight</li><li>It is important</li></ol>
+<div class="explain">Also irrelevance and expiry of time-bound facts.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-25" data-topic="§13.7 Cost">
+<p class="q">In the worked example, the profile-plus-retrieval approach cost about what fraction of including the full history?</p>
+<ol class="opts"><li>Half</li><li>A tenth</li><li data-correct>About a fortieth</li><li>The same</li></ol>
+<div class="explain">About $0.02 against $0.76 per conversation.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-26" data-topic="§13.8 Staleness">
+<p class="q">The best remedy for stale memories about consequential facts (e.g. a booking's status) is:</p>
+<ol class="opts"><li>Longer decay times</li><li data-correct>Prefer a fresh look-up from the authoritative system over memory</li><li>More reflections</li><li>Larger embeddings</li></ol>
+<div class="explain">Memory for context; live sources for facts that drive actions.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-27" data-topic="§13.8 Poisoning">
+<p class="q">Memory poisoning is dangerous mainly because:</p>
+<ol class="opts"><li>It uses many tokens</li><li data-correct>An injected instruction saved to memory persists and influences future sessions after the malicious content is gone</li><li>It deletes the store</li><li>It slows retrieval</li></ol>
+<div class="explain">Persistent prompt injection.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-28" data-topic="§13.8 Poisoning defences">
+<p class="q">Which defence most directly prevents memory poisoning?</p>
+<ol class="opts"><li>Higher temperature</li><li data-correct>Never writing memories derived from untrusted content without the user's confirmation</li><li>A larger store</li><li>Faster decay</li></ol>
+<div class="explain">Separate user-stated memories from document-derived ones.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-29" data-topic="§13.8 Leakage">
+<p class="q">Cross-user memory leakage is best prevented by:</p>
+<ol class="opts"><li>Filtering results by user name in the prompt</li><li data-correct>Partitioning stores by user and organisation in the storage layer</li><li>Lower temperature</li><li>Shorter memories</li></ol>
+<div class="explain">Enforce isolation where data lives, not by retrieval-time filtering alone.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-30" data-topic="§13.9 Evaluation">
+<p class="q">LongMemEval's "abstention" ability tests whether an agent:</p>
+<ol class="opts"><li>Refuses unsafe requests</li><li data-correct>Declines to answer when the information was never given</li><li>Stops early</li><li>Forgets on request</li></ol>
+<div class="explain">Inventing memories is a failure.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-31" data-topic="§13.9 Ablation">
+<p class="q">The most informative evaluation of a memory component is:</p>
+<ol class="opts"><li>Its storage size</li><li data-correct>An ablation: the same agent with and without it on the same multi-session tasks</li><li>Its retrieval latency alone</li><li>The number of memories written</li></ol>
+<div class="explain">Memory that adds tokens and risk without improving outcomes should go.</div>
+</div>
+<div class="mcq" data-id="ch13-mcq-32" data-topic="§13.10 Privacy">
+<p class="q">Why does deleting a memory require lineage tracking?</p>
+<ol class="opts"><li>To speed up retrieval</li><li data-correct>Derived records (summaries, consolidated facts) may contain the deleted fact, and lineage identifies them as descendants to rewrite or remove</li><li>To compress embeddings</li><li>It does not</li></ol>
+<div class="explain">Deletion must propagate through the derivation graph, embeddings included.</div>
+</div>
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer out loud first, then reveal the model answer and rate yourself.</p>
+
+<details class="qa" data-id="ch13-qa-01">
+<summary><span class="lvl warm">Warm-up</span> What kinds of memory does an agent need?</summary>
+<div class="answer"><p>Working memory (the context for the current step), and long-term memory of three kinds: episodic (records of past interactions and trajectories, timestamped), semantic (current facts about the user, world and organisation, often a profile or fact store) and procedural (how to act: lessons, skills, instruction files, and ultimately the weights). Each has a different structure, write policy and failure mode; a single undifferentiated vector store of everything tends to retrieve poorly and accumulate errors.</p></div>
+</details>
+
+<details class="qa" data-id="ch13-qa-02">
+<summary><span class="lvl warm">Warm-up</span> Explain MemGPT.</summary>
+<div class="answer"><p>MemGPT treats the context window like main memory in an operating system and external storage like disk. The context holds fixed instructions, an agent-editable working context of key facts and a queue of recent messages; older messages are evicted (with summaries) under memory pressure into a searchable recall store, and the agent can insert into and search an archival store. The agent manages its own memory through function calls. Its key idea, agent-directed memory via tools, is widely used; its limitation is that agents do not search for memories they do not know exist, so automatic retrieval is also needed.</p></div>
+</details>
+
+<details class="qa" data-id="ch13-qa-03">
+<summary><span class="lvl warm">Warm-up</span> How do Generative Agents decide which memories to retrieve?</summary>
+<div class="answer"><p>Each memory gets a score: recency (exponential decay, 0.995 per hour since last access), importance (1–10, assigned by a model when written) and relevance (cosine similarity to the current query), each min–max normalised over candidates and summed with weights. The top memories that fit the budget enter the context. Periodically, reflection synthesises higher-level insights from recent memories and stores them, linked to their evidence.</p></div>
+</details>
+
+<details class="qa" data-id="ch13-qa-04">
+<summary><span class="lvl core">Core</span> How would you handle contradictory facts in an agent's user profile?</summary>
+<div class="answer"><p>Store facts as typed records with scope (standing vs one-off), provenance (source conversation, quote) and timestamps. On a new statement, classify it: duplicate (reinforce), refinement (merge), trip-specific exception (record against the task, keep the standing fact), or genuine change (supersede, moving the old value to history). Prefer explicit recent statements over inferred ones. Show changes to the user, allow correction, and for consequential facts confirm before acting.</p></div>
+</details>
+
+<details class="qa" data-id="ch13-qa-05">
+<summary><span class="lvl core">Core</span> Design write, retrieval and forgetting policies for a support agent's memory.</summary>
+<div class="answer"><p>Write: log full conversations to an audit store; extract typed facts (preferences, constraints, open issues) after each conversation with confidence thresholds; write only user-stated or verified facts to the profile; record open issues with expiry. Retrieve: automatically load the profile and recent open issues at conversation start (cached near the system prompt); let the agent search past conversations on demand; cap memory at a token budget. Forget: expire resolved issues and time-bound facts; decay retrieval of episodic memories; delete on user request; supersede contradicted facts with history. Partition stores per customer in the storage layer.</p></div>
+</details>
+
+<details class="qa" data-id="ch13-qa-06">
+<summary><span class="lvl core">Core</span> What is memory poisoning and how do you defend against it?</summary>
+<div class="answer"><p>Injected content (a web page, email or document) instructs the agent to save a malicious memory, e.g. a payment detail or an instruction to forward data, which then persists and influences future sessions. Defences: do not write memories from untrusted content without user confirmation; tag memories by source (user-stated vs document-derived) and weight or restrict the latter; never let memories expand permissions; show users new memories; audit and allow deletion; and monitor for memories containing instructions rather than facts.</p></div>
+</details>
+
+<details class="qa" data-id="ch13-qa-07">
+<summary><span class="lvl core">Core</span> When should an agent use memory versus a fresh look-up?</summary>
+<div class="answer"><p>Use memory for context, preferences and know-how that the authoritative systems do not hold or that would be expensive to re-derive. Use a fresh look-up for facts that drive consequential actions and can change (booking status, balances, current prices, code contents), since memories can be stale. A common pattern: memory supplies the hint ("customer had a pending refund"), and a look-up confirms the current state before acting.</p></div>
+</details>
+
+<details class="qa" data-id="ch13-qa-08">
+<summary><span class="lvl core">Core</span> How would you evaluate an agent's memory?</summary>
+<div class="answer"><p>Construct or replay multi-session histories in the target domain and test extraction (does it remember stated facts?), multi-session reasoning, temporal reasoning, knowledge updates (latest value wins), scope (one-off requests not generalised), and abstention (no invented memories). Measure precision of written memories by audit, retrieval precision and recall, tokens and latency per interaction, and end-task success. Run ablations with and without each memory component. Public benchmarks such as LoCoMo and LongMemEval cover the general abilities.</p></div>
+</details>
+
+<details class="qa" data-id="ch13-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Model the long-run effect of an agent that learns lessons across sessions, including wrong ones.</summary>
+<div class="answer"><p>Let success at session \(k\) be \(s_k=s_\infty-(s_\infty-s_0)(1-\alpha)^k-\delta\,w\,k\), where correct lessons close a fraction \(\alpha\) of the gap each session and wrong lessons arrive at rate \(w\) per session, each costing \(\delta\) and never removed. The first term saturates; the last grows linearly, so \(s_k\) peaks at finite \(k\) and eventually falls below \(s_0\). With \(s_0=0.6,s_\infty=0.85,\alpha=0.3,w=0.3,\delta=0.03\), the peak is around session 6. Remedies change the parameters: validation at write lowers \(w\); retirement of lessons correlated with failure makes the wrong-lesson population bounded rather than growing (a birth–death process with a stationary size), restoring monotone improvement.</p></div>
+</details>
+
+<details class="qa" data-id="ch13-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> Compare free text, typed records and knowledge graphs for semantic memory.</summary>
+<div class="answer"><p>Free text: flexible, easy to extract, retrieved by embeddings; but hard to update precisely, prone to duplicates and contradictions, weak for exact facts. Typed records: precise, updatable, auditable, ideal for facts that drive actions; but require a schema and miss unanticipated information. Knowledge graphs: entities and relations support multi-hop and aggregate queries and consolidation; but extraction is error-prone and maintenance is costly. Practical systems combine: typed profile for core facts, free-text notes for the rest, graph structure where relations matter (organisations, networks of entities).</p></div>
+</details>
+
+<details class="qa" data-id="ch13-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> Why can memory make an agent worse, and what does that imply for deployment?</summary>
+<div class="answer"><p>Memory adds tokens (distraction, cost), retrieves stale or irrelevant items, persists errors (false facts, wrong lessons, poisoned instructions), and can leak across scopes. Unlike a stateless agent, a memoryful one's failures are correlated across sessions and can grow over time. Implications: validate writes, scope and partition, decay and expire, give users visibility, monitor memory quality metrics over time, and evaluate with long multi-session tests and ablations before enabling memory broadly; consider memory off by default for high-risk tasks.</p></div>
+</details>
+
+<details class="qa" data-id="ch13-qa-12">
+<summary><span class="lvl design">Design</span> Design memory for a coding agent that works in the same repositories over months.</summary>
+<div class="answer"><p>Procedural: a repository notes file (or instruction file) of verified conventions and commands (how to run tests, environment variables, code style), written only when a command or convention is confirmed by success, reviewed by humans, versioned in the repository. Episodic: logs of past tasks with outcomes, searchable by file and error message, decayed over weeks. Semantic: facts about the code base (owners, modules under refactor, flaky tests) with expiry. Retrieval: load the notes file and repository map at task start; search past tasks when touching the same files or seeing the same error. Guard against stale knowledge by re-verifying commands that fail, and partition by repository.</p></div>
+</details>
+
+<details class="qa" data-id="ch13-qa-13">
+<summary><span class="lvl design">Design</span> A personal assistant remembers things about users across chats. What privacy and safety controls do you build?</summary>
+<div class="answer"><p>Per-user (and per-organisation) storage partitions enforced in the database; encryption; user-visible memory list with edit and delete; notification when a memory is written; no memories written from untrusted documents or web content without confirmation; sensitive categories (health, finances, others' personal data) excluded or confirmed; retention limits and deletion on account closure; memories never used to expand tool permissions; audit logs; and evaluation for leakage across users. Provide a memory-off mode.</p></div>
+</details>
+
+<details class="qa" data-id="ch13-qa-14">
+<summary><span class="lvl design">Design</span> How would you choose decay rates and budgets for memory retrieval?</summary>
+<div class="answer"><p>Estimate each memory type's useful lifetime from data (how long facts stay true, how long episodes stay relevant) and set per-type decay so the recency weight halves at that lifetime (\(r=0.5^{1/T_{1/2}}\)). Set a total memory token budget (e.g. a few per cent of the window) and allocate it by type (profile always, recent episodes, retrieved notes). Tune the score weights and budget on multi-session evaluation tasks, measuring end-task success and token cost; add a reranker if retrieval precision is low.</p></div>
+</details>
+
+<details class="qa" data-id="ch13-qa-15">
+<summary><span class="lvl core">Core</span> What is reflection in agent memory and what are its risks?</summary>
+<div class="answer"><p>Periodic synthesis of higher-level insights from accumulated episodes ("prefers aisle seats", "Klaus researches gentrification"), stored as new memories linked to their evidence. It compresses memory and makes it useful at the right abstraction. Risks: over-generalisation from little evidence (false memories that look supported), drift through reflections on reflections, and cost. Mitigate with evidence thresholds, links to sources, revision on contrary evidence, and user visibility for personal insights.</p></div>
+</details>
+
+<details class="qa" data-id="ch13-qa-16">
+<summary><span class="lvl core">Core</span> Why combine agent-directed and automatic memory retrieval?</summary>
+<div class="answer"><p>Agent-directed retrieval (memory as a tool) lets the agent fetch what it knows it needs, flexibly. But an agent cannot search for a memory whose existence nothing in the current context suggests, such as a forgotten constraint. Automatic retrieval (loading the profile and likely-relevant recent memories before the interaction) covers those cases. Together they approximate a sufficient context without loading everything.</p></div>
+</details>
+
+<details class="qa" data-id="ch13-qa-17">
+<summary><span class="lvl core">Core</span> Why should memory writes happen off the critical path of an interaction?</summary>
+<div class="answer"><p>Extraction, reconciliation and consolidation each require model calls and storage operations that add seconds of latency; doing them during the conversation slows every turn for a benefit realised only in future sessions. Running them after the interaction (or asynchronously in the background) keeps the user-facing path fast and lets the write pipeline use more careful (and expensive) validation. The exception is memory the agent needs within the same episode, which it can keep in its working context or a scratchpad until the episode ends.</p></div>
+</details>
+
+<details class="qa" data-id="ch13-qa-18">
+<summary><span class="lvl deep">Deep-dive</span> When should procedural knowledge move from text memory into the model's weights?</summary>
+<div class="answer"><p>When it is large (consuming significant context budget if kept as text), stable (unlikely to change soon), validated (consistently associated with success), and applies to high-volume traffic, so that fine-tuning on trajectories embodying it pays back through lower per-call tokens and better reliability. Costs: training effort, slower updates, loss of inspectability and precise editing, and risk of entangling it with other behaviours. Keep fast-changing, user-specific or safety-relevant knowledge in text, where it can be read, audited and corrected; distil only the stable core, and keep the text version as documentation and for evaluation.</p></div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="ref-atkinson">R. C. Atkinson and R. M. Shiffrin. Human memory: A proposed system and its control processes. In <em>The Psychology of Learning and Motivation</em>, vol. 2, 1968; A. D. Baddeley and G. Hitch, Working memory, 1974.</li>
+<li id="ref-tulving">E. Tulving. Episodic and semantic memory. In <em>Organization of Memory</em>, Academic Press, 1972.</li>
+<li id="ref-coala">T. R. Sumers, S. Yao, K. Narasimhan, T. L. Griffiths. Cognitive Architectures for Language Agents. <em>TMLR</em>, 2024. <a href="https://arxiv.org/abs/2309.02427">arXiv:2309.02427</a>.</li>
+<li id="ref-memgpt">C. Packer et al. MemGPT: Towards LLMs as Operating Systems. 2023. <a href="https://arxiv.org/abs/2310.08560">arXiv:2310.08560</a>.</li>
+<li id="ref-genagents">J. S. Park et al. Generative Agents: Interactive Simulacra of Human Behavior. <em>UIST</em>, 2023. <a href="https://arxiv.org/abs/2304.03442">arXiv:2304.03442</a>.</li>
+<li id="ref-mem0">P. Chhikara et al. Mem0: Building Production-Ready AI Agents with Scalable Long-Term Memory. 2025. <a href="https://arxiv.org/abs/2504.19413">arXiv:2504.19413</a>.</li>
+<li id="ref-locomo">A. Maharana et al. Evaluating Very Long-Term Conversational Memory of LLM Agents (LoCoMo). <em>ACL</em>, 2024. <a href="https://arxiv.org/abs/2402.17753">arXiv:2402.17753</a>.</li>
+<li id="ref-longmemeval">D. Wu et al. LongMemEval: Benchmarking Chat Assistants on Long-Term Interactive Memory. <em>ICLR</em>, 2025. <a href="https://arxiv.org/abs/2410.10813">arXiv:2410.10813</a>.</li>
+<li>Further reading: L. R. Squire, Memory systems of the brain, <em>Neurobiology of Learning and Memory</em> 82, 2004; Z. Zhang et al., A Survey on the Memory Mechanism of Large Language Model based Agents, <a href="https://arxiv.org/abs/2404.13501">arXiv:2404.13501</a>.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

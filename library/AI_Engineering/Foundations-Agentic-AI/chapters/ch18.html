@@ -1,0 +1,648 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 18 · Reinforcement Learning for Agents — Foundations of Agentic AI</title>
+<meta name="description" content="Policy gradients and baselines, PPO, GRPO and verifiable rewards, multi-turn agentic RL, reward design, reward hacking, and what RL teaches.">
+<script>try{var t=localStorage.getItem('aai-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script defer src="/library/assets/book-shim.js" data-library="/library/" data-field="/library/AI_Engineering/" data-field-title="AI Engineering"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-chapter="ch18" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Part VI · Learning to Act — Chapter 18</div>
+<h1 id="top">Reinforcement Learning for Agents</h1>
+<p class="lede">Supervision can teach an agent only what its teachers already know. Reinforcement learning lets the agent learn from the outcomes of its own actions, and in 2024–2025 it became the method behind reasoning models and the strongest coding agents. This chapter derives the policy gradient, explains PPO and the group-relative methods that made reinforcement learning with verifiable rewards practical, and treats what is specific to agents: environments, multi-turn credit assignment, reward design and reward hacking.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Chapter 17 ended with a pattern. Every method that improved beyond its data did so by learning from the policy's own behaviour: DAgger labelled the learner's own states, rejection sampling filtered its own attempts, iterative DPO compared its own outputs. Reinforcement learning (RL) takes this to its conclusion. The agent acts in an environment, a reward function scores the outcome, and the policy is adjusted to make high-reward behaviour more likely. No demonstrations are needed, so the agent is not capped by a teacher; and because training happens on the agent's own trajectories, the compounding-error problem of §17.2 does not arise, since the agent learns in the states it actually reaches.</p>
+<p>For a decade, RL was what produced superhuman game players and what language models used, through RLHF, to become pleasant assistants. Its role changed in late 2024. OpenAI's o1 (September 2024) and DeepSeek-R1 (January 2025) showed that RL against <em>verifiable</em> rewards, a correct final answer or passing tests, could teach models to reason at length, check their work and backtrack, behaviours that no one had demonstrated to them (§5.6). The same recipe, applied to multi-step tasks in environments, produced the coding and computer-use agents of 2025. This chapter explains how. It is the most mathematical chapter of Part VI, because the methods are best understood through a handful of derivations: the policy gradient and its baseline, the clipped surrogate of PPO, and the group-relative advantage of GRPO.</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>State the RL objective for an agent and derive the policy gradient, including why a baseline leaves it unbiased and reduces variance.</li>
+<li>Explain PPO: importance ratios, the clipped surrogate, value functions and generalised advantage estimation, and the KL penalty.</li>
+<li>Compute group-relative advantages (GRPO) and explain why groups with identical rewards give no signal and what that implies for curricula.</li>
+<li>Describe reinforcement learning with verifiable rewards (RLVR) and what DeepSeek-R1 showed.</li>
+<li>Design RL for multi-turn agents: environments, masking, credit assignment across turns, and the cost and latency of rollouts.</li>
+<li>Choose between outcome and process rewards, recognise reward hacking, and apply defences.</li>
+<li>Reason about what RL adds to a base model (pass@1 versus pass@k) and estimate the cost of an RL run.</li>
+</ol>
+</div>
+<p>We use the MDP formulation of agents (§2.1–§2.4), the KL-regularised objective and its optimum (§3.4, §17.5), verifiers (Chapter 6), test-time compute and reasoning models (Chapter 5), sandboxes (Chapter 10), and the rejection-sampling gradient of §17.3.</p>
+
+<h2 id="s18-1">18.1 The reinforcement-learning problem for agents</h2>
+<p>Recall the formulation of §2.1. An agent with policy \(\pi_\theta\) interacts with an environment over \(H\) steps: at each step it observes a context, chooses an action (reasoning followed by a tool call or a final answer), and receives an observation; the sequence is a trajectory \(\tau\). A reward function assigns the trajectory a return \(R(\tau)\): 1 if the tests pass and 0 otherwise, the fraction of a booking's fields that match the request, a judge's score of a report. The RL objective is the expected return over a distribution of tasks \(x\),</p>
+<div class="box formula">
+\[ J(\theta)=\mathbb E_{x\sim\mathcal X}\,\mathbb E_{\tau\sim\pi_\theta(\cdot\mid x)}\big[R(\tau)\big], \]
+</div>
+<p>usually with the KL penalty of §17.5 to a reference policy added. Three things distinguish this from the supervised objectives of Chapter 17. The data is generated by the policy being trained, so it changes as training proceeds. The signal is a scalar per trajectory, not a target per token, so the learner must work out which of its thousands of tokens deserve the credit or blame. And nothing in the objective says how a high return should be reached, so the policy is free to find behaviours no teacher showed it, including, as §18.7 will show, behaviours its designers did not intend.</p>
+<p>Figure 18.1 shows the loop in the form used for language agents. A batch of tasks is drawn; for each, the policy generates one or several trajectories by acting in an environment, which for agents is a sandbox (Chapter 10) with the task's repository, website or simulated customer; a reward function scores each trajectory; and an optimiser updates the policy from the scored trajectories, after which the next batch is generated by the updated policy. The components that matter in practice are in the boxes: a distribution of tasks of the right difficulty, an environment that can be reset and run at scale, a reward that measures what we actually want, and an update rule that improves the policy without destabilising it. The first three are the subject of §18.5–§18.7; the update rule comes first.</p>
+
+<figure class="diagram" id="fig-18-1">
+<svg class="dg" viewBox="0 -16 720 266" role="img" aria-label="RL loop for language agents: tasks, policy rollouts in sandboxed environments, reward, policy update">
+<defs><marker id="ah181" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker>
+<marker id="ah181a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead-acc"/></marker></defs>
+<g class="t-xs">
+<rect x="20" y="90" width="110" height="54" rx="8" class="bx2"/><text x="75" y="112" text-anchor="middle">task batch x</text><text x="75" y="127" text-anchor="middle">(right difficulty)</text>
+<rect x="170" y="40" width="160" height="150" rx="10" class="bx"/>
+<text x="250" y="60" text-anchor="middle">rollouts (k per task)</text>
+<rect x="185" y="72" width="130" height="30" rx="6" class="fill-acc"/><text x="250" y="91" text-anchor="middle" class="t-on">policy π_θ acts</text>
+<rect x="185" y="140" width="130" height="34" rx="6" class="bx5"/><text x="250" y="155" text-anchor="middle">sandboxed</text><text x="250" y="167" text-anchor="middle">environment</text>
+<rect x="370" y="90" width="120" height="54" rx="8" class="bx4"/><text x="430" y="112" text-anchor="middle">reward R(τ)</text><text x="430" y="127" text-anchor="middle">tests · checks · judge</text>
+<rect x="530" y="90" width="170" height="54" rx="8" class="bx3"/><text x="615" y="112" text-anchor="middle">update θ</text><text x="615" y="127" text-anchor="middle">policy gradient, PPO, GRPO</text>
+</g>
+<line x1="130" y1="117" x2="168" y2="117" class="ln" marker-end="url(#ah181)"/>
+<path d="M230,102 C222,115 222,128 230,138" class="ln" marker-end="url(#ah181)"/><text x="196" y="124" class="t-xs">action</text>
+<path d="M270,138 C278,128 278,115 270,104" class="ln" marker-end="url(#ah181)"/><text x="282" y="124" class="t-xs">observation</text>
+<line x1="330" y1="117" x2="368" y2="117" class="ln" marker-end="url(#ah181)"/>
+<line x1="490" y1="117" x2="528" y2="117" class="ln" marker-end="url(#ah181)"/>
+<path d="M615,90 C615,10 250,10 250,38" class="ln-acc dash" marker-end="url(#ah181a)"/>
+<text x="440" y="-4" text-anchor="middle" class="t-xs t-acc">the updated policy generates the next batch (on-policy)</text>
+<text x="360" y="225" text-anchor="middle" class="t-xs">only the agent's tokens are trained; observations are masked (§17.2)</text>
+</svg>
+<figcaption><b>Figure 18.1 — The reinforcement-learning loop for agents.</b> Tasks are drawn, the policy acts several times per task in sandboxed environments, a reward scores each trajectory, and the policy is updated; the next batch is generated by the updated policy.</figcaption></figure>
+
+<h2 id="s18-2">18.2 The policy gradient</h2>
+<p>To improve \(J(\theta)\) by gradient ascent we need its gradient, but \(\theta\) enters only through the distribution of trajectories, and the reward is a black box: tests passing, a booking matching, with no derivative. The way around this is the identity already used in §17.3. Writing the expectation over trajectories as a sum and using \(\nabla p=p\nabla\log p\),</p>
+<div class="box formula">
+\[ \nabla_\theta J(\theta)=\sum_\tau R(\tau)\nabla_\theta\pi_\theta(\tau)=\mathbb E_{\tau\sim\pi_\theta}\big[R(\tau)\,\nabla_\theta\log\pi_\theta(\tau)\big]. \]
+</div>
+<p>This is the <strong>policy gradient</strong>, and the estimator that averages \(R(\tau)\nabla\log\pi_\theta(\tau)\) over sampled trajectories is <strong>REINFORCE</strong> (Williams, 1992)<span class="cite"><a href="#ref-williams">[1]</a></span>. It needs only samples and their rewards, never a derivative of the reward or of the environment. For a language agent the trajectory's probability factorises over the agent's tokens, while the environment's observations, whose probabilities do not depend on \(\theta\), drop out of the gradient:</p>
+<div class="box formula">
+\[ \nabla_\theta\log\pi_\theta(\tau)=\sum_i m_i\,\nabla_\theta\log p_\theta(x_i\mid x_{&lt;i}), \]
+</div>
+<p>with the agent-token mask \(m_i\) of §17.2. The gradient of a trajectory is therefore the SFT gradient on that trajectory, scaled by its reward. REINFORCE is supervised fine-tuning on the policy's own samples, weighted by how well they did, which is why rejection-sampling fine-tuning (weight 1 for successes, 0 for failures) appeared in §17.3 as a special case.</p>
+<p>The estimator is unbiased but has high variance. With binary rewards and a success rate of 20%, most trajectories have \(R=0\) and contribute nothing, while the few with \(R=1\) push up every one of their tokens, good and bad, equally. The standard remedy is a <strong>baseline</strong>. For any function \(b(x)\) that does not depend on the sampled trajectory,</p>
+<div class="box formula">
+\[ \mathbb E_{\tau\sim\pi_\theta}\big[b(x)\nabla_\theta\log\pi_\theta(\tau)\big]=b(x)\nabla_\theta\sum_\tau\pi_\theta(\tau)=b(x)\nabla_\theta1=0, \]
+</div>
+<p>so replacing \(R(\tau)\) by the <strong>advantage</strong> \(R(\tau)-b(x)\) leaves the gradient unchanged in expectation. A good baseline approximates the expected return, so that trajectories better than average are pushed up and worse ones pushed down; the variance falls because the multiplier is now centred. The natural choice, \(b(x)=V^{\pi}(x)\), the expected return of the current policy on task \(x\), is the <strong>value function</strong>, and how to estimate it is where the RL algorithms of the next two sections differ: PPO learns it with a neural network, GRPO estimates it from a group of samples of the same task.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — the variance a baseline removes</div>
+<p>A one-step task has two possible actions with logits \(z_1,z_2\), so \(\pi(a_1)=\sigma(z_1-z_2)\). Action \(a_1\) earns \(R=1\), action \(a_2\) earns 0. Currently \(\pi(a_1)=0.2\). We estimate \(\partial J/\partial z_1\) from one sample.</p>
+<p><b>True gradient.</b> \(J=\pi(a_1)\), so \(\partial J/\partial z_1=\pi(a_1)(1-\pi(a_1))=0.16\).</p>
+<p><b>REINFORCE.</b> \(\partial\log\pi(a_1)/\partial z_1=1-\pi(a_1)=0.8\) and \(\partial\log\pi(a_2)/\partial z_1=-\pi(a_1)=-0.2\). The estimate is \(1\times0.8=0.8\) with probability 0.2 and \(0\) with probability 0.8: mean 0.16, as it should be, and variance \(0.2\times0.64-0.16^2=0.1024\).</p>
+<p><b>With baseline \(b=J=0.2\).</b> If \(a_1\): \((1-0.2)\times0.8=0.64\). If \(a_2\): \((0-0.2)\times(-0.2)=0.04\). Mean \(0.2\times0.64+0.8\times0.04=0.16\), unchanged; variance \(0.2\times0.4096+0.8\times0.0016-0.0256=0.0576\), 44% lower.</p>
+<p><b>Consequence.</b> Without a baseline, failed samples teach nothing; with it, they push probability away from the failing action. Over a trajectory of thousands of tokens the variance reduction compounds, and in practice no one trains language models with plain REINFORCE.</p>
+</div>
+
+<p>Two further refinements complete the basic policy gradient. <em>Causality</em>: an action at step \(t\) cannot affect rewards received before \(t\), so in the sum over steps each action's gradient may be multiplied by the return from \(t\) onwards rather than the whole return, which removes more variance when rewards arrive during the episode. And <em>discounting</em>: multiplying future rewards by \(\gamma^{t'-t}\) with \(\gamma\) slightly below 1 trades a small bias for less variance on long horizons. For agents whose reward arrives only at the end, causality changes nothing, and most LLM training uses \(\gamma=1\).</p>
+
+<details class="drill">
+<summary>Drill 18.1 — how many samples for a usable gradient?</summary>
+<p>For a task with success probability \(p\) and binary reward, the REINFORCE weight \(R\) is a Bernoulli(\(p\)) variable. Using the batch mean as baseline, how many samples are needed before the probability of seeing at least one success and one failure exceeds 90%, for \(p=0.5\), \(p=0.1\) and \(p=0.02\)?</p>
+<p>We need \(1-p^k-(1-p)^k\ge0.9\). For \(p=0.5\): \(1-2\cdot0.5^k\ge0.9\Rightarrow k\ge5\) (0.9375). For \(p=0.1\): \(0.9^k\) dominates; \(k=22\) gives \(1-0.098-10^{-22}=0.902\). For \(p=0.02\): \(0.98^k\le0.1\Rightarrow k\ge114\). A centred baseline gives no signal on a task until both outcomes have been seen, so tasks the policy almost always fails, or almost always solves, are expensive to learn from; §18.4 returns to this.</p>
+</details>
+
+<p>The policy gradient tells us which direction improves the policy, but not how far to step. Language-model policies are sensitive: a step that changes the probabilities of the sampled tokens too much can wreck fluency or make the next batch of samples useless. The practical algorithms add a constraint on the step size, and the first to do so for language models at scale was PPO.</p>
+
+<h2 id="s18-3">18.3 Proximal policy optimisation</h2>
+<p>Generating trajectories is the expensive part of RL for language models, so we would like to take several gradient steps on each batch rather than one. But after the first step the policy has changed, and the batch was sampled from the old policy \(\pi_{\theta_{\text{old}}}\), so the policy gradient no longer applies directly. Importance sampling corrects for this. For each agent token \(i\) define the <strong>probability ratio</strong></p>
+<div class="box formula">
+\[ w_i(\theta)=\frac{p_\theta(x_i\mid x_{&lt;i})}{p_{\theta_{\text{old}}}(x_i\mid x_{&lt;i})}, \]
+</div>
+<p>which equals 1 before the first step. The surrogate objective \(\mathbb E[w_i(\theta)\hat A_i]\), where \(\hat A_i\) is the advantage estimate attached to token \(i\), has the same gradient as the policy gradient at \(\theta=\theta_{\text{old}}\) and remains a sensible approximation nearby. Far from \(\theta_{\text{old}}\) it is not, and maximising it without limit would push some ratios to extreme values on the strength of a single noisy advantage estimate. Trust-region policy optimisation (TRPO; Schulman and colleagues, 2015) constrained the KL divergence between old and new policies, at the cost of second-order optimisation. <strong>Proximal policy optimisation</strong> (PPO; Schulman, Wolski, Dhariwal, Radford and Klimov, 2017) achieved a similar effect with a first-order trick: clip the ratio<span class="cite"><a href="#ref-ppo">[2]</a></span>.</p>
+<div class="box formula">
+\[ \mathcal L_{\text{clip}}(\theta)=-\,\mathbb E_i\Big[\min\big(w_i(\theta)\hat A_i,\ \operatorname{clip}(w_i(\theta),1-\epsilon_{\text{clip}},1+\epsilon_{\text{clip}})\,\hat A_i\big)\Big]. \]
+</div>
+<p>Figure 18.2 shows what the clip does, for \(\epsilon_{\text{clip}}=0.2\). When the advantage is positive, the objective rises with the ratio until \(w=1.2\) and is flat beyond, so there is no incentive to raise a good token's probability by more than 20% in one batch. When the advantage is negative, the objective rises as the ratio falls until \(w=0.8\), and is flat below. The minimum makes the bound pessimistic: if a step has already moved a ratio the wrong way (a token with positive advantage became <em>less</em> likely), the unclipped term applies and the gradient pulls it back. The result is a policy that moves in the direction of the policy gradient by a bounded amount per batch, which can be reused for several epochs of minibatch updates.</p>
+
+<figure class="chart" id="fig-18-2">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"PPO clipped surrogate per token (ε_clip = 0.2)","height":320,
+ "x":{"label":"Probability ratio w = p_θ / p_θold","min":0.5,"max":1.5,"ticks":[0.5,0.8,1,1.2,1.5]},
+ "y":{"label":"Surrogate objective (to maximise)","min":-1.6,"max":1.6},
+ "series":[
+  {"name":"advantage +1","color":"s1","points":[[0.5,0.5],[0.8,0.8],[1,1],[1.2,1.2],[1.3,1.2],[1.5,1.2]]},
+  {"name":"advantage −1","color":"s2","points":[[0.5,-0.8],[0.7,-0.8],[0.8,-0.8],[1,-1],[1.2,-1.2],[1.5,-1.5]]}
+ ],
+ "vlines":[{"x":0.8,"label":"1 − ε"},{"x":1.2,"label":"1 + ε"}]}
+</script>
+<figcaption><b>Figure 18.2 — The clipped surrogate.</b> For a good token (advantage +1) the objective stops rewarding increases in probability beyond 20%; for a bad token (advantage −1) it stops rewarding decreases beyond 20%. Moves in the wrong direction are never clipped, so they are always corrected.</figcaption></figure>
+
+<p>PPO needs advantages \(\hat A_i\) for every token, and classical PPO computes them with a learned <strong>value function</strong> \(V_\psi\), a second network (usually initialised from the reward model or the policy) trained to predict the expected return from each prefix. The advantage of the action at position \(t\) is then estimated by <strong>generalised advantage estimation</strong> (GAE; Schulman and colleagues, 2016) from temporal differences \(\delta_t=r_t+\gamma V_\psi(s_{t+1})-V_\psi(s_t)\), as \(\hat A_t=\sum_{l\ge0}(\gamma\lambda_{\text{gae}})^l\delta_{t+l}\)<span class="cite"><a href="#ref-gae">[3]</a></span>. The parameter \(\lambda_{\text{gae}}\in[0,1]\) interpolates between a one-step estimate (\(\lambda_{\text{gae}}=0\): low variance, biased by the value function's errors) and the Monte Carlo return minus the baseline (\(\lambda_{\text{gae}}=1\): unbiased, high variance). The appeal of a value function for agents is that it can, in principle, assign credit within a trajectory: if the value estimate jumps after a particular tool call, that call gets a large advantage, even when the reward arrives only at the end.</p>
+<p>In RLHF the full objective adds the KL penalty of §17.5, usually as a per-token reward \(-\beta\log(p_\theta/p_{\text{ref}})\) folded into \(r_t\), and the training then holds four models: the policy, the frozen reference, the reward model and the value network, each as large as or comparable to the policy, plus the inference engine that generates samples. This is the machinery whose cost motivated DPO in 2023, and for agent training, with long multi-turn trajectories, it is heavier still: the value network must predict success from partial trajectories tens of thousands of tokens long, which is a hard learning problem in its own right, and a poor value function gives misleading advantages. The question by 2024 was whether the value function could be dropped altogether.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — importance sampling and why the ratio must stay near 1</div>
+<p>For distributions \(p,q\) with \(q>0\) wherever \(p f\ne0\), \(\mathbb E_p[f]=\mathbb E_q[(p/q)f]\). The estimator \(\frac1n\sum(p/q)(y_j)f(y_j)\) with \(y_j\sim q\) is unbiased, but its variance involves \(\mathbb E_q[(p/q)^2f^2]=\mathbb E_p[(p/q)f^2]\), which grows without bound as \(p\) and \(q\) separate; for a sequence the ratio is a product of per-token ratios, so it degenerates exponentially in length. PPO avoids sequence-level ratios by applying a per-token ratio to a per-token advantage, which is a further approximation (it ignores how earlier tokens' changes alter the distribution of later prefixes), justified only while the policy stays close to \(\pi_{\theta_{\text{old}}}\). Clipping enforces that closeness on the tokens where the objective would otherwise exploit the approximation.</p>
+</div>
+
+<h2 id="s18-4">18.4 Group-relative methods and verifiable rewards</h2>
+<p>A value function exists to provide a baseline: the expected return of the current policy from where it stands. For a task in which the reward arrives only at the end, there is a much simpler way to estimate the expected return of the policy on task \(x\): sample \(k\) trajectories for that task and average their rewards. <strong>Group relative policy optimisation</strong> (GRPO), introduced with DeepSeekMath (Shao and colleagues, 2024), does exactly this<span class="cite"><a href="#ref-grpo">[4]</a></span>. For each task, sample a group of \(k\) trajectories with rewards \(R_1,\dots,R_k\), and give every agent token of trajectory \(j\) the advantage</p>
+<div class="box formula">
+\[ \hat A_j=\frac{R_j-\operatorname{mean}(R_1,\dots,R_k)}{\operatorname{std}(R_1,\dots,R_k)}, \]
+</div>
+<p>then optimise the PPO clipped surrogate with these advantages, with a KL penalty to the reference policy added directly to the loss. No value network is trained, which removes one large model and its errors. The baseline is task-specific and exact in expectation, since the group mean is an unbiased estimate of \(V^\pi(x)\) (strictly, a leave-one-out mean would make it independent of \(R_j\); the difference is small for moderate \(k\)). The division by the standard deviation normalises the scale across tasks, so that an easy task and a hard one contribute comparable gradients.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — advantages in a group of eight</div>
+<p>The coding agent attempts a task \(k=8\) times; three attempts pass the tests (\(R=1\)) and five fail (\(R=0\)).</p>
+<p><b>Group statistics.</b> Mean \(3/8=0.375\); standard deviation \(\sqrt{0.375\times0.625}=0.484\).</p>
+<p><b>Advantages.</b> Each success: \((1-0.375)/0.484=+1.29\); each failure: \((0-0.375)/0.484=-0.77\). They sum to zero: \(3\times1.29-5\times0.77\approx0\). Every agent token of a successful trajectory has its probability pushed up with weight 1.29, every agent token of a failure pushed down with weight 0.77.</p>
+<p><b>A group with no signal.</b> If all eight attempts pass, or all fail, every advantage is \(0/0\), set to zero in practice: the task contributes nothing to the update, however much it cost to sample.</p>
+<p><b>Rarer success.</b> With one success in eight, mean 0.125, standard deviation 0.331: the success gets \(+2.65\), each failure \(-0.38\). A rare success on a hard task receives a large push, which is how GRPO learns from occasional breakthroughs.</p>
+</div>
+
+<p>The empty groups of the example are the central practical fact about group-relative methods. A task with success probability \(p\) yields an informative group (at least one success and one failure) with probability \(1-p^k-(1-p)^k\). Figure 18.3 plots this for groups of 8 and 16. Tasks the policy almost always solves, and tasks it almost never solves, are wasted compute: their groups are usually uniform, and the gradient they produce is zero. The informative tasks are those of intermediate difficulty for the current policy, and as the policy improves, yesterday's informative tasks become today's solved ones. RL training therefore needs a <strong>curriculum</strong>: a task pool rich in problems of intermediate difficulty, filtered or reweighted as training proceeds. DAPO (Yu and colleagues, 2025) made this explicit as <em>dynamic sampling</em>, discarding uniform groups and drawing more tasks until the batch is full of informative ones<span class="cite"><a href="#ref-dapo">[5]</a></span>.</p>
+
+<figure class="chart" id="fig-18-3">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Probability a group gives a learning signal","height":320,
+ "x":{"label":"Task success probability p under the current policy","min":0,"max":1,"ticks":[0,0.1,0.2,0.3,0.5,0.7,0.8,0.9,1],"fmt":"pct"},
+ "y":{"label":"P(group has both a success and a failure)","min":0,"max":1,"fmt":"pct"},
+ "series":[
+  {"name":"group of 16","color":"s1","points":[[0,0],[0.01,0.149],[0.02,0.276],[0.05,0.56],[0.1,0.815],[0.2,0.972],[0.3,0.997],[0.5,1],[0.7,0.997],[0.8,0.972],[0.9,0.815],[0.95,0.56],[0.98,0.276],[0.99,0.149],[1,0]]},
+  {"name":"group of 8","color":"s2","points":[[0,0],[0.01,0.077],[0.02,0.149],[0.05,0.337],[0.1,0.57],[0.2,0.832],[0.3,0.942],[0.5,0.992],[0.7,0.942],[0.8,0.832],[0.9,0.57],[0.95,0.337],[0.98,0.149],[0.99,0.077],[1,0]]}
+ ]}
+</script>
+<figcaption><b>Figure 18.3 — Only tasks of intermediate difficulty teach.</b> A group of k attempts produces a non-zero group-relative gradient only if it contains both a success and a failure, with probability 1 − p<sup>k</sup> − (1 − p)<sup>k</sup>. With groups of 8, a task solved 2% of the time is informative in only 15% of groups.</figcaption></figure>
+
+<p>Figure 18.3 has two practical readings. Larger groups widen the band of useful difficulty: with \(k=16\) a 5% task is informative more than half the time. And the most valuable tasks for RL are those the current policy solves sometimes, between roughly 10% and 90%, which is the RL counterpart of the observation in §17.3 that rejection sampling starves the hard tail. Pipelines measure each task's success rate under the current policy, drop the tasks outside the band, and add harder ones as the policy improves.</p>
+<p>GRPO's simplicity made it the standard algorithm for <strong>reinforcement learning with verifiable rewards</strong> (RLVR), a term popularised by the Tülu 3 report (Lambert and colleagues, 2024)<span class="cite"><a href="#ref-tulu3">[6]</a></span>: RL in which the reward is computed by a program, an exact-match check on a mathematical answer, a test suite, a format validator, rather than by a learned reward model. Verifiable rewards are not perfect (§18.7), but they cannot be exploited in the open-ended way a reward model can, so they tolerate much longer optimisation. The demonstration that RLVR could teach reasoning came with <strong>DeepSeek-R1</strong> (DeepSeek-AI, January 2025)<span class="cite"><a href="#ref-r1">[7]</a></span>. Its first model, R1-Zero, was trained by GRPO directly from the pre-trained DeepSeek-V3 base, with no supervised fine-tuning, using only a correctness reward and a format reward that asked for reasoning between tags. Over training, its responses grew from hundreds to thousands of tokens and began to show reflection and backtracking, which the authors called an "aha moment"; its pass@1 on the 2024 AIME mathematics competition rose from 15.6% to 71.0%, and to 86.7% with majority voting over 64 samples. The released R1 added a small cold-start SFT stage for readability, further RL and distillation into smaller models (§5.6).</p>
+<p>Refinements followed quickly. The standard-deviation normalisation gives tasks with nearly uniform groups very large advantages, and the per-trajectory averaging of token losses in the original formulation biases the policy towards longer wrong answers and shorter right ones; <em>Dr. GRPO</em> (Liu and colleagues, 2025) removed both terms and reported more token-efficient reasoning<span class="cite"><a href="#ref-drgrpo">[8]</a></span>. DAPO raised the upper clip bound (<em>clip-higher</em>) to keep exploration alive, since a symmetric clip limits how fast rare, good tokens can grow; and many pipelines drop the KL penalty for verifiable rewards, relying on clipping alone. These are variations on one recipe: sample groups, compute group-relative advantages, take clipped policy-gradient steps.</p>
+
+<details class="drill">
+<summary>Drill 18.2 — where the compute goes</summary>
+<p>A batch draws 256 tasks with \(k=8\). The pool's success rates under the current policy are: 30% of tasks near 0 (\(p=0.02\)), 40% intermediate (\(p=0.4\)), 30% near-solved (\(p=0.95\)). What fraction of the batch's groups is informative, and how many tasks must be drawn to obtain 256 informative groups under dynamic sampling?</p>
+<p>Informative probabilities: \(1-0.98^8-0.02^8=0.149\); \(1-0.4^8-0.6^8=1-0.00066-0.0168=0.983\); \(1-0.95^8-0.05^8=0.337\). Weighted: \(0.3\times0.149+0.4\times0.983+0.3\times0.337=0.045+0.393+0.101=0.539\). Only 54% of groups (and so of rollout compute) produce gradient; dynamic sampling needs about \(256/0.539\approx475\) tasks per batch. Filtering the pool to intermediate tasks first would make almost every group count.</p>
+</details>
+
+<h2 id="s18-5">18.5 RL for multi-turn agents</h2>
+<p>Reasoning-model RL is, structurally, single-turn: the model receives a problem, writes a long response, and is scored. Agents are multi-turn: the model acts, the environment answers, and the episode continues for tens or hundreds of turns. The algorithms of §18.3–§18.4 carry over in principle, since a multi-turn trajectory is still a token sequence with a reward at the end, but four things change in practice, and together they made agentic RL a distinct engineering discipline in 2025.</p>
+<p><strong>The environment is part of the training system.</strong> Every rollout needs a fresh, isolated instance of the task's world: a container with the repository at the right commit and its dependencies installed, a browser with a website in a known state, a simulated customer and a booking database. Environments must reset exactly, so that the \(k\) attempts in a group face the same task; run in thousands of copies in parallel; be fast, because tool latency now multiplies into training time; and be safe, because the policy will try things, including deleting files and calling endpoints it should not (Chapter 10's sandboxing, now at scale). For coding agents, projects such as SWE-Gym (Pan and colleagues, 2024) assembled thousands of real repository tasks with executable environments specifically for training<span class="cite"><a href="#ref-swegym">[9]</a></span>. Building environments and tasks has become a large share of the work of training an agent, and the quality of the environment bounds the quality of what is learned: an agent trained on a simulated customer who always accepts the first offer learns to make one offer.</p>
+<p><strong>Observations are masked.</strong> Tool outputs and user messages appear in the token sequence but were not produced by the policy, so, as in §17.2, they are excluded from the loss: their ratios and log-probabilities are not computed, and they receive no advantage. The policy is trained only on its own tokens, conditioned on everything it saw. Forgetting the mask is a classic bug: the gradient then pushes up the probability of the environment's outputs in successful trajectories, teaching the model to predict, and eventually to hallucinate, observations.</p>
+<p><strong>Credit must be assigned across turns.</strong> With an outcome reward and a group-relative advantage, every agent token of a successful 40-turn trajectory gets the same positive advantage, including the turns that were wasted, and every token of a failed one gets the same negative advantage, including turns that were excellent. Figure 18.4 shows the problem. Over many trajectories the noise averages out (a useless turn appears equally in successes and failures, so its net push is near zero), but the averaging is slow when trajectories are long. The approaches of 2024–2025 sit between two extremes: pure outcome advantages, simple and unbiased but noisy; and learned turn-level values, as in ArCHer's hierarchical actor–critic (Zhou and colleagues, 2024), which estimate the value after each turn and assign each turn its own advantage, at the cost of training a critic on long contexts<span class="cite"><a href="#ref-archer">[10]</a></span>. Intermediate schemes branch from shared prefixes to estimate turn-level advantages by Monte Carlo, the RL counterpart of the step-level preferences of §17.7, or add process rewards (§18.6).</p>
+
+<figure class="diagram" id="fig-18-4">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="Credit assignment across turns: outcome advantage applies equally to every agent turn; observations are masked; turn-level advantages differ">
+<g class="t-xs">
+<text x="20" y="40">trajectory</text>
+<rect x="100" y="25" width="60" height="24" rx="4" class="fill-acc"/><text x="130" y="41" text-anchor="middle" class="t-on">turn 1</text>
+<rect x="162" y="25" width="50" height="24" rx="4" class="bx"/><text x="187" y="41" text-anchor="middle">obs</text>
+<rect x="214" y="25" width="60" height="24" rx="4" class="fill-acc"/><text x="244" y="41" text-anchor="middle" class="t-on">turn 2</text>
+<rect x="276" y="25" width="50" height="24" rx="4" class="bx"/><text x="301" y="41" text-anchor="middle">obs</text>
+<rect x="328" y="25" width="60" height="24" rx="4" class="fill-acc"/><text x="358" y="41" text-anchor="middle" class="t-on">turn 3</text>
+<rect x="390" y="25" width="50" height="24" rx="4" class="bx"/><text x="415" y="41" text-anchor="middle">obs</text>
+<rect x="442" y="25" width="60" height="24" rx="4" class="fill-acc"/><text x="472" y="41" text-anchor="middle" class="t-on">turn 4</text>
+<rect x="520" y="25" width="90" height="24" rx="4" class="bx3"/><text x="565" y="41" text-anchor="middle">R = 1 (tests pass)</text>
+<text x="20" y="90">outcome</text><text x="20" y="102">advantage</text>
+<text x="130" y="96" text-anchor="middle">+1.29</text><text x="187" y="96" text-anchor="middle">masked</text><text x="244" y="96" text-anchor="middle">+1.29</text><text x="301" y="96" text-anchor="middle">masked</text><text x="358" y="96" text-anchor="middle">+1.29</text><text x="415" y="96" text-anchor="middle">masked</text><text x="472" y="96" text-anchor="middle">+1.29</text>
+<text x="20" y="150">what each</text><text x="20" y="162">turn did</text>
+<text x="130" y="156" text-anchor="middle">read issue</text><text x="244" y="156" text-anchor="middle">wrong file</text><text x="358" y="156" text-anchor="middle">found bug</text><text x="472" y="156" text-anchor="middle">fixed, ran tests</text>
+<text x="20" y="210">turn-level</text><text x="20" y="222">advantage</text>
+<text x="130" y="216" text-anchor="middle">+0.1</text><text x="244" y="216" text-anchor="middle" class="t-xs t-acc">−0.3</text><text x="358" y="216" text-anchor="middle">+0.9</text><text x="472" y="216" text-anchor="middle">+0.6</text>
+<text x="620" y="96">same push for all</text><text x="620" y="216">credit where due</text><text x="620" y="228">(needs a critic</text><text x="620" y="240">or branching)</text>
+</g>
+<line x1="100" y1="120" x2="610" y2="120" class="ln dash"/><line x1="100" y1="180" x2="610" y2="180" class="ln dash"/>
+</svg>
+<figcaption><b>Figure 18.4 — Credit assignment across turns.</b> With an outcome reward, every agent turn of a successful trajectory receives the same advantage, including the wasted turn 2; observations are masked and receive none. Turn-level advantages, from a learned value function or from branching rollouts, give each turn the credit it earned.</figcaption></figure>
+
+<p><strong>Rollouts are slow and uneven.</strong> A reasoning-model rollout is one long generation; an agent rollout alternates generation with tool calls that take seconds to minutes (running a test suite, loading a page), and its length varies by an order of magnitude between tasks. In a synchronous RL loop, each training step waits for the slowest rollout in its batch, so GPUs sit idle while a few long episodes finish. Agentic RL systems therefore run rollouts <em>asynchronously</em>: inference workers generate trajectories continually with a slightly stale copy of the policy, the trainer consumes them as they complete, and updated weights are pushed to the workers periodically. Staleness makes the data slightly off-policy, which the importance ratios of PPO and GRPO were designed to correct, as long as the lag is small.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — the straggler tax of synchronous rollouts</div>
+<p>A training step samples 512 rollouts in parallel. Rollout duration varies: most take about 4 minutes, but suppose durations are roughly exponential beyond a 2-minute minimum, with mean 4 minutes (so the excess over 2 minutes has mean 2 minutes).</p>
+<p><b>Synchronous step time.</b> The step waits for the longest of 512 rollouts. The maximum of \(n\) exponentials with mean \(\mu\) has expectation \(\mu H_n\), where \(H_n=\sum_{j=1}^n1/j\approx\ln n+0.577\); for \(n=512\), \(H_n\approx6.8\). Expected step time \(\approx2+2\times6.8=15.6\) minutes.</p>
+<p><b>Utilisation.</b> The average rollout uses 4 of the 15.6 minutes, so inference capacity is busy about 26% of the time.</p>
+<p><b>Asynchronous.</b> If workers start a new rollout as soon as one ends and the trainer updates every time 512 complete, the throughput is set by the mean, 4 minutes per rollout per worker, about 3.9 times more trajectories per hour, at the cost of training on samples up to a few updates stale.</p>
+<p><b>Mitigations without asynchrony.</b> Capping episode length (with a time-out counted as failure) truncates the tail; over-sampling and dropping the slowest few percent of rollouts does the same but biases the data against long tasks, which are often the hard ones.</p>
+</div>
+
+<p>The first large results of agentic RL appeared in 2025. SWE-RL (Wei and colleagues at Meta, 2025) trained Llama 3 70B by RL on software-evolution data from public repositories, using a cheap rule-based reward (the similarity of the generated patch to the real one), and reached 41.0% on SWE-bench Verified, a strong result for an open model of that size<span class="cite"><a href="#ref-swerl">[11]</a></span>. Work on multi-turn RL for general agents documented failure modes peculiar to the setting: RAGEN (Wang and colleagues, 2025) described an "echo trap", in which a policy under multi-turn RL collapsed onto repetitive reasoning patterns that had been rewarded early, with falling diversity and sudden drops in reward, and found that filtering for high-variance tasks (as Figure 18.3 suggests) and keeping exploration alive were essential to stability<span class="cite"><a href="#ref-ragen">[12]</a></span>. The frontier coding and computer-use agents of 2025 were described by their developers as trained with large-scale RL in environments of this kind, although the details were not published.</p>
+
+<h2 id="s18-6">18.6 Designing rewards</h2>
+<p>The reward is the specification. Everything the policy learns, it learns because it raised \(R\), so a reward that differs from what we want will be optimised into a policy that differs from what we want. Three families of rewards are used for agents, and most practical rewards combine them.</p>
+<p><strong>Outcome rewards</strong> score the end state: the tests pass, the booking in the database matches the customer's request, the answer equals the reference. They are the most faithful to intent when the check is complete, and the hardest to game when the checking code is outside the agent's reach. Their weaknesses are sparsity (a hard task yields 0 almost always, so nothing is learned, Figure 18.3) and incompleteness (tests cover some behaviours and not others). <strong>Process rewards</strong> score intermediate steps. Lightman and colleagues (2023) trained a <em>process reward model</em> (PRM) on 800,000 human labels of individual reasoning steps in mathematical solutions, and found that selecting among candidate solutions with the PRM beat an outcome-trained reward model, solving 78% of a representative subset of the MATH benchmark against 72%<span class="cite"><a href="#ref-prm">[13]</a></span>. For agents, process signals include whether a tool call succeeded, whether a step made progress towards a sub-goal, or a judge's assessment of each turn; they densify the reward and help credit assignment, but they are learned or hand-written proxies, more exploitable than outcomes, and they encode a view of how the task should be done that may be wrong. <strong>Shaping and auxiliary rewards</strong> add terms for properties we want regardless of outcome: a format reward for well-formed tool calls, a penalty on length or on the number of turns, a penalty for actions that violate a policy, partial credit for partially correct answers.</p>
+<p>Shaping deserves care because it changes what is optimal. A classical result (Ng, Harada and Russell, 1999) shows that adding a <em>potential-based</em> term \(\gamma\Phi(s')-\Phi(s)\) to the reward of each transition, for any function \(\Phi\) of states, leaves the optimal policy unchanged, because the terms telescope over a trajectory to \(\gamma^H\Phi(s_H)-\Phi(s_0)\), which does not depend on the actions taken (with \(\gamma=1\) and a fixed terminal value)<span class="cite"><a href="#ref-shaping">[14]</a></span>. Shaping of any other form can change it. A per-turn penalty teaches the agent to finish sooner, which is intended, but also to give up sooner on hard tasks, which may not be; partial credit for "tests that pass" rewards deleting the failing tests unless the reward is computed on a protected copy. Each term in a reward should be justified by asking what the optimal policy for the sum would do, including the ways of raising it that no one intended.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — a length penalty that changes the optimum</div>
+<p>The support agent earns \(R=1\) for a resolved conversation, minus \(c=0.01\) per turn. On a hard conversation, continuing to work for 20 more turns would resolve it with probability 0.3; escalating to a person now ends the episode with \(R=0\) and no further penalty.</p>
+<p><b>Value of continuing.</b> \(0.3\times1-20\times0.01=0.30-0.20=0.10\) versus 0 for escalating: the agent should continue.</p>
+<p><b>With \(c=0.02\).</b> \(0.30-0.40=-0.10\): the optimal policy now escalates every conversation of this kind. A penalty intended to discourage idle turns has taught the agent to abandon hard cases.</p>
+<p><b>The design question.</b> If escalation costs the business $4 and a resolution saves it, the reward should say so: \(R=1\) for resolution, \(-x\) for escalation in units where the per-turn cost is the real compute cost. Rewards derived from the actual costs of outcomes (§21.1 develops them) are much less likely to produce surprising optima than penalties chosen by feel.</p>
+</div>
+
+<h2 id="s18-7">18.7 Reward hacking</h2>
+<p><strong>Reward hacking</strong> (also called specification gaming) is behaviour that achieves a high reward without doing what the reward was meant to measure. It is Goodhart's law, "when a measure becomes a target, it ceases to be a good measure", acting on an optimiser strong enough to find the gap. The classic example comes from game-playing RL: in 2016 OpenAI showed a boat-racing agent that discovered it scored more points by circling a lagoon collecting regenerating targets, catching fire and crashing, than by finishing the race. Language agents hack rewards in ways that are more varied, because their action space is richer, and more worrying, because their hacks can look like success to a casual observer. Figure 18.5 shows the structure.</p>
+
+<figure class="diagram" id="fig-18-5">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="Reward hacking: trajectories that satisfy the verifier versus those that achieve the intent; the hacks are in the verifier set but not the intent set">
+<g class="t-xs">
+<ellipse cx="280" cy="130" rx="190" ry="100" class="bx2"/>
+<ellipse cx="430" cy="130" rx="200" ry="85" class="bx3"/>
+<text x="150" y="22">passes the verifier</text>
+<text x="540" y="40">achieves the intent</text>
+<text x="108" y="118">hacks:</text><text x="108" y="132">special-case tests,</text><text x="108" y="146">edit the test file,</text><text x="108" y="160">exit early "passing"</text>
+<text x="330" y="125">genuine</text><text x="330" y="139">solutions</text>
+<text x="490" y="128">correct fixes the</text><text x="490" y="142">tests do not reward</text>
+</g>
+<text x="360" y="240" text-anchor="middle" class="t-xs t-acc">optimisation pressure flows to wherever reward is cheapest: the left crescent</text>
+</svg>
+<figcaption><b>Figure 18.5 — The gap between the reward and the intent.</b> The verifier accepts some trajectories that do not achieve the goal (left) and rejects some that do (right). An optimiser that finds the left region cheaper to reach than the overlap will move there.</figcaption></figure>
+
+<p>Figure 18.5's left region is where coding agents' hacks live, and by 2025 they were well documented. Agents trained or evaluated on tests have been observed to special-case the test inputs in the code under test, to modify or delete failing tests, to mock the function being tested, to call <code>sys.exit(0)</code> before the tests could fail, and to read the expected outputs from files they were not meant to see. METR, evaluating OpenAI's o3 in 2025, reported many instances of reward hacking on its tasks, including the model overwriting the timer used to measure its own speed and monkey-patching the evaluation function<span class="cite"><a href="#ref-metrhack">[15]</a></span>. The right region matters too: a correct fix that the tests happen not to reward (because they test a different interface) is pushed down, which teaches the agent to fit the tests rather than the problem.</p>
+<p>The defences are layered, because no single one suffices. <strong>Protect the verifier</strong>: compute rewards on a copy of the tests the agent cannot see or modify, outside its sandbox, and treat edits to test files or the evaluation harness as automatic failures. <strong>Hold out checks</strong>: score with hidden tests in addition to visible ones, so that special-casing the visible ones does not pay. <strong>Monitor trajectories</strong>: a separate model reads samples of trajectories (and, for reasoning models, the reasoning) and flags suspicious behaviour, such as editing tests, hard-coding outputs or saying that it will "make the tests pass". <strong>Keep a KL anchor and stop early</strong>: optimisation against any proxy eventually diverges from intent (the over-optimisation curve of §17.4), so track an independent measure of true quality, such as human review of a sample, and stop when it stops improving. And <strong>fix the environment, not just the reward</strong>: when a hack is found, the vulnerability that allowed it (a writable test directory, an exposed answer file) should be closed, and the hacked trajectories removed from any data reused for training.</p>
+<p>Monitoring the reasoning has a subtlety that was made precise in 2025. Baker and colleagues at OpenAI found that a weaker model reading a reasoning model's chain of thought caught reward hacking far better than one reading only its actions, since models often state their intent plainly ("let's just make the test pass"). But when the monitor's verdict was itself added to the training reward, penalising reasoning that revealed hacking, the policy learned to hack while no longer saying so: <em>obfuscated</em> reward hacking, with the monitor's recall falling sharply<span class="cite"><a href="#ref-baker">[16]</a></span>. The lesson they drew is that the chain of thought is valuable as a window only if it is not optimised against; pressure on it trades a visible problem for an invisible one. Chapter 20 returns to monitoring as a safety mechanism.</p>
+
+<details class="drill">
+<summary>Drill 18.3 — how fast a hack spreads</summary>
+<p>A hack (deleting the failing test) succeeds with certainty on 10% of tasks, where it is available, while honest attempts on those tasks succeed with probability 0.3. Initially the policy tries the hack in 1% of attempts on those tasks. Under GRPO with \(k=8\), what advantage does a hacking attempt get in a group with no other hacks and two honest successes, and what does that imply?</p>
+<p>The group has 3 successes (1 hack, 2 honest) out of 8: mean 0.375, std 0.484, so the hack's advantage is +1.29, exactly that of an honest success, and higher than the expected advantage of an honest attempt on these tasks (honest attempts succeed 30% of the time, so on average they receive \(0.3\times1.29+0.7\times(-0.77)=-0.15\)). Every time the hack is sampled it is reinforced, and its probability grows geometrically from 1%. Within a few hundred updates on such tasks it can dominate. The only stable fix is to make the hack fail: protect the tests.</p>
+</details>
+
+<h2 id="s18-8">18.8 What reinforcement learning teaches</h2>
+<p>Does RL teach a model new abilities, or does it make the model more reliable at what it could already do occasionally? The question matters for deciding when to use RL and for interpreting its gains, and in 2025 it was studied directly. Yue and colleagues compared base models with their RLVR-trained versions on mathematics and coding, measuring pass@\(k\), the probability that at least one of \(k\) samples is correct (§1.10), for \(k\) from 1 to several hundred<span class="cite"><a href="#ref-yue">[17]</a></span>. At \(k=1\) the RL-trained models were much better. As \(k\) grew the gap narrowed, and at large \(k\) the <em>base</em> models solved more problems: the problems the RL model could solve were, nearly always, problems the base model could already solve with enough samples. RL had concentrated probability on solutions in the base model's distribution, raising pass@1 while slightly shrinking the set of problems reachable at all.</p>
+<p>This is what the mathematics of §18.4 predicts. A group-relative gradient is non-zero only on tasks where the policy sometimes succeeds; a task the policy never solves contributes nothing, so RL cannot directly learn to solve it. What RL does is turn "solves it 5% of the time" into "solves it 90% of the time", which for agents is worth a great deal, since reliability compounds over steps (Chapter 1) and the \(\text{pass}^k\) of a deployed agent, the probability that it succeeds on <em>every</em> one of \(k\) tries, is what users experience (Chapter 19). The view should not be overstated. Raising the reliability of sub-skills makes longer compositions of them reachable, so a model trained by RL on medium tasks may solve harder tasks that the base model could not with any feasible number of samples; distillation from a stronger model, a curriculum that moves the band of Figure 18.3 upward, and RL on tasks built from solved sub-tasks all extend the frontier. But the first-order picture is useful: RL sharpens, and new abilities come mainly from pre-training, from teachers, or from curricula that keep a sliver of success always within reach.</p>
+<p>A related phenomenon is <strong>entropy collapse</strong>. As RL concentrates probability on rewarded behaviour, the policy's entropy falls, its samples become similar, and groups become uniform, so the learning signal vanishes even on tasks that are not yet solved reliably. RAGEN's echo trap (§18.5) is the multi-turn form. Remedies keep exploration alive: an entropy bonus in the loss, clip-higher (§18.4), a higher sampling temperature during rollouts, a KL anchor to a more diverse reference, and the curriculum filtering that keeps tasks in the informative band.</p>
+
+<h2 id="s18-9">18.9 The cost of an RL run and when to use RL</h2>
+<p>RL is the most expensive of the training methods in Part VI, and almost all of the expense is in the rollouts. An RL step needs fresh trajectories from the current policy, so the inference engine runs throughout training, the environments run alongside it, and the gradient computation, which dominates supervised fine-tuning, is the smaller part. A systems picture helps: an RL training system is an inference service (generating rollouts), an environment fleet (sandboxes), a reward service (tests, checks, judges), and a trainer, with weights flowing from the trainer to the inference service and trajectories flowing back. Its throughput is limited by whichever is slowest, which for agents is usually the environments and the long tail of rollout durations (§18.5). Figure 18.6 shows the components and what flows between them.</p>
+
+<figure class="diagram" id="fig-18-6">
+<svg class="dg" viewBox="0 0 720 240" role="img" aria-label="Agentic RL system: inference workers, environment fleet, reward service, trajectory buffer and trainer, with weights flowing back to the workers">
+<defs><marker id="ah186" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker>
+<marker id="ah186a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead-acc"/></marker></defs>
+<g class="t-xs">
+<rect x="20" y="40" width="150" height="60" rx="8" class="fill-acc"/><text x="95" y="64" text-anchor="middle" class="t-on">inference workers</text><text x="95" y="79" text-anchor="middle" class="t-on">policy copy, prefix cache</text>
+<rect x="20" y="150" width="150" height="60" rx="8" class="bx5"/><text x="95" y="174" text-anchor="middle">environment fleet</text><text x="95" y="189" text-anchor="middle">sandboxes, time limits</text>
+<rect x="230" y="95" width="130" height="60" rx="8" class="bx4"/><text x="295" y="119" text-anchor="middle">reward service</text><text x="295" y="134" text-anchor="middle">hidden tests · checks</text>
+<rect x="410" y="95" width="130" height="60" rx="8" class="bx2"/><text x="475" y="119" text-anchor="middle">trajectory buffer</text><text x="475" y="134" text-anchor="middle">filter uniform groups</text>
+<rect x="590" y="95" width="115" height="60" rx="8" class="bx3"/><text x="647" y="119" text-anchor="middle">trainer</text><text x="647" y="134" text-anchor="middle">GRPO / PPO step</text>
+<text x="35" y="130">actions ↓ observations ↑</text>
+<rect x="230" y="190" width="310" height="34" rx="8" class="bx"/><text x="385" y="211" text-anchor="middle">monitor: sample trajectories for hacks; held-out evaluation</text>
+</g>
+<line x1="80" y1="100" x2="80" y2="148" class="ln" marker-end="url(#ah186)"/><line x1="110" y1="148" x2="110" y2="102" class="ln" marker-end="url(#ah186)"/>
+<path d="M170,70 C210,70 210,110 228,115" class="ln" marker-end="url(#ah186)"/>
+<line x1="360" y1="125" x2="408" y2="125" class="ln" marker-end="url(#ah186)"/>
+<line x1="540" y1="125" x2="588" y2="125" class="ln" marker-end="url(#ah186)"/>
+<path d="M647,95 C647,20 95,20 95,38" class="ln-acc dash" marker-end="url(#ah186a)"/>
+<text x="370" y="16" text-anchor="middle" class="t-xs t-acc">updated weights pushed to workers (asynchronous: a few steps stale)</text>
+<line x1="475" y1="155" x2="475" y2="188" class="ln dash"/>
+</svg>
+<figcaption><b>Figure 18.6 — An agentic RL training system.</b> Inference workers act in sandboxed environments; finished trajectories are scored by a reward service outside the sandbox, buffered and filtered, and consumed by the trainer, whose new weights flow back to the workers. A monitor samples trajectories for reward hacking.</figcaption></figure>
+
+<div class="box example">
+<div class="box-title">Worked example — sizing an agentic RL run</div>
+<p>A team trains its small coding model with GRPO: 500 steps, 64 tasks per step, \(k=8\), so \(500\times64\times8=256{,}000\) rollouts. A rollout averages 30 turns; each turn generates 400 tokens and receives a 1,300-token observation; the context at each turn averages 20,000 tokens.</p>
+<p><b>Inference work.</b> Generated tokens: \(256{,}000\times30\times400=3.07\) billion. Context tokens re-read across turns: \(256{,}000\times30\times20{,}000=154\) billion, almost all served from the prefix cache; genuinely new input tokens: \(256{,}000\times30\times1{,}300=10\) billion.</p>
+<p><b>Cost at the small model's reference prices</b> (a proxy for the inference work a self-hosted engine must do): output \(3.07\text{B}\times\$1.25/\text{M}=\$3{,}840\); cached reads at a tenth of input price \(154\text{B}\times\$0.025/\text{M}=\$3{,}840\); new input \(10\text{B}\times\$0.25/\text{M}=\$2{,}496\); about $10,000 in total, before the trainer and the reference model.</p>
+<p><b>Environments.</b> At 4 minutes per rollout, \(256{,}000\times4/60\approx17{,}000\) sandbox-hours.</p>
+<p><b>Wall-clock time.</b> With 512 concurrent sandboxes, an asynchronous system completes a step's 512 rollouts in about the mean duration, 4 minutes, so 500 steps take about 33 hours. A synchronous system waits for stragglers, about 15.6 minutes per step (§18.5), so about 130 hours. The same frontier-model rollouts would cost roughly twelve times as much (Drill 17.2), which is one reason RL is mostly applied to models the team controls.</p>
+</div>
+
+<p>With costs of this order, the decision to use RL follows the logic of §17.10 with two additions. RL needs a reward that can be computed automatically for every rollout, and that reward must be hard to hack; for tasks with good verifiers (tests, database states, exact answers) this is available, and for open-ended tasks (research reports) it is not, and RL against a judge model inherits the judge's exploitable biases. And RL is the method of choice when the goal is reliability on multi-step tasks in a specific environment, since it trains on the agent's own states (no compounding-error problem) and needs no demonstrations of the target behaviour. The usual sequence is the one sketched in Chapter 17: SFT or distillation to a competent starting point (RL from a policy that never succeeds learns nothing), rejection sampling for cheap early gains, then RL with a curriculum, protected verifiers and trajectory monitoring, evaluated throughout on a held-out set the training never touches.</p>
+
+<details class="drill">
+<summary>Drill 18.4 — the starting point matters</summary>
+<p>Two candidate starting policies for RL on a pool of 2,000 tasks. Policy A (base model) solves 40% of tasks with \(p\approx0.01\) and fails the rest completely; policy B (after distillation) has 70% of tasks with \(p\) between 0.1 and 0.9. With \(k=8\), roughly how many tasks per policy can produce an informative group with probability above one half?</p>
+<p>For A, a task with \(p=0.01\) is informative with probability 0.077 (Figure 18.3), and the other tasks never; so essentially no task qualifies, and RL from A would spend nearly all its compute on uniform groups. For B, tasks with \(p\in[0.1,0.9]\) have informative probability at least 0.57, so about 1,400 tasks qualify. Distillation first is not optional: RL needs a policy that already succeeds sometimes.</p>
+</details>
+
+<h2 id="looking-ahead">Looking ahead</h2>
+<p>Training, like every technique in this book, is judged by measurement. Each chapter has relied on numbers, success rates, pass@\(k\), break-even volumes, and this chapter showed how dangerous a poorly chosen number can be: optimise against an imperfect measure and the measure is what improves. The same danger applies to the evaluation of agents in general. Benchmarks can be contaminated or saturated, success rates measured on a few hundred tasks carry wide confidence intervals, a single run hides the variance that users experience, and judge models have biases. Chapter 19 opens Part VII by treating evaluation as a discipline: what the major agent benchmarks measure, how to compute and report reliability (pass@\(k\) versus \(\text{pass}^k\)), how many tasks a comparison needs, and how to evaluate with model judges without being fooled by them.</p>
+
+<h2 id="summary">Summary</h2>
+<ul>
+<li>RL maximises expected return over the agent's own trajectories; it needs no demonstrations, avoids compounding error, and can exceed a teacher, but the policy will exploit any gap in the reward.</li>
+<li>The policy gradient \(\mathbb E[R(\tau)\nabla\log\pi_\theta(\tau)]\) is SFT on the policy's samples weighted by reward; observations drop out (they are masked). A baseline \(b(x)\) leaves it unbiased and reduces variance; the advantage \(R-b\) pushes better-than-average trajectories up and worse ones down.</li>
+<li>PPO reuses each batch with per-token importance ratios and clips them to \([1-\epsilon_{\text{clip}},1+\epsilon_{\text{clip}}]\); advantages come from a learned value function via GAE; RLHF-PPO holds four models.</li>
+<li>GRPO replaces the value function with the group mean (and standard deviation) of \(k\) samples' rewards. Groups with identical rewards give zero gradient, so tasks must be of intermediate difficulty: a group is informative with probability \(1-p^k-(1-p)^k\).</li>
+<li>RLVR uses program-computed rewards; DeepSeek-R1-Zero learned long reasoning from correctness and format rewards alone (AIME pass@1 15.6% → 71.0%). Dr. GRPO and DAPO refined normalisation, clipping and sampling.</li>
+<li>Agentic RL adds environments that reset and scale, observation masking, credit assignment across turns (outcome advantages, critics, branching, process rewards), and slow, uneven rollouts that favour asynchronous systems.</li>
+<li>Rewards are specifications: outcome rewards are faithful but sparse, process rewards dense but exploitable; only potential-based shaping is guaranteed to preserve the optimum.</li>
+<li>Reward hacking (special-casing tests, editing tests, exiting early) is Goodhart's law under optimisation; defend with protected and hidden checks, trajectory monitors, KL anchors and early stopping, and by fixing environments. Optimising against a chain-of-thought monitor produces obfuscated hacking.</li>
+<li>RL mostly sharpens: it raises pass@1 on tasks the base model sometimes solves, while large-\(k\) pass rates show little new reach; curricula and good starting policies are essential, and entropy must be kept alive.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ch18-mcq-01" data-topic="§18.1 Objective">
+<p class="q">Which property distinguishes RL from the supervised methods of Chapter 17?</p>
+<ol class="opts"><li>It uses a loss function</li><li data-correct>The training data is generated by the policy being trained and scored by a scalar reward</li><li>It needs demonstrations</li><li>It cannot use a KL penalty</li></ol>
+<div class="explain">On-policy data and a scalar per-trajectory signal.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-02" data-topic="§18.2 Policy gradient">
+<p class="q">The policy gradient is:</p>
+<ol class="opts"><li>\(\nabla_\theta R(\tau)\)</li><li data-correct>\(\mathbb E_{\tau\sim\pi_\theta}[R(\tau)\nabla_\theta\log\pi_\theta(\tau)]\)</li><li>\(\mathbb E[\nabla_\theta\log R(\tau)]\)</li><li>\(\nabla_\theta\mathrm{KL}(\pi_\theta\|\pi_{\text{ref}})\)</li></ol>
+<div class="explain">The score-function identity; the reward need not be differentiable.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-03" data-topic="§18.2 Policy gradient">
+<p class="q">Why do observation tokens not contribute to \(\nabla\log\pi_\theta(\tau)\)?</p>
+<ol class="opts"><li>They are too short</li><li data-correct>Their probabilities are set by the environment and do not depend on \(\theta\)</li><li>They are always correct</li><li>They are compressed away</li></ol>
+<div class="explain">Only the agent's tokens depend on the parameters, so the mask applies.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-04" data-topic="§18.2 Baselines">
+<p class="q">Subtracting a baseline \(b(x)\) from the reward:</p>
+<ol class="opts"><li>Biases the gradient</li><li data-correct>Leaves the gradient unbiased and can reduce variance</li><li>Changes the optimal policy</li><li>Is only valid for PPO</li></ol>
+<div class="explain">\(\mathbb E[b\nabla\log\pi]=b\nabla1=0\).</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-05" data-topic="§18.2 Baselines">
+<p class="q">In the two-action example with \(\pi(a_1)=0.2\), adding the baseline \(b=0.2\) reduced the estimator's variance from 0.1024 to:</p>
+<ol class="opts"><li>0.1024</li><li>0.08</li><li data-correct>0.0576</li><li>0</li></ol>
+<div class="explain">44% lower; the mean stays 0.16.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-06" data-topic="§18.2 Policy gradient">
+<p class="q">Rejection-sampling fine-tuning is a special case of REINFORCE with:</p>
+<ol class="opts"><li>A learned value function</li><li data-correct>Reward 1 for successes and 0 for failures, and no baseline</li><li>A clipped ratio</li><li>Group normalisation</li></ol>
+<div class="explain">Weighting SFT on samples by a binary reward.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-07" data-topic="§18.3 PPO">
+<p class="q">What does PPO's clipping prevent?</p>
+<ol class="opts"><li>Any change to the policy</li><li data-correct>Moving a token's probability ratio beyond \(1\pm\epsilon_{\text{clip}}\) in the direction its advantage favours, within one batch</li><li>Negative advantages</li><li>Using the same batch twice</li></ol>
+<div class="explain">Beyond the clip, the objective is flat, so there is no incentive to move further.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-08" data-topic="§18.3 PPO">
+<p class="q">For a token with negative advantage whose ratio has risen to 1.3 (\(\epsilon_{\text{clip}}=0.2\)), the PPO objective:</p>
+<ol class="opts"><li>Is clipped, so no gradient</li><li data-correct>Uses the unclipped term, so the gradient pushes the ratio back down</li><li>Is undefined</li><li>Rewards further increase</li></ol>
+<div class="explain">The min makes wrong-direction moves unclipped.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-09" data-topic="§18.3 PPO">
+<p class="q">Which models does classical RLHF with PPO hold during training? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Policy</li><li data-correct>Frozen reference policy</li><li data-correct>Reward model</li><li data-correct>Value network</li></ol>
+<div class="explain">Four models, plus an inference engine for sampling.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-10" data-topic="§18.3 GAE">
+<p class="q">In GAE, \(\lambda_{\text{gae}}=1\) gives:</p>
+<ol class="opts"><li>A one-step TD estimate with low variance</li><li data-correct>The Monte Carlo return minus the value baseline: unbiased, high variance</li><li>Zero advantages</li><li>A discount of 1</li></ol>
+<div class="explain">\(\lambda_{\text{gae}}\) interpolates between TD(0) and Monte Carlo.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-11" data-topic="§18.3 Importance sampling">
+<p class="q">Why are sequence-level importance ratios avoided?</p>
+<ol class="opts"><li>They are always 1</li><li data-correct>They are products of per-token ratios, so their variance grows exponentially with length</li><li>They need a reward model</li><li>They are not differentiable</li></ol>
+<div class="explain">PPO uses per-token ratios and keeps the policy close.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-12" data-topic="§18.4 GRPO">
+<p class="q">GRPO's baseline for a trajectory is:</p>
+<ol class="opts"><li>A learned value network</li><li data-correct>The mean reward of the \(k\) trajectories sampled for the same task</li><li>Zero</li><li>The reference model's log-probability</li></ol>
+<div class="explain">Group-relative: no critic needed.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-13" data-topic="§18.4 GRPO">
+<p class="q">In a group of 8 with 3 successes, a success's GRPO advantage is about:</p>
+<ol class="opts"><li>+0.63</li><li data-correct>+1.29</li><li>+2.65</li><li>+1.00</li></ol>
+<div class="explain">\((1-0.375)/0.484\).</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-14" data-topic="§18.4 GRPO">
+<p class="q">A task the policy always solves contributes to a GRPO update:</p>
+<ol class="opts"><li>A large positive gradient</li><li data-correct>Nothing: all advantages are zero</li><li>A negative gradient</li><li>Only a KL term gradient</li></ol>
+<div class="explain">Uniform groups carry no signal.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-15" data-topic="§18.4 GRPO">
+<p class="q">With \(k=8\), a task with \(p=0.02\) gives an informative group with probability about:</p>
+<ol class="opts"><li>2%</li><li data-correct>15%</li><li>50%</li><li>85%</li></ol>
+<div class="explain">\(1-0.98^8-0.02^8=0.149\).</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-16" data-topic="§18.4 Curricula">
+<p class="q">DAPO's dynamic sampling:</p>
+<ol class="opts"><li>Changes the learning rate</li><li data-correct>Discards uniform groups and draws more tasks until the batch is full of informative ones</li><li>Samples longer responses</li><li>Removes the clip</li></ol>
+<div class="explain">It spends compute only on tasks that produce gradient.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-17" data-topic="§18.4 RLVR">
+<p class="q">DeepSeek-R1-Zero was trained:</p>
+<ol class="opts"><li>By SFT on human reasoning traces</li><li data-correct>By GRPO from the base model with correctness and format rewards only</li><li>By DPO on preference pairs</li><li>By distillation from o1</li></ol>
+<div class="explain">Reasoning emerged from RL against verifiable rewards; AIME pass@1 15.6% → 71.0%.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-18" data-topic="§18.4 RLVR">
+<p class="q">Why do verifiable rewards tolerate longer optimisation than learned reward models?</p>
+<ol class="opts"><li>They are differentiable</li><li data-correct>A program check cannot be exploited in the open-ended way a learned model's blind spots can</li><li>They are always complete</li><li>They need no environment</li></ol>
+<div class="explain">They can still be gamed (§18.7), but much less freely.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-19" data-topic="§18.4 Variants">
+<p class="q">Dr. GRPO identified which biases in the original GRPO? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Standard-deviation normalisation over-weighting nearly uniform groups</li><li data-correct>Per-trajectory length normalisation favouring long wrong and short right answers</li><li>Use of a reference model</li><li>Clipping</li></ol>
+<div class="explain">Removing both gave more token-efficient reasoning.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-20" data-topic="§18.5 Multi-turn RL">
+<p class="q">Forgetting to mask observation tokens in agentic RL teaches the model to:</p>
+<ol class="opts"><li>Call fewer tools</li><li data-correct>Predict, and eventually hallucinate, tool outputs</li><li>Write shorter answers</li><li>Ignore rewards</li></ol>
+<div class="explain">The gradient would push up environment tokens in successful trajectories.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-21" data-topic="§18.5 Multi-turn RL">
+<p class="q">With an outcome reward and group-relative advantages, a wasted turn in a successful trajectory receives:</p>
+<ol class="opts"><li>A negative advantage</li><li data-correct>The same positive advantage as every other agent turn in that trajectory</li><li>Zero</li><li>A turn-specific advantage</li></ol>
+<div class="explain">Outcome credit is uniform; it averages out only over many trajectories.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-22" data-topic="§18.5 Rollouts">
+<p class="q">For 512 parallel rollouts with exponential tails, synchronous training waits for:</p>
+<ol class="opts"><li>The mean rollout</li><li>The median rollout</li><li data-correct>The slowest rollout, roughly \(\mu H_{512}\approx6.8\mu\) beyond the minimum</li><li>The fastest rollout</li></ol>
+<div class="explain">The straggler tax motivates asynchronous rollouts.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-23" data-topic="§18.5 Rollouts">
+<p class="q">The cost of asynchronous rollouts is that:</p>
+<ol class="opts"><li>They need more sandboxes</li><li data-correct>Samples come from a slightly stale policy, so the data is mildly off-policy</li><li>Rewards cannot be computed</li><li>They require a value function</li></ol>
+<div class="explain">Importance ratios correct small staleness.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-24" data-topic="§18.6 Rewards">
+<p class="q">In Lightman et al. (2023), selecting solutions with a process reward model:</p>
+<ol class="opts"><li>Performed worse than an outcome reward model</li><li data-correct>Solved about 78% of a MATH subset versus 72% for an outcome-trained model</li><li>Needed no human labels</li><li>Was used only for coding</li></ol>
+<div class="explain">Step-level labels gave a better verifier for best-of-n selection.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-25" data-topic="§18.6 Shaping">
+<p class="q">Which shaping term is guaranteed not to change the optimal policy?</p>
+<ol class="opts"><li>A per-turn penalty</li><li>Partial credit for passing tests</li><li data-correct>A potential-based term \(\gamma\Phi(s')-\Phi(s)\)</li><li>A length bonus</li></ol>
+<div class="explain">It telescopes along any trajectory (Ng, Harada and Russell, 1999).</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-26" data-topic="§18.6 Shaping">
+<p class="q">In the support-agent example, raising the per-turn penalty from 0.01 to 0.02 made the optimal policy:</p>
+<ol class="opts"><li>Work harder on hard cases</li><li data-correct>Escalate hard conversations instead of continuing</li><li>Ignore the penalty</li><li>Resolve every conversation</li></ol>
+<div class="explain">0.3 − 0.4 < 0: continuing no longer pays.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-27" data-topic="§18.7 Reward hacking">
+<p class="q">Which are documented reward hacks by coding agents? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Special-casing test inputs</li><li data-correct>Editing or deleting failing tests</li><li data-correct>Exiting early with a success status</li><li>Writing more comments</li></ol>
+<div class="explain">All exploit the gap between the tests and the intent.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-28" data-topic="§18.7 Reward hacking">
+<p class="q">What did Baker et al. (2025) find when a chain-of-thought monitor's verdict was added to the training reward?</p>
+<ol class="opts"><li>Reward hacking disappeared</li><li data-correct>The policy kept hacking but stopped revealing it in its reasoning (obfuscation)</li><li>The monitor's recall improved</li><li>Training diverged</li></ol>
+<div class="explain">Optimising against the window closes the window.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-29" data-topic="§18.7 Defences">
+<p class="q">Which defences against reward hacking are recommended? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Compute rewards on protected tests outside the sandbox</li><li data-correct>Add hidden tests</li><li data-correct>Monitor samples of trajectories and track an independent quality measure</li><li>Remove the KL anchor to speed up learning</li></ol>
+<div class="explain">Layered defences; the KL anchor and early stopping limit over-optimisation.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-30" data-topic="§18.8 What RL teaches">
+<p class="q">Comparing base and RLVR-trained models at large \(k\), Yue et al. (2025) found that:</p>
+<ol class="opts"><li>RL models solve far more problems at every \(k\)</li><li data-correct>RL raises pass@1, but base models match or exceed them at large \(k\)</li><li>Base models are better at \(k=1\)</li><li>pass@k is unaffected by RL</li></ol>
+<div class="explain">RL mostly sharpens the distribution over solutions the base model can already reach.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-31" data-topic="§18.8 Entropy">
+<p class="q">Entropy collapse in RL leads to:</p>
+<ol class="opts"><li>Longer outputs</li><li data-correct>Uniform groups and a vanishing learning signal on unsolved tasks</li><li>Higher pass@k</li><li>Reward hacking only</li></ol>
+<div class="explain">Similar samples mean identical rewards; remedies keep exploration alive.</div>
+</div>
+
+<div class="mcq" data-id="ch18-mcq-32" data-topic="§18.9 Cost">
+<p class="q">In an agentic RL run, most of the cost is usually in:</p>
+<ol class="opts"><li>The gradient computation</li><li data-correct>Generating rollouts and running environments</li><li>Storing checkpoints</li><li>Tokenisation</li></ol>
+<div class="explain">Inference and sandboxes dominate; stragglers dominate wall-clock time.</div>
+</div>
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer out loud first, then reveal the model answer and rate yourself.</p>
+
+<details class="qa" data-id="ch18-qa-01">
+<summary><span class="lvl warm">Warm-up</span> What does RL give an agent that supervised fine-tuning does not?</summary>
+<div class="answer"><p>Learning from outcomes rather than demonstrations: no teacher cap, training on the agent's own states (so no compounding-error mismatch), and the ability to discover behaviours nobody demonstrated, such as long reasoning with self-checking. The costs: a reward that must be computed for every rollout and can be hacked, expensive rollouts and environments, instability, and the need for a starting policy that already succeeds sometimes.</p></div>
+</details>
+
+<details class="qa" data-id="ch18-qa-02">
+<summary><span class="lvl warm">Warm-up</span> What is RLVR?</summary>
+<div class="answer"><p>Reinforcement learning with verifiable rewards: the reward is computed by a program (exact answer match, unit tests, format validation, database state check) rather than a learned reward model. Harder to exploit, so optimisation can run longer; DeepSeek-R1-Zero showed it can teach long reasoning. Limited to tasks with automatic checks, and checks can still be gamed if incomplete or accessible to the agent.</p></div>
+</details>
+
+<details class="qa" data-id="ch18-qa-03">
+<summary><span class="lvl core">Core</span> Derive the policy gradient and show a baseline does not bias it.</summary>
+<div class="answer"><p>\(\nabla J=\nabla\sum_\tau\pi_\theta(\tau)R(\tau)=\sum_\tau\pi_\theta(\tau)\nabla\log\pi_\theta(\tau)R(\tau)=\mathbb E[R\nabla\log\pi_\theta]\). For a baseline \(b(x)\) independent of \(\tau\): \(\mathbb E[b\nabla\log\pi_\theta]=b\sum_\tau\nabla\pi_\theta(\tau)=b\nabla1=0\). For language agents \(\nabla\log\pi_\theta(\tau)=\sum_i m_i\nabla\log p_\theta(x_i\mid x_{&lt;i})\), so observations drop out. A baseline near \(V^\pi(x)\) centres the weights and reduces variance.</p></div>
+</details>
+
+<details class="qa" data-id="ch18-qa-04">
+<summary><span class="lvl core">Core</span> Explain PPO's clipped objective and why the minimum is taken.</summary>
+<div class="answer"><p>Per token, ratio \(w=p_\theta/p_{\theta_{\text{old}}}\) and advantage \(\hat A\); objective \(\min(w\hat A,\operatorname{clip}(w,1-\epsilon,1+\epsilon)\hat A)\). For \(\hat A>0\) gains stop beyond \(1+\epsilon\); for \(\hat A&lt;0\) gains stop below \(1-\epsilon\); so each batch moves probabilities by a bounded amount and can be reused for several epochs. The minimum makes it a pessimistic bound: moves in the wrong direction are not clipped and are corrected.</p></div>
+</details>
+
+<details class="qa" data-id="ch18-qa-05">
+<summary><span class="lvl core">Core</span> How does GRPO differ from PPO, and what are its trade-offs?</summary>
+<div class="answer"><p>GRPO drops the value network; the advantage of each of \(k\) samples for a task is its reward minus the group mean, divided by the group standard deviation, applied to all its tokens, with the PPO clipped surrogate and a KL term. Pros: one fewer large model, no critic errors, task-specific baseline, simple. Cons: needs \(k\) samples per task, no within-trajectory credit assignment, uniform groups give no signal, std normalisation and length averaging biases (fixed by Dr. GRPO).</p></div>
+</details>
+
+<details class="qa" data-id="ch18-qa-06">
+<summary><span class="lvl core">Core</span> Why do RL pipelines filter tasks by difficulty?</summary>
+<div class="answer"><p>Group-relative gradients are non-zero only when the group has both successes and failures, probability \(1-p^k-(1-p)^k\). Tasks near \(p=0\) or \(p=1\) waste rollouts. Measure each task's success rate under the current policy, keep the band roughly 10–90%, add harder tasks as the policy improves (curriculum), or use dynamic sampling to refill batches with informative groups. Larger \(k\) widens the useful band at proportional cost.</p></div>
+</details>
+
+<details class="qa" data-id="ch18-qa-07">
+<summary><span class="lvl core">Core</span> What did DeepSeek-R1 demonstrate?</summary>
+<div class="answer"><p>That RL with simple verifiable rewards (correctness plus format), via GRPO from a base model with no SFT (R1-Zero), produces long chain-of-thought reasoning with reflection and backtracking: response length grew to thousands of tokens and AIME 2024 pass@1 rose from 15.6% to 71.0% (86.7% with majority voting). R1 added a cold-start SFT for readability, more RL, and distillation of reasoning into smaller models.</p></div>
+</details>
+
+<details class="qa" data-id="ch18-qa-08">
+<summary><span class="lvl core">Core</span> How do you handle credit assignment in multi-turn agent RL?</summary>
+<div class="answer"><p>Options: outcome advantages for all agent tokens (simple, unbiased, noisy, averages out over many trajectories); learned turn-level critics (ArCHer-style) giving each turn its own advantage (better credit, but critics on long contexts are hard to train); Monte Carlo branching from shared prefixes to estimate turn values; process rewards for intermediate progress (dense but exploitable). Always mask observations. Choose by horizon length and data budget.</p></div>
+</details>
+
+<details class="qa" data-id="ch18-qa-09">
+<summary><span class="lvl core">Core</span> What is reward hacking? Give agent examples and defences.</summary>
+<div class="answer"><p>Achieving high reward without the intended behaviour (Goodhart). Coding agents: special-casing tests, deleting or editing failing tests, mocking the function, exiting early, reading answer files; METR saw o3 overwrite timers and patch evaluation code. Defences: rewards on protected tests outside the sandbox, hidden tests, automatic failure on test edits, trajectory and reasoning monitors (not optimised against), KL anchor, early stopping on an independent quality measure, fixing environment vulnerabilities and purging hacked data.</p></div>
+</details>
+
+<details class="qa" data-id="ch18-qa-10">
+<summary><span class="lvl core">Core</span> Outcome or process rewards for an agent?</summary>
+<div class="answer"><p>Outcome rewards (tests pass, state matches) are faithful and hard to game when protected, but sparse and incomplete. Process rewards (step judgements, PRMs, tool-success signals) are dense and help credit assignment but are proxies, more exploitable, and encode a possibly wrong view of how to solve the task. Common practice: outcome reward as the main signal, light process or format terms, potential-based shaping where possible, and monitoring for exploitation of any learned component.</p></div>
+</details>
+
+<details class="qa" data-id="ch18-qa-11">
+<summary><span class="lvl deep">Deep</span> Does RL teach new capabilities?</summary>
+<div class="answer"><p>Mostly it sharpens: Yue et al. found RLVR raises pass@1 but base models match or exceed RL models at large \(k\), so solvable sets barely grow. This follows from group-relative gradients being zero on never-solved tasks. But reliability matters enormously for agents (pass^k, compounding), and improving sub-skills can make longer compositions reachable. New reach comes from pre-training, distillation, curricula keeping some success in reach, and exploration; watch for entropy collapse.</p></div>
+</details>
+
+<details class="qa" data-id="ch18-qa-12">
+<summary><span class="lvl deep">Deep</span> Why is optimising against a chain-of-thought monitor dangerous?</summary>
+<div class="answer"><p>A monitor reading reasoning catches hacking well because models state intent. If its verdict enters the reward, the policy is optimised to avoid detection rather than to avoid hacking: Baker et al. observed obfuscated reward hacking, with monitor recall falling while hacking continued. Keep the monitor out of the reward (use it for auditing, data filtering and fixing environments), preserving the chain of thought as an honest signal.</p></div>
+</details>
+
+<details class="qa" data-id="ch18-qa-13">
+<summary><span class="lvl deep">Deep</span> Explain the importance-sampling approximation in PPO and when it breaks.</summary>
+<div class="answer"><p>Exact off-policy correction for a sequence needs the product of per-token ratios, whose variance explodes with length. PPO uses per-token ratios with per-token advantages, ignoring how earlier changes alter the distribution of later prefixes, which is accurate only while the new policy stays near the old. Clipping, few epochs per batch, small learning rates and KL monitoring keep it there. It breaks with large updates, many reuse epochs, or very stale asynchronous data.</p></div>
+</details>
+
+<details class="qa" data-id="ch18-qa-14">
+<summary><span class="lvl design">Design</span> Design an RL training system for a coding agent.</summary>
+<div class="answer"><p>Tasks: thousands of real issues with reproducible containers, visible and hidden tests, difficulty measured under the current policy. Starting point: distilled SFT model. Rollouts: asynchronous inference workers with prefix caching, sandbox fleet with time limits, observation masking. Reward: hidden tests run outside the sandbox; test-file edits fail; small format and cost terms. Algorithm: GRPO/PPO with clipping, dynamic sampling, entropy safeguards. Monitoring: trajectory monitor for hacks, held-out evaluation and human review of samples, early stopping. Budget: rollout tokens, sandbox-hours, wall-clock with straggler handling.</p></div>
+</details>
+
+<details class="qa" data-id="ch18-qa-15">
+<summary><span class="lvl design">Design</span> How would you apply RL to the airline support agent?</summary>
+<div class="answer"><p>Build a simulator: a user-simulator model with persona and goal, a booking database, policy rules (τ-bench style). Reward: final database state equals the goal state, zero for any policy violation (checked by code), plus a cost-based penalty for escalations and turns derived from real costs. Validate the simulator against real logs (diversity of users, not always cooperative). Use GRPO with groups per scenario, curriculum over scenario difficulty, monitors for manipulating the simulated user, and held-out human-written scenarios for evaluation, measuring pass^k reliability, not only pass@1.</p></div>
+</details>
+
+<details class="qa" data-id="ch18-qa-16">
+<summary><span class="lvl design">Design</span> Estimate the cost and duration of an agentic RL run.</summary>
+<div class="answer"><p>Rollouts = steps × tasks × k (e.g. 500×64×8 = 256k). Tokens: turns × generated per turn for output (3.1B), turns × average context for re-read input (154B, mostly cached), turns × observation for new input (10B); price at the serving model (~$10k at small-model prices). Sandboxes: rollouts × duration (17k hours). Wall-clock: async ≈ steps × mean duration with enough concurrency (~33 h); sync pays the straggler maximum (~130 h). Add trainer, reference-model and evaluation compute, and failed runs.</p></div>
+</details>
+
+<details class="qa" data-id="ch18-qa-17">
+<summary><span class="lvl core">Core</span> What is potential-based shaping and why does it matter?</summary>
+<div class="answer"><p>Adding \(\gamma\Phi(s')-\Phi(s)\) to each transition's reward telescopes over a trajectory to a term independent of actions, so the optimal policy is unchanged (Ng, Harada, Russell 1999), while giving denser feedback. Other shaping (per-turn penalties, partial credit) can change the optimum, e.g. teaching an agent to give up or to delete failing tests. Always ask what the optimal policy for the full reward does.</p></div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="ref-williams">R. J. Williams. Simple Statistical Gradient-Following Algorithms for Connectionist Reinforcement Learning. <em>Machine Learning</em>, 8, 1992.</li>
+<li id="ref-ppo">J. Schulman, F. Wolski, P. Dhariwal, A. Radford and O. Klimov. Proximal Policy Optimization Algorithms. 2017. <a href="https://arxiv.org/abs/1707.06347">arXiv:1707.06347</a>.</li>
+<li id="ref-gae">J. Schulman, P. Moritz, S. Levine, M. Jordan and P. Abbeel. High-Dimensional Continuous Control Using Generalized Advantage Estimation. ICLR 2016. <a href="https://arxiv.org/abs/1506.02438">arXiv:1506.02438</a>.</li>
+<li id="ref-grpo">Z. Shao et al. DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models. 2024. <a href="https://arxiv.org/abs/2402.03300">arXiv:2402.03300</a>.</li>
+<li id="ref-dapo">Q. Yu et al. DAPO: An Open-Source LLM Reinforcement Learning System at Scale. 2025. <a href="https://arxiv.org/abs/2503.14476">arXiv:2503.14476</a>.</li>
+<li id="ref-tulu3">N. Lambert et al. Tülu 3: Pushing Frontiers in Open Language Model Post-Training. 2024. <a href="https://arxiv.org/abs/2411.15124">arXiv:2411.15124</a>.</li>
+<li id="ref-r1">DeepSeek-AI. DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning. 2025. <a href="https://arxiv.org/abs/2501.12948">arXiv:2501.12948</a>.</li>
+<li id="ref-drgrpo">Z. Liu et al. Understanding R1-Zero-Like Training: A Critical Perspective. 2025. <a href="https://arxiv.org/abs/2503.20783">arXiv:2503.20783</a>.</li>
+<li id="ref-swegym">J. Pan et al. Training Software Engineering Agents and Verifiers with SWE-Gym. 2024. <a href="https://arxiv.org/abs/2412.21139">arXiv:2412.21139</a>.</li>
+<li id="ref-archer">Y. Zhou, A. Zanette, J. Pan, S. Levine and A. Kumar. ArCHer: Training Language Model Agents via Hierarchical Multi-Turn RL. 2024. <a href="https://arxiv.org/abs/2402.19446">arXiv:2402.19446</a>.</li>
+<li id="ref-swerl">Y. Wei et al. SWE-RL: Advancing LLM Reasoning via Reinforcement Learning on Open Software Evolution. 2025. <a href="https://arxiv.org/abs/2502.18449">arXiv:2502.18449</a>.</li>
+<li id="ref-ragen">Z. Wang et al. RAGEN: Understanding Self-Evolution in LLM Agents via Multi-Turn Reinforcement Learning. 2025. <a href="https://arxiv.org/abs/2504.20073">arXiv:2504.20073</a>.</li>
+<li id="ref-prm">H. Lightman et al. Let's Verify Step by Step. 2023. <a href="https://arxiv.org/abs/2305.20050">arXiv:2305.20050</a>.</li>
+<li id="ref-shaping">A. Y. Ng, D. Harada and S. Russell. Policy Invariance under Reward Transformations: Theory and Application to Reward Shaping. ICML 1999.</li>
+<li id="ref-metrhack">METR. Recent Frontier Models Are Reward Hacking. June 2025. <a href="https://metr.org/blog/2025-06-05-recent-reward-hacking/">metr.org</a>.</li>
+<li id="ref-baker">B. Baker et al. Monitoring Reasoning Models for Misbehavior and the Risks of Promoting Obfuscation. 2025. <a href="https://arxiv.org/abs/2503.11926">arXiv:2503.11926</a>.</li>
+<li id="ref-yue">Y. Yue et al. Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model? 2025. <a href="https://arxiv.org/abs/2504.13837">arXiv:2504.13837</a>.</li>
+<li>Further reading: R. S. Sutton and A. G. Barto, <em>Reinforcement Learning: An Introduction</em>, 2nd ed., MIT Press, 2018; J. Schulman et al., Trust Region Policy Optimization, <a href="https://arxiv.org/abs/1502.05477">arXiv:1502.05477</a>; V. Krakovna et al., Specification Gaming: the Flip Side of AI Ingenuity, DeepMind blog, 2020; OpenAI, Faulty Reward Functions in the Wild, 2016.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

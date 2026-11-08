@@ -1,0 +1,631 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 16 · Agent Architectures and Frameworks — Foundations of Agentic AI</title>
+<meta name="description" content="Chapter 16 of Foundations of Agentic AI: the building blocks of agent systems, choosing autonomy per component, chains with gates and routing arithmetic, agents as graphs with structural guarantees, durable execution, frameworks, and testing architectures.">
+<script>try{var t=localStorage.getItem('aai-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script defer src="/library/assets/book-shim.js" data-library="/library/" data-field="/library/AI_Engineering/" data-field-title="AI Engineering"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-chapter="ch16" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Part V · Many Agents — Chapter 16</div>
+<h1 id="top">Agent Architectures and Frameworks</h1>
+<p class="lede">Every agent system in this book, from a single tool-calling loop to a multi-agent research system, is assembled from a handful of building blocks: chains, routers, parallel branches, loops with evaluators, orchestrators and autonomous agents. This chapter names the blocks, shows how to choose the right amount of autonomy for each part of a system, explains how agent systems are built as explicit graphs with durable state, and assesses what the popular frameworks provide and what they cost.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Chapter 2 framed workflows and agents as nested policy classes: a fixed sequence of steps, a router that chooses among sequences, and an agent that chooses every step (§2.5). Later chapters added more structure: plan-and-execute (§6.5), evaluator–optimizer loops (§7.8), sub-agents and milestones (Chapter 14), orchestrators with workers (§15.4). A practitioner designing a real system faces these choices not once but at every point in the system: should the support agent's eligibility check be a deterministic workflow or a model's judgement? Should requests be routed to specialised flows or handled by one general agent? Should the research system's sub-questions be fixed by a template or chosen by the lead?</p>
+<p>This chapter provides the vocabulary and the engineering for those decisions. We begin with the catalogue of building blocks that practitioners converged on by 2024, then give a method for assigning autonomy component by component, with the arithmetic of routing and chaining. We then show how a system built from these blocks is best represented as an explicit graph of states and transitions, which makes properties such as "no refund without a policy check" checkable, and how such graphs are executed durably, with checkpoints, human interruptions and replay. Finally we survey agent frameworks: what problems they solve, what they hide, and when to use one.</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Name and describe the canonical building blocks: augmented model, prompt chain, router, parallelisation (sectioning and voting), orchestrator–workers, evaluator–optimizer, autonomous agent.</li>
+<li>Assign autonomy to each component of a system using variability, feedback and cost of error, and compute the reliability of chains with and without gates.</li>
+<li>Analyse routing: overall accuracy as a function of router accuracy, and when specialised flows beat a general agent.</li>
+<li>Represent an agent system as a graph with typed state, and use the graph to guarantee safety properties.</li>
+<li>Explain durable execution: checkpointed state, human-in-the-loop interrupts and replay.</li>
+<li>Evaluate agent frameworks by what they abstract, and decide between a framework and direct implementation.</li>
+<li>Test an agent architecture at the levels of nodes, tools, trajectories and properties.</li>
+</ol>
+</div>
+<p>We use the policy classes of §2.5, the evaluator–optimizer of §7.8, tool design (Chapter 8), long-horizon structure (Chapter 14) and multi-agent patterns (Chapter 15).</p>
+
+<h2 id="s16-1">16.1 A vocabulary of building blocks</h2>
+<p>In December 2024 Anthropic published a short guide, <em>Building Effective Agents</em>, distilled from work with many teams deploying agent systems<span class="cite"><a href="#ref-bea">[1]</a></span>. Its most influential contribution was a vocabulary: a small set of composable patterns, ordered by increasing autonomy, from which most successful systems were built. Figure 16.1 draws them, and we use the guide's names throughout.</p>
+
+<figure class="diagram" id="fig-16-1">
+<svg class="dg" viewBox="0 0 720 316" role="img" aria-label="Six building blocks of agent systems">
+<defs><marker id="ah161" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<g class="t-xs">
+<text x="120" y="20" text-anchor="middle" class="t-sm t-b">prompt chaining</text>
+<rect x="20" y="32" width="50" height="26" rx="5" class="fill-acc"/><text x="45" y="49" text-anchor="middle" class="t-on">LLM</text>
+<rect x="95" y="32" width="40" height="26" rx="5" class="bx4"/><text x="115" y="49" text-anchor="middle">gate</text>
+<rect x="160" y="32" width="50" height="26" rx="5" class="fill-acc"/><text x="185" y="49" text-anchor="middle" class="t-on">LLM</text>
+<line x1="70" y1="45" x2="93" y2="45" class="ln" marker-end="url(#ah161)"/><line x1="135" y1="45" x2="158" y2="45" class="ln" marker-end="url(#ah161)"/>
+<text x="360" y="20" text-anchor="middle" class="t-sm t-b">routing</text>
+<rect x="270" y="45" width="50" height="26" rx="5" class="fill-acc"/><text x="295" y="62" text-anchor="middle" class="t-on">router</text>
+<rect x="370" y="26" width="80" height="22" rx="5" class="bx3"/><text x="410" y="41" text-anchor="middle">flow A</text>
+<rect x="370" y="54" width="80" height="22" rx="5" class="bx3"/><text x="410" y="69" text-anchor="middle">flow B</text>
+<rect x="370" y="82" width="80" height="22" rx="5" class="bx3"/><text x="410" y="97" text-anchor="middle">flow C</text>
+<line x1="320" y1="55" x2="368" y2="37" class="ln" marker-end="url(#ah161)"/><line x1="320" y1="58" x2="368" y2="65" class="ln" marker-end="url(#ah161)"/><line x1="320" y1="62" x2="368" y2="92" class="ln" marker-end="url(#ah161)"/>
+<text x="600" y="20" text-anchor="middle" class="t-sm t-b">parallelisation</text>
+<rect x="500" y="45" width="40" height="26" rx="5" class="bx2"/><text x="520" y="62" text-anchor="middle">split</text>
+<rect x="565" y="26" width="50" height="22" rx="5" class="fill-acc"/><text x="590" y="41" text-anchor="middle" class="t-on">LLM</text>
+<rect x="565" y="54" width="50" height="22" rx="5" class="fill-acc"/><text x="590" y="69" text-anchor="middle" class="t-on">LLM</text>
+<rect x="565" y="82" width="50" height="22" rx="5" class="fill-acc"/><text x="590" y="97" text-anchor="middle" class="t-on">LLM</text>
+<rect x="640" y="45" width="60" height="26" rx="5" class="bx2"/><text x="670" y="62" text-anchor="middle">aggregate</text>
+<line x1="540" y1="55" x2="563" y2="37" class="ln"/><line x1="540" y1="58" x2="563" y2="65" class="ln"/><line x1="540" y1="62" x2="563" y2="92" class="ln"/><line x1="615" y1="37" x2="640" y2="54" class="ln"/><line x1="615" y1="65" x2="640" y2="58" class="ln"/><line x1="615" y1="92" x2="640" y2="64" class="ln"/>
+<text x="120" y="160" text-anchor="middle" class="t-sm t-b">orchestrator–workers</text>
+<rect x="85" y="172" width="70" height="26" rx="5" class="fill-acc"/><text x="120" y="189" text-anchor="middle" class="t-on">orchestrator</text>
+<rect x="30" y="230" width="50" height="22" rx="5" class="bx3"/><text x="55" y="245" text-anchor="middle">worker</text><rect x="95" y="230" width="50" height="22" rx="5" class="bx3"/><text x="120" y="245" text-anchor="middle">worker</text><rect x="160" y="230" width="50" height="22" rx="5" class="bx3"/><text x="185" y="245" text-anchor="middle">worker</text>
+<line x1="105" y1="198" x2="60" y2="228" class="ln" marker-end="url(#ah161)" marker-start="url(#ah161)"/><line x1="120" y1="198" x2="120" y2="228" class="ln" marker-end="url(#ah161)" marker-start="url(#ah161)"/><line x1="135" y1="198" x2="180" y2="228" class="ln" marker-end="url(#ah161)" marker-start="url(#ah161)"/>
+<text x="120" y="276" text-anchor="middle">sub-tasks chosen at run time</text>
+<text x="360" y="160" text-anchor="middle" class="t-sm t-b">evaluator–optimizer</text>
+<rect x="290" y="190" width="60" height="30" rx="5" class="fill-acc"/><text x="320" y="209" text-anchor="middle" class="t-on">generator</text>
+<rect x="390" y="190" width="60" height="30" rx="5" class="bx4"/><text x="420" y="209" text-anchor="middle">evaluator</text>
+<path d="M350,198 L388,198" class="ln" marker-end="url(#ah161)"/><path d="M388,214 L352,214" class="ln" marker-end="url(#ah161)"/>
+<text x="360" y="246" text-anchor="middle">feedback until accepted</text>
+<text x="600" y="160" text-anchor="middle" class="t-sm t-b">autonomous agent</text>
+<rect x="540" y="185" width="70" height="40" rx="8" class="fill-acc"/><text x="575" y="209" text-anchor="middle" class="t-on">LLM</text>
+<rect x="640" y="185" width="60" height="40" rx="8" class="bx4"/><text x="670" y="209" text-anchor="middle">env</text>
+<path d="M610,195 L638,195" class="ln" marker-end="url(#ah161)"/><path d="M638,215 L612,215" class="ln" marker-end="url(#ah161)"/>
+<text x="620" y="246" text-anchor="middle">model chooses every step</text>
+</g>
+<line x1="20" y1="292" x2="700" y2="292" class="ln"/><text x="20" y="308" class="t-xs">less autonomy, more predictable</text><text x="700" y="308" text-anchor="end" class="t-xs">more autonomy, more flexible</text>
+</svg>
+<figcaption><b>Figure 16.1 — Building blocks of agent systems.</b> Chains run fixed steps with checks between them; routers send inputs to specialised flows; parallelisation splits work or samples several answers and aggregates; orchestrators choose sub-tasks at run time; evaluator–optimizers loop until a check passes; autonomous agents choose every step. Real systems compose them.</figcaption></figure>
+
+<p>Figure 16.1 orders the blocks by how much of the control flow the model decides. The foundation of all of them is the <strong>augmented model</strong>, a language model with retrieval, tools and memory (Chapters 8–13), able to decide within a single call which tools to use. <strong>Prompt chaining</strong> decomposes a task into a fixed sequence of calls, each consuming the previous one's output, with programmatic <em>gates</em> between them (a schema check, a length check, a policy check): a support reply might be drafted, checked against the policy, then translated. <strong>Routing</strong> classifies an input and sends it to a specialised flow: refunds to one prompt and tool set, baggage questions to another, unusual requests to a general agent. <strong>Parallelisation</strong> runs calls simultaneously, either <em>sectioning</em> a task into independent parts or <em>voting</em> over several attempts (§5.4, §15.3). <strong>Orchestrator–workers</strong> lets a model decide the sub-tasks at run time (§15.4). <strong>Evaluator–optimizer</strong> loops a generator against an evaluator until the output passes (§7.8). And the <strong>autonomous agent</strong> lets the model choose every action in a loop with the environment (§1.1).</p>
+<p>The guide's central advice, which has held up well, was to use the simplest block that works and add autonomy only when measurement shows a simpler design failing: "the most successful implementations weren't using complex frameworks or specialized libraries. Instead, they were building with simple, composable patterns." This is the policy-class argument of §2.5 turned into practice. Every step up the ladder buys flexibility at the price of predictability, cost and testability, and the price is worth paying only where the task's variability demands it.</p>
+
+<h2 id="s16-2">16.2 Choosing autonomy component by component</h2>
+<p>A real system is not one block but a composition, and the autonomy decision should be made separately for each component. Chapter 2 identified three properties that favour more autonomy: <em>variability</em> (the right sequence of steps differs between inputs), <em>feedback</em> (the environment reports the consequences of actions, so errors can be caught) and a low <em>cost of error</em> (mistakes are cheap or reversible). Applying them component by component gives architectures in which most steps are fixed and a few are autonomous, which is how successful agent products usually look.</p>
+<p>Consider the support agent as a system. Authentication of the customer varies little and errors are costly: a fixed workflow. Classifying the request type varies and is cheap to get wrong if misroutes can be detected: a model-based router. Answering a common question (baggage allowance) is low-variability: a chain with retrieval. Changing a booking varies moderately, has feedback (the booking system validates changes) and is consequential: a constrained agent with read tools, a deterministic quote tool and a guarded write (§8.9). Handling an unusual complaint is high-variability and needs judgement: an autonomous agent with escalation to a human. The policy check before any refund is not a model decision at all: deterministic code. The resulting system is a graph in which the model's autonomy is concentrated where it pays.</p>
+<p>Chaining has its own arithmetic. If each of \(k\) stages succeeds with probability \(\rho_s\), a chain succeeds with \(\rho_s^k\), the \(\rho^H\) law of Chapter 1 at the level of stages. Gates between stages change this exactly as detection did in §2.6: a gate that catches a fraction \(r_g\) of stage failures and triggers one retry raises a stage's effective success to \(\rho_s+(1-\rho_s)r_g\rho_s\). Figure 16.2 shows the effect for \(\rho_s=0.95\) and \(r_g=0.8\).</p>
+
+<figure class="chart" id="fig-16-2">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Reliability of a k-stage prompt chain (each stage 95%)","height":320,
+ "x":{"label":"Number of stages k","min":1,"max":10,"ticks":[1,2,3,4,6,8,10]},
+ "y":{"label":"Probability the chain succeeds","min":0.5,"max":1,"fmt":"pct"},
+ "series":[
+  {"name":"gates catch 80% of stage failures, one retry","color":"s1","points":[[1,0.988],[2,0.9761],[3,0.9644],[4,0.9529],[6,0.9301],[8,0.9079],[10,0.8863]]},
+  {"name":"no gates","color":"s2","points":[[1,0.95],[2,0.9025],[3,0.8574],[4,0.8145],[6,0.7351],[8,0.6634],[10,0.5987]]}
+ ]}
+</script>
+<figcaption><b>Figure 16.2 — Gates make chains robust.</b> Without checks between stages, a ten-stage chain of 95% stages succeeds 60% of the time; with gates that catch 80% of stage failures and retry once, 89%. A gate is the cheapest reliability mechanism in an architecture: often a few lines of validation code.</figcaption></figure>
+
+<p>Figure 16.2 is why chains with gates are so effective in practice and why their design deserves care. A gate can be deterministic (does the output parse, does the amount lie within policy, does every cited quote appear in its source?) or a model check (does the draft answer the question?); deterministic gates are cheaper and have known error rates, so they should be used wherever a property can be checked by code. The same arithmetic warns against long ungated chains, which are as fragile as long ungated agent trajectories, and it suggests where to put gates: after the stages with the lowest success rates and before any stage whose errors are expensive to propagate.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — router plus specialised flows, or one general agent?</div>
+<p>A support system receives three request types. Specialised flows (each a chain with gates and the right tools) resolve their type correctly 97% of the time, but a misrouted request (sent to the wrong flow) is resolved only 60% of the time, usually after the flow notices and escalates. A single general agent resolves 88% of all requests.</p>
+<p><b>Overall accuracy with a router of accuracy \(r\).</b> \(0.97r+0.60(1-r)\). At \(r=0.95\): \(0.9215+0.03=0.9515\). At \(r=0.80\): 0.896. At \(r=0.75\): 0.8775, just below the general agent.</p>
+<p><b>Break-even.</b> \(0.97r+0.6(1-r)=0.88\Rightarrow r=0.28/0.37=0.757\). Routing pays if the router is right more than about 76% of the time, which a classifier on clearly distinct request types easily achieves.</p>
+<p><b>Cost.</b> Specialised flows can use a cheaper model and shorter prompts, so the router architecture is usually also cheaper, as long as misroutes are detected rather than silently mishandled.</p>
+</div>
+
+<figure class="chart" id="fig-16-3">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Overall accuracy of routing to specialised flows versus one general agent","height":310,
+ "x":{"label":"Router accuracy r","min":0.7,"max":1,"fmt":"pct","ticks":[0.7,0.75,0.8,0.85,0.9,0.95,1]},
+ "y":{"label":"Requests resolved","min":0.84,"max":0.98,"fmt":"pct"},
+ "hlines":[{"y":0.88,"text":"general agent 88%"}],
+ "series":[{"name":"router + specialised flows","color":"s1","points":[[0.7,0.859],[0.75,0.8775],[0.8,0.896],[0.85,0.9145],[0.9,0.933],[0.95,0.9515],[0.99,0.9663],[1,0.97]]}]}
+</script>
+<figcaption><b>Figure 16.3 — When routing pays.</b> With specialised flows at 97% and misrouted requests at 60%, routing beats a general agent at 88% once the router is right about three times in four. Below that, misroutes cost more than specialisation gains.</figcaption></figure>
+
+<p>Figure 16.3 generalises: specialisation pays when the specialised components are much better than the general one on their own inputs and the router is reliable, and it fails when misroutes are frequent or silent. Two design habits make routing robust. Give every specialised flow a way to say "this is not mine" and hand back to the router or a general agent, which turns silent misroutes into detected ones and raises the misrouted resolution rate. And keep a general agent as the destination for anything the router is unsure about, using the router's confidence (§3.6) as the threshold.</p>
+
+<h2 id="s16-3">16.3 Agents as graphs</h2>
+<p>As systems grow from one loop into compositions of chains, routers, agents and checks, the question "what can this system do next?" becomes hard to answer by reading prompts. The architectural answer, adopted by frameworks such as LangGraph in 2024, is to make the control flow an explicit <strong>graph</strong>: nodes are steps (a model call, a tool call, a deterministic function, a sub-agent, a human approval), edges say which step may follow which, some edges are <em>conditional</em> on the state (a model's routing decision, a check's result), and a typed <strong>state</strong> object carries the data that nodes read and write<span class="cite"><a href="#ref-langgraph">[2]</a></span>. An autonomous agent is then a graph with a loop (model node to tool node and back) and a conditional exit; a workflow is a graph without model-chosen edges; and everything in between is expressible.</p>
+
+<figure class="diagram" id="fig-16-4">
+<svg class="dg" viewBox="0 0 720 280" role="img" aria-label="The support system as an explicit graph with typed state and a guarded refund path">
+<defs><marker id="ah164" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker>
+<marker id="ah164a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead-acc"/></marker></defs>
+<g class="t-xs">
+<rect x="14" y="120" width="80" height="34" rx="6" class="bx2"/><text x="54" y="141" text-anchor="middle">start</text>
+<rect x="114" y="120" width="90" height="34" rx="6" class="bx4"/><text x="159" y="134" text-anchor="middle">authenticate</text><text x="159" y="147" text-anchor="middle">(code)</text>
+<rect x="224" y="120" width="80" height="34" rx="6" class="fill-acc"/><text x="264" y="141" text-anchor="middle" class="t-on">router</text>
+<rect x="334" y="30" width="110" height="34" rx="6" class="bx3"/><text x="389" y="44" text-anchor="middle">FAQ chain</text><text x="389" y="57" text-anchor="middle">(retrieval)</text>
+<rect x="334" y="120" width="110" height="34" rx="6" class="fill-acc"/><text x="389" y="134" text-anchor="middle" class="t-on">change agent</text><text x="389" y="147" text-anchor="middle" class="t-on">(read tools)</text>
+<rect x="334" y="210" width="110" height="34" rx="6" class="fill-acc"/><text x="389" y="224" text-anchor="middle" class="t-on">general agent</text><text x="389" y="237" text-anchor="middle" class="t-on">(escalate)</text>
+<rect x="474" y="120" width="100" height="34" rx="6" class="bx4"/><text x="524" y="134" text-anchor="middle">policy check</text><text x="524" y="147" text-anchor="middle">(code)</text>
+<rect x="474" y="190" width="100" height="34" rx="6" class="bx5"/><text x="524" y="211" text-anchor="middle">human approval</text>
+<rect x="604" y="120" width="100" height="34" rx="6" class="bx3"/><text x="654" y="134" text-anchor="middle">execute write</text><text x="654" y="147" text-anchor="middle">(idempotent)</text>
+<rect x="604" y="30" width="100" height="34" rx="6" class="bx2"/><text x="654" y="51" text-anchor="middle">reply + end</text>
+</g>
+<line x1="94" y1="137" x2="112" y2="137" class="ln" marker-end="url(#ah164)"/><line x1="204" y1="137" x2="222" y2="137" class="ln" marker-end="url(#ah164)"/>
+<line x1="304" y1="130" x2="332" y2="52" class="ln dash" marker-end="url(#ah164)"/><line x1="304" y1="137" x2="332" y2="137" class="ln dash" marker-end="url(#ah164)"/><line x1="304" y1="144" x2="332" y2="222" class="ln dash" marker-end="url(#ah164)"/>
+<line x1="444" y1="137" x2="472" y2="137" class="ln-acc" marker-end="url(#ah164a)"/>
+<line x1="524" y1="154" x2="524" y2="188" class="ln dash" marker-end="url(#ah164)"/><text x="530" y="176" class="t-xs">over limit</text>
+<line x1="574" y1="137" x2="602" y2="137" class="ln-acc" marker-end="url(#ah164a)"/><line x1="574" y1="207" x2="620" y2="156" class="ln" marker-end="url(#ah164)"/>
+<line x1="444" y1="47" x2="602" y2="47" class="ln" marker-end="url(#ah164)"/><line x1="654" y1="120" x2="654" y2="66" class="ln" marker-end="url(#ah164)"/>
+<path d="M444,227 C560,260 680,250 680,66" class="ln" marker-end="url(#ah164)"/>
+<rect x="14" y="200" width="290" height="64" rx="8" class="fill-muted"/><text x="24" y="218" class="t-xs">typed state: customer_id, verified: bool,</text><text x="24" y="234" class="t-xs">request_type, booking, quote_id, policy_ok: bool,</text><text x="24" y="250" class="t-xs">approval, messages[ ]</text>
+</svg>
+<figcaption><b>Figure 16.4 — An architecture as a graph.</b> Authentication and the policy check are code; the router and the agents are model nodes; dashed edges are conditional. Every path to "execute write" passes through the policy check, and over-limit actions through human approval, which can be verified from the graph itself.</figcaption></figure>
+
+<p>Figure 16.4 shows the principal benefit of the explicit graph: properties of the system become properties of the graph that can be checked without running it. The safety requirement "no write without a passing policy check" holds if and only if every path from the start node to the write node passes through the policy-check node with <code>policy_ok</code> set, which is a reachability question on a small directed graph. In a single autonomous agent with all tools available, the same requirement depends on the model choosing to call the check, and can only be tested statistically. Making safety-critical sequencing a structural property of the graph, and leaving the model free inside the nodes where its judgement is needed, combines the predictability of workflows with the flexibility of agents.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — an agent graph is a controlled transition system</div>
+<p>Let the system's configurations be pairs \((v,\sigma)\) of a node \(v\) in a finite directed graph \(G\) and a state \(\sigma\) of a typed record. Each node is a map \(\sigma\mapsto\sigma'\), deterministic for code nodes and stochastic for model nodes (it samples from \(\pi_\theta\)); each edge \((v,w)\) carries a guard, a predicate on \(\sigma\), and the next node is chosen among out-edges whose guards hold, by code or by a model. Safety properties of the form "every execution reaching \(w\) has previously visited \(u\) with predicate \(\phi\) true" are temporal-logic properties of this transition system. If every model node can only change the fields its type allows, and the guards on edges into \(w\) are deterministic, such properties can be verified on the graph alone, independent of what the models do, because no model output can create an edge that does not exist.</p>
+</div>
+
+<div class="box example">
+<div class="box-title">Worked example — a structural guarantee versus a prompted one</div>
+<p>In design A, one autonomous agent has the tools <code>check_policy</code> and <code>issue_refund</code>, and its system prompt says to always check the policy before refunding. In design B, the graph of Figure 16.4 makes <code>issue_refund</code> reachable only from the policy-check node.</p>
+<p><b>Design A.</b> Testing on 2,000 conversations finds the agent skips the check in 0.4% of refunds (usually under customer pressure). At 300 refunds a day, about 1.2 unchecked refunds a day, of which perhaps a third are ineligible: about 150 improper refunds a year.</p>
+<p><b>Design B.</b> The check cannot be skipped: the only edge to the write node starts at the check node, and the write node's guard requires <code>policy_ok</code>. Improper refunds now come only from errors in the policy code itself, which can be tested exhaustively against the policy's rules.</p>
+<p><b>Cost.</b> Design B constrains the agent only where the rule applies; everywhere else (understanding the request, choosing alternatives, explaining) the model is as free as in A.</p>
+</div>
+
+<h2 id="s16-4">16.4 State, durability and human interruptions</h2>
+<p>A graph with typed state also solves the durability problems of Chapter 14 at the architectural level. Because all the information that flows between nodes lives in the state object, the runtime can <strong>checkpoint</strong> the state after every node, keyed by a thread or run identifier. A crashed or paused run resumes by loading the last checkpoint and continuing from the next node, without re-running completed nodes, as in durable execution (§14.7), provided that nodes with side effects record their completion or are idempotent (§8.7). The same mechanism gives three capabilities that are otherwise hard to build. <strong>Human-in-the-loop interrupts</strong>: a node can pause the run and wait, for minutes or days, for a person to approve, edit the state or provide input, after which execution resumes from the checkpoint; the approval node of Figure 16.4 is implemented this way. <strong>Replay and time travel</strong>: a developer can load the checkpoint before a bad decision, change the prompt or the state, and re-run from there, which is the most efficient way to debug a long trajectory. And <strong>streaming and observability</strong>: each node's inputs and outputs are natural units for logs and traces (§15.7). Figure 16.5 shows the life of a run with an interrupt.</p>
+
+<figure class="diagram" id="fig-16-5">
+<svg class="dg" viewBox="0 0 720 220" role="img" aria-label="A run with per-node checkpoints, a human interrupt, and resumption">
+<defs><marker id="ah165" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<line x1="30" y1="100" x2="700" y2="100" class="ln"/>
+<g class="t-xs">
+<rect x="40" y="76" width="80" height="48" rx="6" class="fill-acc"/><text x="80" y="104" text-anchor="middle" class="t-on">router</text>
+<rect x="150" y="76" width="90" height="48" rx="6" class="fill-acc"/><text x="195" y="104" text-anchor="middle" class="t-on">change agent</text>
+<rect x="270" y="76" width="80" height="48" rx="6" class="bx4"/><text x="310" y="104" text-anchor="middle">policy</text>
+<rect x="380" y="76" width="100" height="48" rx="6" class="bx5"/><text x="430" y="98" text-anchor="middle">approval</text><text x="430" y="112" text-anchor="middle">(interrupt)</text>
+<rect x="560" y="76" width="70" height="48" rx="6" class="bx3"/><text x="595" y="104" text-anchor="middle">write</text>
+<rect x="645" y="76" width="55" height="48" rx="6" class="bx2"/><text x="672" y="104" text-anchor="middle">reply</text>
+</g>
+<g class="fill-s3"><circle cx="135" cy="140" r="5"/><circle cx="255" cy="140" r="5"/><circle cx="365" cy="140" r="5"/><circle cx="545" cy="140" r="5"/><circle cx="638" cy="140" r="5"/></g>
+<text x="360" y="164" text-anchor="middle" class="t-xs">● checkpoint of the typed state after each node</text>
+<path d="M480,76 C500,30 540,30 556,76" class="ln dash" marker-end="url(#ah165)"/><text x="518" y="28" text-anchor="middle" class="t-xs">hours later: approved</text>
+<text x="430" y="60" text-anchor="middle" class="t-xs">run paused, state saved</text>
+<text x="360" y="200" text-anchor="middle" class="t-xs">a crash anywhere resumes from the last checkpoint; a developer can reload any checkpoint and re-run</text>
+</svg>
+<figcaption><b>Figure 16.5 — Durable execution of a graph.</b> The runtime saves the typed state after each node. An approval node pauses the run until a person responds, possibly hours later; a crash resumes from the last checkpoint; and any checkpoint can be reloaded to debug or re-run from that point.</figcaption></figure>
+
+<p>Figure 16.5 also shows why state design matters. The state object is the system's sufficient statistic (Chapter 2) in explicit form: whatever is not in it is lost at a checkpoint boundary, and whatever is in it is carried, logged and visible to every later node. A good state schema separates what the model needs to see (messages, findings) from control data (flags such as <code>verified</code> and <code>policy_ok</code>, which only code should set), keeps large artefacts as references rather than inline (a file path, not the file), and is versioned, since a change to the schema must be compatible with runs paused under the old one.</p>
+
+<details class="drill">
+<summary>Drill 16.1 — what replay saves</summary>
+<p>A 60-node research run fails at node 52 because of a bad prompt in the synthesis node. Each node costs on average $0.04 and 9 seconds. How much does fixing the prompt and re-running cost with and without checkpoint replay?</p>
+<p>Without replay: the whole run again, \(60\times\$0.04=\$2.40\) and 9 minutes, and different searches may yield a different, non-comparable result. With replay from the checkpoint before node 52: 9 nodes, $0.36 and 81 seconds, on exactly the same inputs, so the effect of the prompt change is isolated. For debugging, the comparability matters more than the saving.</p>
+</details>
+
+<h2 id="s16-5">16.5 Frameworks: what they give and what they cost</h2>
+<p>An ecosystem of agent frameworks grew up between 2023 and 2025, and an engineer will meet several. Early general-purpose libraries, LangChain (from late 2022) and LlamaIndex, offered abstractions for prompts, model providers, retrieval pipelines, tools and memory, and became the default starting point for many applications. Graph and state-machine runtimes, notably LangGraph, provided the explicit graphs, checkpointing and interrupts of §16.3–§16.4. Multi-agent frameworks, AutoGen and CrewAI among them, provided abstractions for agents with roles and conversations among them (Chapter 15). In 2025 the model providers released their own toolkits, OpenAI's Agents SDK and Anthropic's Claude Agent SDK, built on the harnesses behind their own agent products, and Google released its Agent Development Kit; lighter libraries such as Hugging Face's smolagents emphasised minimalism and code actions (Chapter 10).</p>
+<p>What frameworks provide is real: integrations with many model providers, tools, vector stores and protocols (MCP, Chapter 12); implementations of the patterns of Figure 16.1; state management, checkpointing and human interrupts; tracing and evaluation hooks; and, in the providers' SDKs, harness features tuned for their models (context compaction, tool-use conventions, sub-agents). For a team without existing infrastructure, these can save weeks.</p>
+<p>What frameworks cost is equally real, and the costs fall exactly where this book has argued that quality is decided. <em>Hidden prompts and context</em>: abstractions that assemble prompts, format tool results and manage memory make it hard to see, and therefore to engineer, the context the model actually receives (Chapter 4). <em>Leaky abstractions</em>: when an agent misbehaves, debugging requires understanding the framework's internals as well as the model's behaviour. <em>Lag and churn</em>: model capabilities and provider APIs changed rapidly in 2023–2025, and frameworks sometimes lagged them or changed their own interfaces frequently. <em>Lock-in</em>: state formats and abstractions make it costly to move. Anthropic's guide recommended starting with direct calls to model APIs, many patterns needing only a few lines of code, and using a framework only with an understanding of the code underneath; experienced teams frequently build thin internal harnesses for exactly the reasons above.</p>
+<p>A practical decision rule follows. Use direct API calls and a thin harness when the system is a single agent loop or a small composition, when the context must be tightly controlled, or when the team is still discovering what the system should do. Use a graph runtime when the system has many components, long-running or paused runs, human approvals and safety properties that should be structural. Use a provider's agent SDK when building an agent of the kind the provider's own products are (a coding agent, a research agent) and the harness features match. In every case, keep the prompts, tool definitions and state schema in the team's own code, under version control and evaluation, so that the framework is an execution engine rather than the place where the system's behaviour is defined.</p>
+
+<h2 id="s16-6">16.6 Testing an architecture</h2>
+<p>A composed system can be tested at four levels, from the cheapest and most precise to the most realistic, and a mature agent project uses all four. <strong>Node tests</strong> treat each component as a function: given this state, does the router choose the right flow, does the chain produce a valid draft, does the policy node accept and reject the right cases? Code nodes get ordinary unit tests; model nodes get small labelled datasets, run on every change to their prompt or model, since a prompt is code (§3.8). <strong>Contract tests</strong> check the interfaces between components and with external systems: does each tool accept the arguments its schema declares and return what its description promises, and does each node write only the state fields it is allowed to? <strong>Trajectory tests</strong> run the whole system on recorded or simulated tasks and check outcomes (the database end state, the final answer) and, where it matters, the path ("the policy node ran before the write"). Golden trajectories, replays of real past interactions with their correct outcomes, catch regressions when anything changes. <strong>Property tests</strong> check invariants over many generated inputs: no path reaches a write without a check; no output contains another customer's data; the system terminates within the step budget. For graphs, some properties can be checked statically, as §16.3 showed; the rest are checked by running many randomised episodes, including adversarial ones (injection attempts, abusive users, malformed tool outputs).</p>
+<p>Two practices make this sustainable. Make model nodes replaceable by recorded outputs, so that trajectory tests of the surrounding logic are deterministic and cheap, and run the expensive end-to-end tests with live models on a schedule rather than on every commit. And track each node's measured quality over time (router accuracy, chain pass rates, gate catch rates), since the reliability arithmetic of §16.2 lets a change in one node's quality be translated into its effect on the whole system before deployment. Chapter 19 develops the statistics of agent evaluation that these tests rely on.</p>
+
+<details class="drill">
+<summary>Drill 16.2 — where to put the gate</summary>
+<p>A five-stage chain has stage success rates 0.99, 0.90, 0.98, 0.95, 0.99. You can afford one gate (catching 80% of its stage's failures and retrying once). Which stage should it follow, and what is the chain's success before and after?</p>
+<p>Before: \(0.99\times0.90\times0.98\times0.95\times0.99=0.821\). A gate on stage \(s\) raises its success to \(\rho_s+0.8(1-\rho_s)\rho_s\): stage 2 becomes \(0.90+0.8\times0.1\times0.9=0.972\), multiplying the chain by \(0.972/0.90=1.08\), to 0.887; stage 4 would become \(0.95+0.8\times0.05\times0.95=0.988\), a factor 1.04, to 0.854. Put the gate after the weakest stage: stage 2.</p>
+</details>
+
+<h2 id="s16-7a">16.7 Event-driven and background agents</h2>
+<p>The architectures so far began with a person typing a request. A growing share of agent work is triggered instead by <strong>events</strong>: a new issue is filed and a coding agent proposes a fix; an email arrives and an assistant triages it; a monitoring alert fires and an agent gathers diagnostics; a nightly schedule starts a report. Such agents run in the background, without a person waiting, and they turn the agent graph into one stage of a larger asynchronous pipeline, drawn in Figure 16.6. Event-driven operation introduces three engineering concerns that interactive agents can ignore.</p>
+
+<figure class="diagram" id="fig-16-6">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-label="Event-driven agents: events enter a queue, workers run agent graphs, results go to review">
+<defs><marker id="ah166" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<g class="t-xs">
+<rect x="20" y="30" width="120" height="30" rx="6" class="bx2"/><text x="80" y="50" text-anchor="middle">new issue (webhook)</text>
+<rect x="20" y="75" width="120" height="30" rx="6" class="bx2"/><text x="80" y="95" text-anchor="middle">incoming email</text>
+<rect x="20" y="120" width="120" height="30" rx="6" class="bx2"/><text x="80" y="140" text-anchor="middle">monitoring alert</text>
+<rect x="20" y="165" width="120" height="30" rx="6" class="bx2"/><text x="80" y="185" text-anchor="middle">nightly schedule</text>
+<rect x="190" y="70" width="110" height="90" rx="8" class="bx4"/><text x="245" y="96" text-anchor="middle" class="t-sm">queue</text><text x="245" y="116" text-anchor="middle">deduplicate by</text><text x="245" y="130" text-anchor="middle">event ID; rate-limit</text><text x="245" y="144" text-anchor="middle">at-least-once</text>
+<rect x="350" y="40" width="150" height="40" rx="8" class="fill-acc"/><text x="425" y="64" text-anchor="middle" class="t-on">worker: agent graph</text>
+<rect x="350" y="95" width="150" height="40" rx="8" class="fill-acc"/><text x="425" y="119" text-anchor="middle" class="t-on">worker: agent graph</text>
+<rect x="350" y="150" width="150" height="40" rx="8" class="fill-acc"/><text x="425" y="174" text-anchor="middle" class="t-on">worker: agent graph</text>
+<rect x="550" y="60" width="150" height="40" rx="8" class="bx3"/><text x="625" y="84" text-anchor="middle">results: PR, draft, report</text>
+<rect x="550" y="130" width="150" height="40" rx="8" class="bx5"/><text x="625" y="154" text-anchor="middle">human review queue</text>
+</g>
+<line x1="140" y1="45" x2="188" y2="95" class="ln" marker-end="url(#ah166)"/><line x1="140" y1="90" x2="188" y2="105" class="ln" marker-end="url(#ah166)"/><line x1="140" y1="135" x2="188" y2="125" class="ln" marker-end="url(#ah166)"/><line x1="140" y1="180" x2="188" y2="140" class="ln" marker-end="url(#ah166)"/>
+<line x1="300" y1="100" x2="348" y2="60" class="ln" marker-end="url(#ah166)"/><line x1="300" y1="115" x2="348" y2="115" class="ln" marker-end="url(#ah166)"/><line x1="300" y1="130" x2="348" y2="170" class="ln" marker-end="url(#ah166)"/>
+<line x1="500" y1="60" x2="548" y2="78" class="ln" marker-end="url(#ah166)"/><line x1="500" y1="115" x2="548" y2="85" class="ln" marker-end="url(#ah166)"/><line x1="500" y1="170" x2="548" y2="152" class="ln" marker-end="url(#ah166)"/>
+<line x1="625" y1="100" x2="625" y2="128" class="ln" marker-end="url(#ah166)"/>
+<text x="360" y="220" text-anchor="middle" class="t-xs">concurrency needed = arrival rate × duration (Little's law); every handler must be idempotent</text>
+</svg>
+<figcaption><b>Figure 16.6 — Event-driven agents.</b> Events from many sources enter a queue that deduplicates and rate-limits them; a pool of workers runs the agent graph for each; results go to their destinations, often through a human review queue. Delivery is typically at-least-once, so handlers must tolerate repeats.</figcaption></figure>
+
+<p>Figure 16.6's first concern is <strong>capacity</strong>: how many agent runs must be in flight at once, and therefore how many sandboxes, model-rate-limit headroom and budget the system needs. The answer comes from a result of queueing theory that holds under very general conditions<span class="cite"><a href="#ref-little">[3]</a></span>.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — Little's law</div>
+<p>For any stable system in which items arrive, spend some time and leave, the long-run average number of items in the system \(\bar n\) equals the arrival rate \(\lambda\) times the average time each spends in it \(W\): \(\bar n=\lambda W\). The law needs no assumptions about the distributions of arrivals or durations, only stationarity, which is why it is the first tool for sizing any service. For agents: if issues arrive at \(\lambda\) per hour and each agent run takes \(W\) hours, \(\lambda W\) runs are in progress on average; peaks are higher, so capacity is set with headroom above the mean.</p>
+</div>
+
+<p>Applied to the running examples, Little's law gives quick, useful numbers. A repository that receives 120 issues a day, each handled by a six-minute coding-agent run, has on average \(120/1{,}440\times6=0.5\) runs in flight: a single worker suffices. An airline whose support agent handles 50 new conversations a minute, each lasting four minutes, has \(50\times4=200\) concurrent conversations, each holding a context and possibly a sandbox, and the model provider's rate limits must accommodate the corresponding tokens per minute. A research service that receives 30 requests an hour, each taking 20 minutes, needs 10 concurrent runs, and if each run spawns 8 workers (Chapter 15), 80 concurrent agent contexts.</p>
+<p>The second concern is <strong>delivery semantics</strong>. Event systems usually guarantee that each event is delivered <em>at least once</em>, because guaranteeing exactly once is expensive; a webhook may be retried if the receiver was slow to acknowledge it. An agent triggered twice by the same issue would open two pull requests. The remedies are those of §8.7 applied to whole runs: deduplicate events by their identifier at the queue, make each run's outputs idempotent (look for an existing pull request for this issue before opening one), and record run completion durably. The third concern is <strong>backpressure and cost control</strong>. A burst of events (a monitoring storm, a spam wave) can launch hundreds of runs and a matching bill; queues should rate-limit, prioritise and drop or merge redundant events (one diagnosis run per incident, not per alert), and budgets should be enforced per source as well as per run.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — sizing a triage pipeline</div>
+<p>An email-triage agent receives on average 600 emails an hour, with peaks of three times the mean. Each triage run takes 20 seconds (a classification, a summary, a draft reply for some) and uses about 6,000 input and 400 output tokens.</p>
+<p><b>Concurrency.</b> Mean: \(600/3{,}600\times20=3.3\) runs in flight; peak about 10. Provision 12 workers.</p>
+<p><b>Throughput of tokens.</b> At peak, 1,800 emails an hour, 30 a minute: \(30\times6{,}400=192{,}000\) tokens a minute, which must fit within the provider's rate limits with headroom.</p>
+<p><b>Cost.</b> Per email \(0.006\times\$3+0.0004\times\$15=\$0.024\) on the frontier model; on the small model, \(0.006\times\$0.25+0.0004\times\$1.25=\$0.002\). At 600 an hour around the clock: about $346 a day on the frontier model, $29 on the small one, which motivates the per-node model choice of §16.8.</p>
+</div>
+
+<h2 id="s16-8">16.8 Choosing a model for each node</h2>
+<p>Once a system is a graph, the model becomes a per-node decision rather than a global one, and this is one of the largest cost levers available. Nodes differ in difficulty and in the cost of their errors. A router classifying requests into clear categories, an extractor pulling fields from a document, a summariser condensing a tool output: these are routine and a small model handles them well. A planner decomposing an open research question, an agent diagnosing an unfamiliar bug, a judge deciding a disputed refund: these benefit from the strongest model and, often, from reasoning (Chapter 5). Assigning models by node concentrates expensive capability where it changes outcomes.</p>
+<p>The decision for each node follows the cascade logic of §3.7. Measure each candidate model's accuracy on the node's own labelled data; estimate the cost of the node's errors (including their propagation, which the chain arithmetic of §16.2 quantifies); and choose the cheapest model whose accuracy is within a tolerance of the best, or use a cascade (small model first, escalating on low confidence) where the small model's confidence is informative. In practice, systems that start with one frontier model everywhere and then move routine nodes to smaller models commonly cut model costs by large factors with little loss of quality, because most tokens flow through routine nodes. The reverse adjustment matters too: a node where errors are costly and rare (the eligibility decision in the support graph) may deserve a stronger model, a reasoning budget, or a vote of several models (§15.3), even if the rest of the system runs on small ones.</p>
+
+<details class="drill">
+<summary>Drill 16.4 — per-node models in the support graph</summary>
+<p>Per conversation, the support graph spends tokens as follows: router 3,000 in / 20 out; FAQ or change flow 40,000 in / 1,500 out; policy-explanation node 8,000 in / 300 out. Compute the model cost per conversation with the frontier model everywhere, and with the small model for the router and the flow but the frontier model for the policy node.</p>
+<p>Frontier everywhere: inputs 51,000 tokens ($0.153), outputs 1,820 ($0.0273): about $0.18. Mixed: router and flow on the small model, \(43{,}000\times\$0.25/\text{M}+1{,}520\times\$1.25/\text{M}=\$0.0108+\$0.0019=\$0.0127\); policy node on the frontier model, \(8{,}000\times\$3/\text{M}+300\times\$15/\text{M}=\$0.024+\$0.0045=\$0.0285\); total about $0.041, a quarter of the original, provided the small model's accuracy on the router and the flow has been verified.</p>
+</details>
+
+<h2 id="s16-9">16.9 Three architectures</h2>
+<p>We can now describe the architecture of each running example in this chapter's vocabulary, as a summary of how the book's techniques fit together. The table is a starting design to be revised by measurement.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Component</th><th>Coding agent</th><th>Support agent</th><th>Research agent</th></tr></thead>
+<tbody>
+<tr><td>Outer structure</td><td>Autonomous agent inside a milestone graph (plan → milestone loop → verify → commit)</td><td>Router to specialised flows plus a general agent; graph of Figure 16.4</td><td>Orchestrator–workers with a citation-checking stage</td></tr>
+<tr><td>Deterministic nodes</td><td>Test runs, linters, forbidden-file checks, commits</td><td>Authentication, policy check, quote computation, idempotent writes</td><td>Fetching, quote matching, URL resolution</td></tr>
+<tr><td>Model autonomy</td><td>High within milestones (localise, edit, debug)</td><td>Low to medium; high only in the general agent</td><td>Lead plans and dispatches; workers search freely within scope</td></tr>
+<tr><td>Gates</td><td>Reproduction test, regression suite</td><td>Policy, approval above threshold, read-back</td><td>Every claim supported by a fetched source</td></tr>
+<tr><td>Human role</td><td>Approves plan; reviews the pull request</td><td>Approves exceptions; takes escalations</td><td>Reviews the outline and the final report</td></tr>
+<tr><td>Durability</td><td>Checkpoint per milestone; notes and commits</td><td>Per-node state; conversations resumable across channels</td><td>Findings store; resumable rounds</td></tr>
+</tbody></table></div>
+<p>Reading across the rows shows the principle of §16.2 at work: autonomy is concentrated where variability is high and feedback is available (the coding agent within a milestone, the research workers), structure and deterministic code where errors are costly and rules are known (the support agent's writes), and gates and humans at the boundaries where mistakes would propagate. None of the three is "an agent" in the sense of a single unconstrained loop with every tool; each is a graph with an agent in some of its nodes.</p>
+
+<details class="drill">
+<summary>Drill 16.3 — the value of a "not mine" exit</summary>
+<p>In the routing worked example, misrouted requests are resolved 60% of the time. Suppose each specialised flow is given a way to detect that a request is not its type (catching 70% of misroutes) and hand it to the general agent (88%). What is the new resolution rate of misrouted requests, and the overall accuracy at router accuracy 0.85?</p>
+<p>Misrouted: \(0.7\times0.88+0.3\times0.60=0.616+0.18=0.796\). Overall at \(r=0.85\): \(0.85\times0.97+0.15\times0.796=0.8245+0.1194=0.944\), against 0.9145 without the exit. Turning silent misroutes into detected ones is worth three points here, and lowers the router accuracy at which routing pays from 0.76 to about 0.48.</p>
+</details>
+
+<h3 id="antipatterns">Architectural anti-patterns</h3>
+<p>Experience with deployed systems has produced a short list of designs that repeatedly disappoint, each the violation of a principle from this chapter. <em>The everything agent</em>: one autonomous loop with dozens of tools and a long system prompt for every case, which dilutes tool selection (§8.8), makes safety depend on prompting (§16.3) and resists testing. <em>The ungated chain</em>: a long pipeline of model calls with no checks between them, whose reliability decays as \(\rho_s^k\) (Figure 16.2). <em>The silent router</em>: specialised flows with no way to hand back a misrouted request, so that routing errors become wrong answers instead of detours. <em>Persona theatre</em>: many role-playing agents chatting where one agent following a procedure would do (§15.5). <em>State in the prompt</em>: control decisions (has the customer been verified? has the policy passed?) recorded only as text in the conversation, where a model can misread or be persuaded about them, rather than as typed flags that only code sets. And <em>framework first</em>: adopting a large framework before knowing what the system must do, then fighting its abstractions to see and shape the context. Each has a direct remedy in the preceding sections, and checking a design against the list is a useful review step before building.</p>
+
+<h2 id="s16-10">16.10 From prototype to production</h2>
+<p>Most agent systems begin as a prototype: a notebook or a script, one model, a long prompt, a few tools, and a demonstration that works on the examples its author tried. The distance from there to a dependable system is large, and teams that try to cross it in one step usually rebuild. An incremental path, in which each stage adds the structure the next one needs, is cheaper, and it maps onto the chapters of this book.</p>
+<p><strong>Stage 1: a measured prototype.</strong> Before improving anything, collect fifty to a hundred real tasks with a definition of success and run the prototype on them (Chapter 19). The number will be lower than the demonstration suggested, and the error analysis of §19.8 will say why. <strong>Stage 2: the right skeleton.</strong> Using the failure taxonomy, decide which parts should be fixed workflow, which routed, which autonomous (§16.2), and move policy rules from the prompt into code. <strong>Stage 3: tools and context.</strong> Reshape the tools and their outputs (§8.5, §8.10), make the context cache-friendly (§4.6), and add retrieval or memory only where failures show missing knowledge. <strong>Stage 4: instrumentation and gates.</strong> Add tracing, a regression suite with a release gate, guardrails and budgets (Chapter 21), so that every later change is measured. <strong>Stage 5: scale and optimise.</strong> Only now add routing, cascades, distillation or training (Chapters 17–18, §21.3), where traces show the cost and the evaluation can confirm quality.</p>
+<p>The anti-patterns are the stages taken out of order. <em>Framework first</em>: adopting an elaborate framework before the problem's shape is known locks in abstractions that may not fit (§16.5). <em>Prompt sprawl</em>: fixing each observed failure with another paragraph of instructions, until the prompt is long, contradictory and impossible to test; failures that recur should become code, tools or examples. <em>Agents everywhere</em>: giving the model autonomy over steps that never vary, paying in cost and reliability for flexibility no one uses. <em>Optimising unmeasured</em>: adding multi-agent structure, reflection or fine-tuning before an evaluation exists, so that no one can tell whether it helped. And <em>invisible state</em>: keeping essential state only in the model's context, where it cannot be inspected, checkpointed or recovered (§16.4). Each is a shortcut that saves a day and costs a month, and each is avoided by the order above: measure, structure, then optimise.</p>
+<p>The stages also give a vocabulary for reviewing a system someone else built. Ask which stage it is in: is there an evaluation set, and what does it say; which policies live in code and which in prompts; what do the traces show about cost and failures; what gate does a change pass before it ships. A system with impressive components and no answer to these questions is a prototype, whatever its size, and the next step for it is stage 1, not another component.</p>
+
+<h2 id="looking-ahead" class="unnumbered">Looking ahead</h2>
+<p>Parts I to V built agents by composing a fixed model with context, tools, memory, structure and other agents. Everything the agent knows how to do came either from the model's training or from what we put in its context. That leaves the most powerful lever unused: changing the model itself so that it becomes a better agent. Can an agent learn from demonstrations of good behaviour, from people's preferences between its attempts, and from the outcomes of its own trajectories? How do supervised fine-tuning on trajectories, reinforcement learning from human feedback and direct preference optimisation work, and when is training worth its cost compared with better prompting? Part VI begins with learning from demonstrations and preferences in Chapter 17.</p>
+
+<h2 id="summary">Chapter summary</h2>
+<ul>
+<li>Building blocks, by increasing autonomy: augmented model, prompt chaining with gates, routing, parallelisation (sectioning, voting), orchestrator–workers, evaluator–optimizer, autonomous agent. Use the simplest that works; compose them.</li>
+<li>Assign autonomy per component by variability, feedback and cost of error: deterministic code for rules and writes, chains for routine flows, agents where steps vary and feedback exists.</li>
+<li>Chains succeed as \(\rho_s^k\); gates catching \(r_g\) of failures with a retry raise stages to \(\rho_s+(1-\rho_s)r_g\rho_s\); put gates after the weakest stages.</li>
+<li>Routing to specialised flows beats a general agent when the router is accurate enough (\(0.97r+0.6(1-r)>0.88\Rightarrow r>0.76\) in the example); "not mine" exits make misroutes detectable.</li>
+<li>Explicit <b>graphs</b> with typed state make control flow inspectable and safety properties structural (every write path passes the policy check), verifiable without running the models.</li>
+<li><b>Durable execution</b> checkpoints state per node, enabling resumption, human-in-the-loop interrupts, replay and observability; design the state schema as the system's explicit sufficient statistic.</li>
+<li><b>Frameworks</b> provide integrations, patterns, state and tracing, at the cost of hidden context, leaky abstractions, churn and lock-in. Keep prompts, tools and state schemas in your own code; start simple.</li>
+<li><b>Event-driven agents</b> need capacity sized by Little\'s law \(\bar n=\lambda W\), deduplication and idempotent runs for at-least-once delivery, and backpressure and per-source budgets.</li>
+<li>Choose the <b>model per node</b>: small models for routine nodes, strong models or votes where errors are costly; most tokens flow through routine nodes.</li>
+<li>Test at four levels: nodes, contracts, trajectories (golden replays), properties (static and randomised).</li>
+<li>Move from prototype to production in order: measure on real tasks, fix the skeleton and move policy into code, shape tools and context, instrument and gate, and only then optimise; avoid framework-first, prompt sprawl, agents everywhere, unmeasured optimisation and invisible state.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ch16-mcq-01" data-topic="§16.1 Blocks">
+<p class="q">Which building block runs a fixed sequence of model calls with programmatic checks between them?</p>
+<ol class="opts"><li data-correct>Prompt chaining</li><li>Routing</li><li>Orchestrator–workers</li><li>Autonomous agent</li></ol>
+<div class="explain">Chains with gates.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-02" data-topic="§16.1 Blocks">
+<p class="q">Parallelisation has two variants:</p>
+<ol class="opts"><li>Routing and chaining</li><li data-correct>Sectioning (independent parts) and voting (several attempts)</li><li>Planning and executing</li><li>Caching and compaction</li></ol>
+<div class="explain">Split work, or sample and aggregate.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-03" data-topic="§16.1 Blocks">
+<p class="q">What distinguishes orchestrator–workers from sectioning?</p>
+<ol class="opts"><li>Workers use tools</li><li data-correct>The sub-tasks are chosen by a model at run time rather than fixed in advance</li><li>It uses voting</li><li>It has no aggregation</li></ol>
+<div class="explain">Sectioning's split is predefined.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-04" data-topic="§16.1 Advice">
+<p class="q">The central advice of <em>Building Effective Agents</em> was to:</p>
+<ol class="opts"><li>Always use a framework</li><li data-correct>Use the simplest composable pattern that works, adding autonomy only when measurement shows the need</li><li>Always use multi-agent systems</li><li>Avoid tools</li></ol>
+<div class="explain">Simple patterns outperformed complex frameworks in practice.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-05" data-topic="§16.2 Autonomy">
+<p class="q">Which component of the support system should be deterministic code?</p>
+<ol class="opts"><li>Explaining options to the customer</li><li data-correct>The policy check before a refund</li><li>Handling an unusual complaint</li><li>Classifying the request</li></ol>
+<div class="explain">Known rules with costly errors belong in code.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-06" data-topic="§16.2 Chains">
+<p class="q">A ten-stage chain of 95% stages without gates succeeds with probability about:</p>
+<ol class="opts"><li>95%</li><li>89%</li><li data-correct>60%</li><li>10%</li></ol>
+<div class="explain">\(0.95^{10}\approx0.599\).</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-07" data-topic="§16.2 Gates">
+<p class="q">A gate that catches 80% of a 95% stage's failures and retries once raises the stage's success to:</p>
+<ol class="opts"><li>0.95</li><li>0.96</li><li data-correct>0.988</li><li>1.0</li></ol>
+<div class="explain">\(0.95+0.05\times0.8\times0.95=0.988\).</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-08" data-topic="§16.2 Gate placement">
+<p class="q">With one gate to place, it should follow:</p>
+<ol class="opts"><li>The first stage</li><li>The last stage</li><li data-correct>The stage with the lowest success rate (or whose errors are costliest to propagate)</li><li>Any stage</li></ol>
+<div class="explain">Drill 16.2: gating the 90% stage beats gating a 95% stage.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-09" data-topic="§16.2 Routing">
+<p class="q">Specialised flows resolve 97%, misroutes 60%, a general agent 88%. Routing beats the general agent when router accuracy exceeds about:</p>
+<ol class="opts"><li>50%</li><li data-correct>76%</li><li>90%</li><li>99%</li></ol>
+<div class="explain">\(r>0.28/0.37\approx0.757\).</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-10" data-topic="§16.2 Routing">
+<p class="q">Giving each specialised flow a "not mine" exit to the general agent:</p>
+<ol class="opts"><li>Has no effect</li><li data-correct>Turns silent misroutes into detected ones, raising accuracy and lowering the router accuracy needed</li><li>Requires a larger router</li><li>Breaks caching</li></ol>
+<div class="explain">In Drill 16.3, the break-even router accuracy fell from 0.76 to about 0.48.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-11" data-topic="§16.3 Graphs">
+<p class="q">In an agent graph, a conditional edge is:</p>
+<ol class="opts"><li>An edge that is always taken</li><li data-correct>An edge taken only if a guard on the state holds, possibly decided by a model</li><li>A tool call</li><li>A checkpoint</li></ol>
+<div class="explain">Routers and checks produce conditional transitions.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-12" data-topic="§16.3 Guarantees">
+<p class="q">"Every refund passes a policy check" becomes a structural guarantee when:</p>
+<ol class="opts"><li>The prompt says so in capitals</li><li data-correct>The only edges into the write node come from the policy-check node, guarded by a flag only code can set</li><li>The model is larger</li><li>Temperature is zero</li></ol>
+<div class="explain">Reachability on the graph, independent of model behaviour.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-13" data-topic="§16.3 Guarantees">
+<p class="q">In the worked example, the prompted design skipped the policy check in 0.4% of refunds. The graph design's improper refunds come only from:</p>
+<ol class="opts"><li>The model skipping the check</li><li data-correct>Errors in the policy code, which can be tested exhaustively</li><li>Router mistakes</li><li>Caching</li></ol>
+<div class="explain">The check cannot be skipped structurally.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-14" data-topic="§16.3 Formalism">
+<p class="q">Formally, an agent graph is best described as:</p>
+<ol class="opts"><li>A neural network</li><li data-correct>A controlled transition system over (node, state) configurations with guarded edges and stochastic model nodes</li><li>A database schema</li><li>A context window</li></ol>
+<div class="explain">Safety properties are temporal properties of this system.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-15" data-topic="§16.4 Durability">
+<p class="q">Checkpointing the typed state after every node enables (select all):</p>
+<ol class="opts"><li data-correct>Resuming after a crash without re-running completed nodes</li><li data-correct>Pausing for human approval for hours</li><li data-correct>Replaying from a past checkpoint to debug</li><li>Removing the need for idempotent writes</li></ol>
+<div class="explain">Writes must still be idempotent or recorded.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-16" data-topic="§16.4 State design">
+<p class="q">Which belongs in the typed state as a flag only code may set?</p>
+<ol class="opts"><li>The customer's message</li><li data-correct><code>policy_ok</code></li><li>The model's reasoning</li><li>Search results</li></ol>
+<div class="explain">Control data should not be writable by model nodes.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-17" data-topic="§16.4 State design">
+<p class="q">Large artefacts in the state should usually be stored as:</p>
+<ol class="opts"><li>Inline text</li><li data-correct>References such as file paths or IDs</li><li>Embeddings</li><li>Model weights</li></ol>
+<div class="explain">Keeps checkpoints and contexts small.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-18" data-topic="§16.4 Replay">
+<p class="q">The main benefit of replay from a checkpoint when debugging a bad prompt late in a run is:</p>
+<ol class="opts"><li>It is free</li><li data-correct>It re-runs only the remaining nodes on identical inputs, isolating the effect of the change</li><li>It avoids model calls</li><li>It removes randomness entirely</li></ol>
+<div class="explain">Comparability matters as much as the saving.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-19" data-topic="§16.5 Frameworks">
+<p class="q">Select all genuine benefits of agent frameworks.</p>
+<ol class="opts"><li data-correct>Integrations with providers, tools and vector stores</li><li data-correct>Implementations of common patterns, state and checkpointing</li><li data-correct>Tracing and evaluation hooks</li><li>Guaranteed better prompts</li></ol>
+<div class="explain">They do not make the context better by themselves.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-20" data-topic="§16.5 Costs">
+<p class="q">The most consequential cost of a framework, in this book's terms, is often:</p>
+<ol class="opts"><li>Licence fees</li><li data-correct>Hidden assembly of prompts and context, which makes context engineering and debugging harder</li><li>Slower CPUs</li><li>Larger models</li></ol>
+<div class="explain">Quality is decided in the context.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-21" data-topic="§16.5 Decision">
+<p class="q">When is a graph runtime most clearly worth adopting?</p>
+<ol class="opts"><li>For a single tool-calling loop</li><li data-correct>For many components with long-running or paused runs, human approvals and structural safety properties</li><li>For one-off scripts</li><li>Never</li></ol>
+<div class="explain">Direct API calls suffice for small systems.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-22" data-topic="§16.5 Ownership">
+<p class="q">Whatever framework is used, which should remain in the team's own version-controlled code?</p>
+<ol class="opts"><li data-correct>Prompts, tool definitions and the state schema</li><li>Only the README</li><li>The model weights</li><li>Nothing</li></ol>
+<div class="explain">The framework should be an execution engine, not where behaviour is defined.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-23" data-topic="§16.6 Testing">
+<p class="q">A golden trajectory test is:</p>
+<ol class="opts"><li>A unit test of a code node</li><li data-correct>A replay of a real past interaction with its known correct outcome, run to catch regressions</li><li>A load test</li><li>A static type check</li></ol>
+<div class="explain">Trajectory-level regression testing.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-24" data-topic="§16.6 Testing">
+<p class="q">Why make model nodes replaceable by recorded outputs in tests?</p>
+<ol class="opts"><li>Recorded outputs are better</li><li data-correct>So tests of surrounding logic are deterministic and cheap, with live-model tests run on a schedule</li><li>To avoid prompts</li><li>To hide failures</li></ol>
+<div class="explain">Separates logic bugs from model variability.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-25" data-topic="§16.6 Property tests">
+<p class="q">Which is a property test for an agent system?</p>
+<ol class="opts"><li>"The reply is polite" on one example</li><li data-correct>"No execution reaches a write without a passing check", checked over many randomised and adversarial episodes</li><li>Measuring latency once</li><li>Reading the prompt</li></ol>
+<div class="explain">Invariants over many inputs, or statically on the graph.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-26" data-topic="§16.7 Architectures">
+<p class="q">Which outer structure fits the research agent?</p>
+<ol class="opts"><li>A single prompt chain</li><li data-correct>Orchestrator–workers with a citation-checking stage</li><li>A router to FAQ flows</li><li>No structure</li></ol>
+<div class="explain">Breadth-first work with verification.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-27" data-topic="§16.7 Architectures">
+<p class="q">Where is model autonomy highest in the coding agent's architecture?</p>
+<ol class="opts"><li>In commits</li><li>In test runs</li><li data-correct>Within milestones: localising, editing and debugging</li><li>In forbidden-file checks</li></ol>
+<div class="explain">High variability with strong feedback.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-28" data-topic="§16.2 Autonomy factors">
+<p class="q">Select all factors that favour more autonomy for a component.</p>
+<ol class="opts"><li data-correct>High variability of the right steps</li><li data-correct>Informative feedback from the environment</li><li data-correct>Low or reversible cost of error</li><li>Strict regulatory rules</li></ol>
+<div class="explain">Rules and costly errors favour code.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-29" data-topic="§16.3 Graph vs agent">
+<p class="q">An autonomous agent loop, expressed as a graph, is:</p>
+<ol class="opts"><li>Impossible</li><li data-correct>A model node and a tool node in a loop with a conditional exit</li><li>A straight chain</li><li>A router only</li></ol>
+<div class="explain">Graphs subsume both workflows and agents.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-30" data-topic="§16.4 Interrupts">
+<p class="q">A human-in-the-loop interrupt in a durable graph:</p>
+<ol class="opts"><li>Keeps a process running idle for days</li><li data-correct>Saves state and pauses the run until a person responds, then resumes from the checkpoint</li><li>Restarts the run from scratch</li><li>Requires a new model</li></ol>
+<div class="explain">Approvals can take hours without holding resources.</div>
+</div>
+
+<div class="mcq" data-id="ch16-mcq-31" data-topic="§16.5 Provider SDKs">
+<p class="q">A provider's agent SDK is most attractive when:</p>
+<ol class="opts"><li>Building any small chain</li><li data-correct>Building an agent like the provider's own products, whose harness features (compaction, sub-agents, tool conventions) match the need</li><li>Avoiding that provider's models</li><li>No tools are used</li></ol>
+<div class="explain">The SDKs package the harnesses behind those products.</div>
+</div>
+<div class="mcq" data-id="ch16-mcq-32" data-topic="§16.10 Prototype to production">
+<p class="q">What should be the first step in turning an agent prototype into a production system?</p>
+<ol class="opts"><li>Adopt a framework</li><li>Add more agents</li><li data-correct>Collect real tasks with a definition of success and measure the prototype on them</li><li>Fine-tune a model</li></ol>
+<div class="explain">Measure, structure, then optimise.</div>
+</div>
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer out loud first, then reveal the model answer and rate yourself.</p>
+
+<details class="qa" data-id="ch16-qa-01">
+<summary><span class="lvl warm">Warm-up</span> Name the common building blocks of agent systems.</summary>
+<div class="answer"><p>The augmented model (LLM with retrieval, tools and memory); prompt chaining (fixed steps with gates); routing (classify and dispatch to specialised flows); parallelisation (sectioning and voting); orchestrator–workers (model-chosen sub-tasks); evaluator–optimizer (generate, evaluate, revise loop); and autonomous agents (model chooses every step). Real systems compose them, using the least autonomy that works at each point.</p></div>
+</details>
+
+<details class="qa" data-id="ch16-qa-02">
+<summary><span class="lvl warm">Warm-up</span> When would you use a fixed workflow instead of an agent?</summary>
+<div class="answer"><p>When the steps are predictable, errors are costly or irreversible, rules are known, and testability, latency and cost matter: e.g. authentication, policy checks, data extraction pipelines. Use agents where the right steps vary by input and the environment gives feedback. Most systems mix: workflows for the skeleton, agents in the nodes that need judgement.</p></div>
+</details>
+
+<details class="qa" data-id="ch16-qa-03">
+<summary><span class="lvl warm">Warm-up</span> Should you use an agent framework?</summary>
+<div class="answer"><p>It depends on the system. Frameworks give integrations, patterns, state, checkpointing and tracing, but can hide the context the model sees, leak abstractions when debugging, change quickly and lock you in. Start with direct API calls and a thin harness for small systems; adopt a graph runtime for complex, long-running systems with approvals and structural safety needs; consider a provider SDK for agents like the provider's products. Keep prompts, tools and state schemas in your own code.</p></div>
+</details>
+
+<details class="qa" data-id="ch16-qa-04">
+<summary><span class="lvl core">Core</span> Compute the reliability of a prompt chain and show how gates help.</summary>
+<div class="answer"><p>A chain of \(k\) stages with success \(\rho_s\) succeeds with \(\rho_s^k\): ten 95% stages give 60%. A gate catching a fraction \(r_g\) of a stage's failures with one retry raises that stage to \(\rho_s+(1-\rho_s)r_g\rho_s\): 0.988 for \(\rho_s=0.95,r_g=0.8\), so ten gated stages give 89%. Place gates after the weakest or most consequential stages; prefer deterministic gates (schema, policy, citation checks) for known error rates.</p></div>
+</details>
+
+<details class="qa" data-id="ch16-qa-05">
+<summary><span class="lvl core">Core</span> When does routing to specialised flows beat a single general agent?</summary>
+<div class="answer"><p>When \(r\,a_{\text{spec}}+(1-r)a_{\text{mis}}>a_{\text{gen}}\), where \(r\) is router accuracy, \(a_{\text{spec}}\) the specialised flows' accuracy on their own inputs, \(a_{\text{mis}}\) the resolution rate of misrouted requests and \(a_{\text{gen}}\) the general agent's. With 97%, 60% and 88%, routing pays above \(r\approx0.76\). Adding "not mine" exits to the general agent raises \(a_{\text{mis}}\) and lowers the threshold; routing uncertain cases (low router confidence) to the general agent helps too. Specialised flows are often also cheaper.</p></div>
+</details>
+
+<details class="qa" data-id="ch16-qa-06">
+<summary><span class="lvl core">Core</span> Why represent an agent system as an explicit graph?</summary>
+<div class="answer"><p>It makes control flow inspectable and safety properties structural: if every edge into a write node comes from a policy-check node guarded by a code-set flag, no model output can bypass it, which can be verified by reachability on the graph rather than tested statistically. Graphs also give a natural unit for checkpointing, interrupts, tracing and testing, and they let model autonomy be concentrated inside specific nodes.</p></div>
+</details>
+
+<details class="qa" data-id="ch16-qa-07">
+<summary><span class="lvl core">Core</span> Explain durable execution for agent graphs.</summary>
+<div class="answer"><p>The runtime persists the typed state after each node, keyed by run. On crash or pause it resumes from the last checkpoint without re-running completed nodes (side-effecting nodes must be idempotent or recorded). Interrupts let nodes wait for human approval or input for long periods without holding resources. Checkpoints enable replay from any point for debugging and provide a per-node trace. State schema design matters: separate model-visible data from control flags, store references for large artefacts, version the schema.</p></div>
+</details>
+
+<details class="qa" data-id="ch16-qa-08">
+<summary><span class="lvl core">Core</span> How do you test an agent system?</summary>
+<div class="answer"><p>Node tests (unit tests for code nodes; labelled datasets for model nodes, re-run on prompt or model changes), contract tests (tool schemas and behaviours, allowed state writes), trajectory tests (golden replays of real interactions, simulated users and environments, outcome and path checks), and property tests (invariants over randomised and adversarial episodes, or static graph checks). Replace model nodes with recorded outputs for deterministic logic tests; run live end-to-end evaluations on a schedule; track per-node quality metrics over time.</p></div>
+</details>
+
+<details class="qa" data-id="ch16-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Formalise when a safety property of an agent system can be verified without reasoning about the model.</summary>
+<div class="answer"><p>Model the system as a transition system over (node, state) with guarded edges; model nodes are stochastic maps restricted to writing certain state fields; guards are predicates. A property "every path to node \(w\) passes node \(u\) with \(\phi\) true" can be verified on the graph if (a) all edges into \(w\) are guarded by predicates implying \(\phi\) was established at \(u\), (b) the fields \(\phi\) depends on are writable only by code nodes (notably \(u\)), and (c) no model node can create edges or invoke tools outside its node's allowed set. Then for any model behaviour the property holds. Where model nodes have tools that act directly, the property depends on the model and needs statistical testing.</p></div>
+</details>
+
+<details class="qa" data-id="ch16-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> How do you decide the granularity of nodes in an agent graph?</summary>
+<div class="answer"><p>A node should be a unit of work with a clear input and output in the state, a natural checkpoint, a meaningful test, and a single responsibility (one model decision, one tool action, one check). Too coarse (one giant agent node) loses structural guarantees and observability; too fine (a node per token-level decision) adds overhead and makes the graph rigid. Place node boundaries where you want a gate, an approval, a checkpoint or a change of model or permissions, and keep free-form agent loops inside nodes where variability is high.</p></div>
+</details>
+
+<details class="qa" data-id="ch16-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> What are the risks of hidden context in frameworks, and how do you mitigate them?</summary>
+<div class="answer"><p>Frameworks may inject their own system prompts, format tool results verbosely, append memory automatically, reorder messages or change templates across versions, so the model sees a context the team did not design and cannot easily inspect; caching may break, costs rise, and behaviour shifts with framework upgrades. Mitigations: log the exact request sent to the model for every call; pin framework versions; override or own prompt templates; test with golden trajectories on upgrades; and prefer frameworks that expose the raw context.</p></div>
+</details>
+
+<details class="qa" data-id="ch16-qa-12">
+<summary><span class="lvl design">Design</span> Architect the airline support system end to end.</summary>
+<div class="answer"><p>Graph: start → authentication (code) → router (small model, confidence threshold) → FAQ chain (retrieval + citation gate) / change agent (read tools, deterministic quote tool) / refund flow / general agent with escalation; every write path → policy check (code) → approval above threshold (human interrupt) → idempotent write → read-back → reply. Typed state with code-only control flags; checkpoints per node; per-node tracing. Specialised flows have "not mine" exits. Tests: node datasets, tool contracts, golden conversations, adversarial property tests (injection, pressure for exceptions). Metrics: resolution rate per type, router accuracy, gate catch rates, escalations, cost and latency per conversation.</p></div>
+</details>
+
+<details class="qa" data-id="ch16-qa-13">
+<summary><span class="lvl design">Design</span> A team built everything as one autonomous agent with 40 tools. Performance is erratic. How would you re-architect?</summary>
+<div class="answer"><p>Mine logs for task types and their tool sequences. Extract deterministic parts (validation, policy, computations) into code nodes. Add a router for clearly distinct task types with specialised flows using small tool sets (raising selection accuracy, §8.8). Keep a general agent for the long tail. Make safety-critical sequencing structural in a graph. Add gates after weak steps. Introduce typed state and checkpoints. Measure each component and the whole on a fixed evaluation set before and after, aiming for higher reliability and lower cost without loss of coverage.</p></div>
+</details>
+
+<details class="qa" data-id="ch16-qa-14">
+<summary><span class="lvl design">Design</span> How would you design the state schema for a durable research-agent graph?</summary>
+<div class="answer"><p>Fields: question (verbatim), plan (sub-questions with status and assigned worker), findings (references to stored claim–evidence records with source URLs and confidence), open questions, budget counters (tokens, time, rounds), control flags (plan_approved, citations_verified) writable only by code or humans, draft report reference, and message history for the lead (bounded). Large artefacts (pages, drafts) stored externally by reference. Versioned schema with migrations for paused runs. This makes the run resumable, inspectable and testable.</p></div>
+</details>
+
+<details class="qa" data-id="ch16-qa-15">
+<summary><span class="lvl core">Core</span> What is the evaluator–optimizer pattern and when does it fit?</summary>
+<div class="answer"><p>A generator produces an output and an evaluator gives feedback in a loop until the output passes or a round limit is reached. It fits when evaluation criteria are clear and checking is easier than generating (code with tests, translations with explicit requirements, citations against sources), and iterative refinement measurably helps. Its value depends on the evaluator's reliability (Chapter 7); bound rounds and revise only on specific flags.</p></div>
+</details>
+
+<details class="qa" data-id="ch16-qa-16">
+<summary><span class="lvl core">Core</span> Where should gates go in an agent architecture?</summary>
+<div class="answer"><p>After stages with the lowest success rates, before stages whose errors are expensive to propagate or irreversible (writes, external messages), and at boundaries between components (handovers). Prefer deterministic gates where properties can be checked by code; use model or human checks where they cannot. Each gate should produce an actionable error for retry.</p></div>
+</details>
+
+<details class="qa" data-id="ch16-qa-17">
+<summary><span class="lvl core">Core</span> How would you size the infrastructure for an event-triggered agent?</summary>
+<div class="answer"><p>Use Little's law: average runs in flight \(=\) arrival rate \(\times\) average run duration, then add headroom for peaks (e.g. three times the mean). From concurrency derive sandboxes, workers and the tokens per minute the model provider must allow. Add deduplication by event ID (at-least-once delivery), idempotent outputs (check for an existing PR before opening one), rate limiting and prioritisation in the queue, merging of redundant events, and per-source and per-run budgets.</p></div>
+</details>
+
+<details class="qa" data-id="ch16-qa-18">
+<summary><span class="lvl core">Core</span> How do you choose which model to use at each node of an agent system?</summary>
+<div class="answer"><p>Measure candidate models on each node's labelled data; estimate the cost of the node's errors including propagation; pick the cheapest model within tolerance of the best, or a cascade where the small model's confidence is informative. Routine nodes (routing, extraction, summarisation) usually go to small models, which carry most tokens; consequential, rare decisions get the strongest model, a reasoning budget or a diverse vote. Re-measure when models change.</p></div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="ref-bea">E. Schluntz and B. Zhang. Building Effective Agents. Anthropic, December 2024. <a href="https://www.anthropic.com/research/building-effective-agents">anthropic.com</a>.</li>
+<li id="ref-langgraph">LangChain. LangGraph documentation: graphs, state, persistence and human-in-the-loop. <a href="https://langchain-ai.github.io/langgraph/">langchain-ai.github.io/langgraph</a>.</li>
+<li id="ref-little">J. D. C. Little. A Proof for the Queuing Formula: L = λW. <em>Operations Research</em>, 9(3), 1961.</li>
+<li>Further reading: OpenAI, Agents SDK documentation (2025); Anthropic, Claude Agent SDK documentation (2025); Google, Agent Development Kit documentation (2025); Q. Wu et al., AutoGen, <a href="https://arxiv.org/abs/2308.08155">arXiv:2308.08155</a>; Hugging Face, smolagents documentation; E. M. Clarke, O. Grumberg, D. Peled, <em>Model Checking</em>, MIT Press, 1999.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

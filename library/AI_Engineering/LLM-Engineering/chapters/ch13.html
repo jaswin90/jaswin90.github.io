@@ -1,0 +1,692 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 13 · Disaggregated Serving — Introduction to LLM Engineering</title>
+<meta name="description" content="Chapter 13 of Introduction to LLM Engineering: prefill-decode interference, goodput, Splitwise and DistServe, the cost of KV transfer, sizing prefill and decode pools, the colocation bound, Mooncake, Dynamo and llm-d, KV-aware routing and attention-FFN disaggregation.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script defer src="/library/assets/book-shim.js" data-library="/library/" data-field="/library/AI_Engineering/" data-field-title="AI Engineering"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-chapter="ch13" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Part IV · Serving Systems — Chapter 13</div>
+<h1 id="top">Disaggregated Serving</h1>
+<p class="lede">Prefill and decode want different things from the hardware and get in each other's way when they share it. This chapter asks when they should run on different machines, what it costs to move the KV cache between them, how to size the two pools, and how the idea grew from two research papers in 2024 into the architecture of large-scale serving.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Every chapter so far has assumed that one engine does everything: it prefills a prompt, writes the KV cache, and then decodes from that cache on the same GPUs. Chapter 11 showed that this arrangement has an intrinsic tension. A prefill step is compute-bound and long; a decode step is memory-bound and short; and when they share a step, one of them suffers. Chunked prefill (§11.6) manages the tension by mixing a bounded amount of prefill into every decode step, and for many deployments that is enough. But it leaves a single knob, the token budget, to serve two masters. A larger budget lowers time to first token and raises time per output token; a smaller budget does the opposite. There is no setting that is best for both, and the compromise gets worse as prompts get longer and latency targets get tighter.</p>
+<p>In 2024 two research groups proposed the obvious radical alternative: put prefill and decode on <em>different</em> GPUs. Prefill machines compute KV caches and hand them over; decode machines receive them and generate. Each pool can be sized, parallelised and even built from different hardware for its own phase, and neither can disturb the other's latency. The price is that every request's KV cache must cross the network, and that the system becomes a distributed system, with routing, transfer, placement and failure handling to get right. Within eighteen months the idea had moved from papers to the largest production deployments, including Moonshot AI's Kimi and DeepSeek's own serving of DeepSeek-V3, and into open frameworks such as NVIDIA Dynamo and llm-d.</p>
+<p>This chapter develops disaggregation the way an engineer would have to justify it. We first make the interference problem quantitative and define <strong>goodput</strong>, the objective that disaggregation optimises. We then derive the cost of moving the cache and show why grouped-query and latent attention made disaggregation practical. We size a deployment, and we prove a perhaps surprising result: on identical hardware, an ideal colocated engine is never less efficient than a disaggregated one. Understanding exactly which assumption of that result fails in practice is what tells you when to disaggregate. We end with the KV-centric architecture of Mooncake, the production frameworks, and the newest step, splitting attention from the feed-forward layers.</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Explain prefill–decode interference quantitatively, and why chunked prefill couples TTFT and TPOT through one knob.</li>
+<li>Define goodput and SLO attainment, and explain why they, rather than throughput, are the right objective.</li>
+<li>Describe Splitwise and DistServe and the design choices they introduced.</li>
+<li>Derive the KV-transfer ratio \(\chi\), evaluate it for real models and networks, and explain layer-wise pipelining of transfers.</li>
+<li>Size the prefill and decode pools of a deployment from workload and hardware parameters.</li>
+<li>State and prove the colocation bound, and use its assumptions to decide when disaggregation pays.</li>
+<li>Describe Mooncake's KV-centric design, KV-aware routing, the Dynamo and llm-d frameworks, and attention–FFN disaggregation.</li>
+</ol>
+<p class="small muted">Uses: Chapters 3, 6, 10, 11 and 12. Symbols: <a href="../notation.html">notation page</a>.</p>
+</div>
+
+<h2 id="s13-1">13.1 Two phases on one machine</h2>
+<p>Recall the costs of the two phases for our running example, Llama 3 8B on one H100 (§3.6, §6.5). Prefilling a 4,000-token prompt performs about \(2N\times4000\approx6.4\times10^{13}\) FLOPs plus attention, and takes about 130 ms. A decode step for a batch of 64 sequences at 2k context reads about 33 GB of weights and cache, and takes about 10 ms. The two operations differ by more than an order of magnitude in duration, and they are limited by different resources: prefill by the tensor cores, decode by HBM bandwidth. A single engine must interleave them, and every way of doing so harms one of the two latency metrics.</p>
+<p>The oldest way, used by early engines, ran each prefill as its own step. When a prompt arrived, the running decodes paused for its whole prefill, so every user in the batch saw a gap of 130 ms in their stream, thirteen times the normal inter-token latency. Prioritising decodes instead, and prefilling only when the decode batch had nothing to do, protected inter-token latency but made new requests wait, inflating time to first token without bound under load. Chunked prefill, the modern compromise, splits each prompt into pieces and gives every step a token budget \(b\): each running decode contributes one token, and the rest of the budget goes to prefill chunks. Because a decode step leaves the tensor cores mostly idle, the first few hundred prefill tokens are nearly free (§11.6). Beyond that, every extra prefill token lengthens the step, and with it the time per output token of every running request.</p>
+
+<figure class="diagram" id="fig-13-1">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-label="Three ways to schedule prefill and decode">
+<text x="20" y="24" class="t-sm t-b">(a) Colocated, prefill as its own step</text>
+<text x="20" y="52" class="t-xs">GPU</text>
+<rect x="60" y="40" width="28" height="18" rx="2" class="fill-acc"/><rect x="90" y="40" width="28" height="18" rx="2" class="fill-acc"/><rect x="120" y="40" width="28" height="18" rx="2" class="fill-acc"/>
+<rect x="150" y="40" width="250" height="18" rx="2" class="fill-s2"/><text x="275" y="53" text-anchor="middle" class="t-xs t-on">prefill of a new 4k prompt</text>
+<rect x="402" y="40" width="28" height="18" rx="2" class="fill-acc"/><rect x="432" y="40" width="28" height="18" rx="2" class="fill-acc"/><rect x="462" y="40" width="28" height="18" rx="2" class="fill-acc"/><rect x="492" y="40" width="28" height="18" rx="2" class="fill-acc"/>
+<text x="275" y="76" text-anchor="middle" class="t-xs t-s2">every running stream stalls: an inter-token gap 13× the normal</text>
+<text x="20" y="110" class="t-sm t-b">(b) Colocated with chunked prefill</text>
+<text x="20" y="138" class="t-xs">GPU</text>
+<rect x="60" y="126" width="28" height="18" rx="2" class="fill-acc"/><rect x="88" y="126" width="34" height="18" rx="2" class="fill-s2"/>
+<rect x="124" y="126" width="28" height="18" rx="2" class="fill-acc"/><rect x="152" y="126" width="34" height="18" rx="2" class="fill-s2"/>
+<rect x="188" y="126" width="28" height="18" rx="2" class="fill-acc"/><rect x="216" y="126" width="34" height="18" rx="2" class="fill-s2"/>
+<rect x="252" y="126" width="28" height="18" rx="2" class="fill-acc"/><rect x="280" y="126" width="34" height="18" rx="2" class="fill-s2"/>
+<rect x="316" y="126" width="28" height="18" rx="2" class="fill-acc"/><rect x="344" y="126" width="34" height="18" rx="2" class="fill-s2"/>
+<rect x="380" y="126" width="28" height="18" rx="2" class="fill-acc"/><rect x="408" y="126" width="34" height="18" rx="2" class="fill-s2"/>
+<rect x="444" y="126" width="28" height="18" rx="2" class="fill-acc"/><rect x="472" y="126" width="34" height="18" rx="2" class="fill-s2"/>
+<text x="290" y="162" text-anchor="middle" class="t-xs t-s2">no stalls, but every step is longer: one budget trades TTFT against TPOT</text>
+<text x="20" y="196" class="t-sm t-b">(c) Disaggregated</text>
+<text x="20" y="224" class="t-xs">prefill GPU</text>
+<rect x="100" y="212" width="120" height="18" rx="2" class="fill-s2"/><rect x="222" y="212" width="90" height="18" rx="2" class="fill-s2"/><rect x="314" y="212" width="150" height="18" rx="2" class="fill-s2"/>
+<text x="20" y="268" class="t-xs">decode GPU</text>
+<rect x="100" y="256" width="28" height="18" rx="2" class="fill-acc"/><rect x="130" y="256" width="28" height="18" rx="2" class="fill-acc"/><rect x="160" y="256" width="28" height="18" rx="2" class="fill-acc"/><rect x="190" y="256" width="28" height="18" rx="2" class="fill-acc"/><rect x="220" y="256" width="28" height="18" rx="2" class="fill-acc"/><rect x="250" y="256" width="28" height="18" rx="2" class="fill-acc"/><rect x="280" y="256" width="28" height="18" rx="2" class="fill-acc"/><rect x="310" y="256" width="28" height="18" rx="2" class="fill-acc"/><rect x="340" y="256" width="28" height="18" rx="2" class="fill-acc"/><rect x="370" y="256" width="28" height="18" rx="2" class="fill-acc"/><rect x="400" y="256" width="28" height="18" rx="2" class="fill-acc"/><rect x="430" y="256" width="28" height="18" rx="2" class="fill-acc"/><rect x="460" y="256" width="28" height="18" rx="2" class="fill-acc"/><rect x="490" y="256" width="28" height="18" rx="2" class="fill-acc"/>
+<line x1="220" y1="232" x2="232" y2="254" class="ln" marker-end="url(#a131)"/><line x1="312" y1="232" x2="324" y2="254" class="ln" marker-end="url(#a131)"/>
+<text x="560" y="240" class="t-xs">KV cache sent</text><text x="560" y="254" class="t-xs">after each prefill</text>
+<defs><marker id="a131" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="560" y="40" width="14" height="12" class="fill-acc"/><text x="580" y="50" class="t-xs">decode step</text>
+<rect x="560" y="60" width="14" height="12" class="fill-s2"/><text x="580" y="70" class="t-xs">prefill work</text>
+<text x="290" y="292" text-anchor="middle" class="t-xs t-s2">steady decode steps and dedicated prefill; the KV cache crosses the network</text>
+</svg>
+<figcaption><b>Figure 13.1 — Three ways to combine prefill and decode.</b> (a) A prefill run as its own step stalls all running decodes. (b) Chunked prefill removes the stalls but lengthens every step, coupling TTFT and TPOT. (c) Disaggregation runs the phases on different GPUs, so decode steps stay short and steady, at the cost of sending each prompt's KV cache from the prefill GPU to the decode GPU.</figcaption></figure>
+
+<p>Figure 13.1 lays the three schedules side by side. In panel (a) the stall is plain to see: three short decode steps, one long prefill, then decode resumes. Panel (b) has no stall, but every step now carries some prefill and is correspondingly longer. Panel (c) is the subject of this chapter. The prefill GPU works through prompts back to back, the decode GPU runs short steps of a constant length, and the only coupling between them is the arrow: each finished prefill sends its KV cache across.</p>
+<p>The coupling in panel (b) can be written down. Model a mixed step with budget \(b\) tokens, \(B\) of them decodes, as taking the larger of its memory time and its compute time, with \(W\) the bytes of weights and cache it must read:</p>
+\[ t_{\text{step}}(b)\;\approx\;\max\!\Big(\frac{W}{\beta},\;\frac{2N\,b}{\pi_{\text{eff}}}\Big), \]
+<p>where \(\pi_{\text{eff}}\) is the compute rate actually achieved. A prompt of \(n_{\text{in}}\) tokens needs about \(n_{\text{in}}/(b-B)\) steps to prefill, so its time to first token falls as \(b\) grows, while the time per output token of every running request is \(t_{\text{step}}(b)\), which rises with \(b\) once the step becomes compute-bound. Both service-level objectives depend on the same \(b\), and they pull it in opposite directions. Long prompts make this worse, because more steps are needed per prompt, and a tight TPOT target makes it worse, because it caps \(b\). Before asking whether separating the phases helps, we need a precise statement of what "helps" means.</p>
+
+<h2 id="s13-2">13.2 Goodput: the right objective</h2>
+<p>Throughput, tokens or requests per second, is the number most often quoted for a serving system, and it is the wrong objective on its own. Any engine can raise its throughput by admitting larger batches and longer prefill chunks, and the price is latency. A system that serves 30 requests per second with a median TPOT of 80 ms is not better than one that serves 20 with a TPOT of 15 ms if the product needs 20 ms. What a deployment actually needs is the highest load it can carry while still meeting its latency targets. That quantity was named <strong>goodput</strong> by the DistServe authors<span class="cite"><a href="#r-distserve">[2]</a></span>.</p>
+<div class="box def">
+<div class="box-title">Definition — SLO attainment and goodput</div>
+<p>Fix latency targets \(T_1\) for TTFT and \(T_2\) for TPOT, and an attainment level \(q\) (for example 0.9 or 0.99). At arrival rate \(\lambda\), the <em>SLO attainment</em> is \(A(\lambda)=\Pr\big[\text{TTFT}\le T_1\ \text{and}\ \text{TPOT}\le T_2\big]\) for a random request in steady state. The <strong>goodput</strong> is \(G=\sup\{\lambda : A(\lambda)\ge q\}\), and the <em>per-GPU goodput</em> is \(G\) divided by the number of GPUs used.</p>
+</div>
+<p>Two features of this definition matter. First, it is a joint condition on both metrics for the same request. A system that meets TTFT for 95% of requests and TPOT for a different 95% may meet both for only 90%. Second, \(A(\lambda)\) is decreasing in \(\lambda\), because queueing grows with load (§11.8), so \(G\) is well defined and can be read off a curve of attainment against arrival rate. Per-GPU goodput is the right figure of merit for comparing architectures, because it is the quantity that determines cost: a deployment needs \(\lambda_{\text{peak}}/(G/n_{\text{GPU}})\) GPUs to carry a peak load \(\lambda_{\text{peak}}\).</p>
+<p>In these terms the problem of §13.1 is that a colocated engine has one control, the token budget, to satisfy two constraints, TTFT and TPOT. With tight targets on both, there may be no budget that meets them at the load we want, and goodput collapses even though the hardware is far from saturated. A disaggregated system has separate controls for each constraint: the number and configuration of prefill GPUs governs TTFT, and the number and configuration of decode GPUs governs TPOT. That is the real promise of disaggregation, and the first systems to pursue it said so explicitly.</p>
+
+<h2 id="s13-3">13.3 Splitting the phases: Splitwise and DistServe</h2>
+<p>Two papers, posted within weeks of each other in late 2023 and early 2024, proposed disaggregation from different starting points. <strong>Splitwise</strong> (Patel et al., Microsoft, ISCA 2024)<span class="cite"><a href="#r-splitwise">[1]</a></span> began from characterisation of production traces in Azure. Its authors observed that the token-generation phase uses a small fraction of a GPU's compute and power, and so "does not need the compute capability of the latest GPUs". If decode ran on separate machines, those machines could be older or cheaper GPUs, or the same GPUs power-capped, without hurting latency. Splitwise organised a cluster into a prompt pool, a token pool and a mixed pool that could absorb imbalance. It transferred the KV cache layer by layer over InfiniBand while the prompt was still being processed, and it reported up to 1.4× higher throughput at 20% lower cost, or 2.35× more throughput under the same cost and power budgets.</p>
+<p><strong>DistServe</strong> (Zhong et al., Peking University and UC San Diego, OSDI 2024)<span class="cite"><a href="#r-distserve">[2]</a></span> began from the latency side. It defined goodput, showed how interference made colocated systems miss TTFT and TPOT targets together, and argued that the two phases want not only separate GPUs but separate <em>parallelism</em>. Prefill, which must finish quickly, benefits from tensor parallelism to cut TTFT. Decode, which must sustain large batches, may prefer fewer GPUs per replica and more replicas, or pipeline parallelism. DistServe searched over the parallel configuration and number of instances of each phase with a simulator of SLO attainment, and placed instances with the network in mind: when cross-node bandwidth was scarce, it paired prefill and decode instances holding the same layers inside one NVLink-connected node, so that KV transfer never crossed the slower network. On A100 clusters it reported serving 7.4× more requests, or meeting 12.6× tighter SLOs, than the colocated systems of the time while keeping over 90% of requests within their targets. TetriInfer<span class="cite"><a href="#r-tetri">[3]</a></span> appeared in the same months with a similar split, adding length prediction to schedule decode instances.</p>
+
+<figure class="diagram" id="fig-13-2">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="Disaggregated serving architecture">
+<defs><marker id="a132" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="95" width="80" height="50" rx="8" class="bx"/><text x="55" y="118" text-anchor="middle" class="t-sm">clients</text><text x="55" y="134" text-anchor="middle" class="t-xs">HTTP / SSE</text>
+<rect x="125" y="85" width="110" height="70" rx="8" class="bx4"/><text x="180" y="108" text-anchor="middle" class="t-sm t-b">router</text><text x="180" y="125" text-anchor="middle" class="t-xs">picks a prefill and</text><text x="180" y="139" text-anchor="middle" class="t-xs">a decode instance</text>
+<rect x="275" y="20" width="170" height="90" rx="10" class="bx2"/><text x="360" y="40" text-anchor="middle" class="t-sm t-b">prefill pool (n<tspan dy="3" font-size="9">P</tspan><tspan dy="-3"> GPUs)</tspan></text>
+<rect x="290" y="52" width="65" height="44" rx="6" class="bx"/><text x="322" y="78" text-anchor="middle" class="t-xs">TP = 4</text>
+<rect x="365" y="52" width="65" height="44" rx="6" class="bx"/><text x="397" y="78" text-anchor="middle" class="t-xs">TP = 4</text>
+<rect x="275" y="140" width="170" height="90" rx="10" class="bx5"/><text x="360" y="160" text-anchor="middle" class="t-sm t-b">decode pool (n<tspan dy="3" font-size="9">D</tspan><tspan dy="-3"> GPUs)</tspan></text>
+<rect x="285" y="172" width="46" height="44" rx="6" class="bx"/><text x="308" y="198" text-anchor="middle" class="t-xs">TP 1</text>
+<rect x="337" y="172" width="46" height="44" rx="6" class="bx"/><text x="360" y="198" text-anchor="middle" class="t-xs">TP 1</text>
+<rect x="389" y="172" width="46" height="44" rx="6" class="bx"/><text x="412" y="198" text-anchor="middle" class="t-xs">TP 1</text>
+<line x1="95" y1="120" x2="123" y2="120" class="ln" marker-end="url(#a132)"/>
+<line x1="235" y1="105" x2="273" y2="70" class="ln" marker-end="url(#a132)"/>
+<line x1="235" y1="135" x2="273" y2="175" class="ln dash" marker-end="url(#a132)"/>
+<line x1="445" y1="80" x2="520" y2="80" class="ln"/><line x1="520" y1="80" x2="520" y2="185" class="ln"/><line x1="520" y1="185" x2="447" y2="185" class="ln" marker-end="url(#a132)"/>
+<text x="530" y="120" class="t-xs t-b">KV transfer</text><text x="530" y="136" class="t-xs">RDMA / NVLink,</text><text x="530" y="150" class="t-xs">layer by layer</text>
+<line x1="275" y1="230" x2="55" y2="230" class="ln"/><line x1="55" y1="230" x2="55" y2="147" class="ln" marker-end="url(#a132)"/>
+<text x="165" y="244" text-anchor="middle" class="t-xs">tokens streamed back</text>
+<text x="600" y="40" text-anchor="middle" class="t-xs">compute-bound:</text><text x="600" y="54" text-anchor="middle" class="t-xs">sized for TTFT</text>
+<text x="600" y="200" text-anchor="middle" class="t-xs">memory-bound:</text><text x="600" y="214" text-anchor="middle" class="t-xs">sized for TPOT</text>
+</svg>
+<figcaption><b>Figure 13.2 — A disaggregated deployment.</b> The router sends each request to a prefill instance, which computes the KV cache and the first token, and assigns a decode instance, which receives the cache and generates the rest. The two pools can differ in size, parallelism and hardware.</figcaption></figure>
+
+<p>Figure 13.2 shows the architecture both papers share. A request enters through a router, is prefilled on an instance in the prefill pool, and continues on an instance in the decode pool. The pools are sized and configured independently: here the prefill instances use four-way tensor parallelism to keep TTFT low on long prompts, while the decode instances each use one GPU, because, as Drill 12.1 showed, splitting a small model's decode across GPUs costs more in communication and CPU overhead than it gains. The prefill instance produces the first token, which can be streamed to the client at once; every later token comes from the decode instance.</p>
+<p>The headline speed-ups of the two papers deserve a careful reading. They were measured against colocated engines of 2023, which mostly ran prefill as separate steps or with crude chunking, and at operating points chosen to show the effect of interference. Chunked prefill narrows the gap considerably, a point the Sarathi-Serve authors made at the time<span class="cite"><a href="#r-sarathi">[4]</a></span>, and §13.6 will show that on identical hardware an ideal colocated engine is never less efficient than a disaggregated one. Disaggregation is not a free lunch. Its value lies in the assumptions that the ideal colocated engine violates, and to see them we must first account for the new cost it introduces.</p>
+
+<h2 id="s13-4">13.4 The cost of moving the cache</h2>
+<p>Disaggregation exists only because a KV cache can be moved faster than it can be recomputed. A prompt of \(n_{\text{in}}\) tokens leaves \(n_{\text{in}}\,s_{kv}\) bytes of cache, which must cross from prefill GPU to decode GPU. If that transfer took as long as the prefill itself, disaggregation would double TTFT and saturate the network. So the natural question is the ratio of the two times.</p>
+<p>Let \(\beta_{\text{net}}\) be the network bandwidth available per GPU, so that a prefill instance spread across several GPUs sends each GPU's share of the cache over that GPU's own network interface, and let \(\pi_{\text{eff}}\) be the achieved prefill compute rate per GPU. Ignoring attention FLOPs for the moment, the prefill costs \(2N\) FLOPs per token, and the ratio of transfer time to prefill time is</p>
+\[ \chi\;=\;\frac{n_{\text{in}}\,s_{kv}/\beta_{\text{net}}}{2N\,n_{\text{in}}/\pi_{\text{eff}}}\;=\;\frac{s_{kv}}{2N}\cdot\frac{\pi_{\text{eff}}}{\beta_{\text{net}}}. \]
+<p>The prompt length cancels. So does the tensor-parallel degree, since both the cache and the FLOPs divide evenly across the GPUs of an instance. What remains is the product of two ratios: the model's <em>bytes of cache per FLOP of prefill</em>, \(s_{kv}/2N\), which is a property of the architecture, and the hardware's <em>FLOPs per byte of network</em>, \(\pi_{\text{eff}}/\beta_{\text{net}}\), a property of the cluster. Including attention FLOPs only lengthens the prefill, so this \(\chi\) is an upper bound that is tight for short prompts and pessimistic for long ones.</p>
+<div class="box example">
+<div class="box-title">Worked example — moving a 2,000-token cache</div>
+<p><strong>Llama 3 8B, one H100, 400 Gb/s InfiniBand</strong> (\(\beta_{\text{net}}=50\) GB/s). The cache is \(2000\times128\) KiB \(\approx262\) MB, which takes 5.2 ms to send. The prefill costs \(2000\times(2N+2Ldn_{\text{in}})\approx2000\times1.66\times10^{10}\) FLOPs, about 56 ms at \(\pi_{\text{eff}}=593\) TFLOP/s (60% of peak). So \(\chi\approx0.094\): the transfer is under a tenth of the prefill. <strong>Llama 3 70B, TP = 4, one 400 Gb/s NIC per GPU.</strong> The cache is \(2000\times320\) KiB \(\approx655\) MB, 164 MB per GPU, which takes 3.3 ms. The prefill takes about \(2000\times1.44\times10^{11}/(4\times593\times10^{12})\approx121\) ms, so \(\chi\approx0.027\). The larger model does far more computation per byte of cache, because its eight KV heads serve a width of 8,192 rather than 4,096.</p>
+</div>
+
+<figure class="chart" id="fig-13-3">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"KV-transfer ratio against network bandwidth","height":340,
+ "x":{"label":"Network bandwidth per GPU (GB/s; 50 GB/s = 400 Gb/s)","log":true,"min":10,"max":125,"ticks":[12.5,25,50,100]},
+ "y":{"label":"Transfer time / prefill time (χ)","log":true,"min":0.004,"max":3,"ticks":[0.01,0.1,1]},
+ "hlines":[{"y":1,"text":"transfer as long as prefill"}],
+ "series":[
+  {"name":"MHA 7B (Llama 2 7B, 512 KiB/token)","color":"s2","points":[[12.5,1.85],[25,0.92],[50,0.46],[100,0.23]]},
+  {"name":"Llama 3 8B (GQA, 128 KiB)","color":"s1","points":[[12.5,0.387],[25,0.194],[50,0.097],[100,0.048]]},
+  {"name":"Llama 3 70B (GQA, 320 KiB)","color":"s3","points":[[12.5,0.11],[25,0.055],[50,0.0275],[100,0.0138]]},
+  {"name":"DeepSeek-V3 (MLA, 68.6 KiB, 37B active)","color":"s4","points":[[12.5,0.045],[25,0.0225],[50,0.0113],[100,0.0056]]}
+ ]}
+</script>
+<figcaption><b>Figure 13.3 — Cache-efficient attention made disaggregation cheap.</b> The ratio \(\chi\) of KV-transfer time to prefill time, at 60% prefill MFU on H100, ignoring attention FLOPs (an upper bound). A multi-head-attention model over a 100 Gb/s network spends longer sending its cache than computing it. GQA and especially MLA cut the ratio by one to two orders of magnitude.</figcaption></figure>
+
+<p>Figure 13.3 evaluates \(\chi\) for four models across the range of data-centre networks, from 100 Gb/s Ethernet to 800 Gb/s per GPU. Two facts stand out. The first is that \(\chi\) varies over more than two orders of magnitude, and that the model matters as much as the network. A 2023-era multi-head-attention model like Llama 2 7B, with 512 KiB of cache per token, needs a fast network just to bring \(\chi\) below one half. Llama 3 8B, with grouped-query attention, is almost five times cheaper to move, and DeepSeek-V3, whose latent attention caches 68.6 KiB per token for 37 billion active parameters, is cheaper by another factor of nine. The attention variants of Chapter 8, invented to shrink the cache for decode, turned out to be what made disaggregation economical as well. The second fact is that even the worst case improves with pipelining, which we now describe.</p>
+<p>A prefill computes layers in order, and the cache of layer \(\ell\) is complete as soon as layer \(\ell\) finishes. There is no need to wait for the whole prefill before sending: the engine can send layer \(\ell\)'s cache while it computes layer \(\ell+1\). If transfer and compute overlap perfectly and \(\chi&lt;1\), only the last layer's transfer remains exposed, adding about \(\chi/L\) of the prefill time to TTFT. For Llama 3 8B that is about 0.16 ms. Splitwise used exactly this layer-wise transfer. Its cost is engineering complexity: the decode instance must have allocated its blocks before the first layer arrives, and many small transfers are less efficient than a few large ones, so practical systems batch several layers or several requests per transfer.</p>
+
+<figure class="diagram" id="fig-13-4">
+<svg class="dg" viewBox="0 0 720 190" role="img" aria-label="Layer-wise pipelined KV transfer">
+<text x="20" y="24" class="t-sm t-b">Send after prefill</text>
+<text x="20" y="50" class="t-xs">compute</text><rect x="90" y="38" width="320" height="18" rx="2" class="fill-s2"/><text x="250" y="51" text-anchor="middle" class="t-xs t-on">layers 1 … L</text>
+<text x="20" y="76" class="t-xs">network</text><rect x="412" y="64" width="110" height="18" rx="2" class="fill-s4"/><text x="467" y="77" text-anchor="middle" class="t-xs t-on-dark">all KV</text>
+<text x="540" y="77" class="t-xs">exposed: χ × prefill</text>
+<text x="20" y="114" class="t-sm t-b">Layer-wise pipelined</text>
+<text x="20" y="140" class="t-xs">compute</text>
+<rect x="90" y="128" width="78" height="18" rx="2" class="fill-s2"/><rect x="170" y="128" width="78" height="18" rx="2" class="fill-s2"/><rect x="250" y="128" width="78" height="18" rx="2" class="fill-s2"/><rect x="330" y="128" width="78" height="18" rx="2" class="fill-s2"/>
+<text x="129" y="141" text-anchor="middle" class="t-xs t-on">ℓ = 1</text><text x="209" y="141" text-anchor="middle" class="t-xs t-on">ℓ = 2</text><text x="289" y="141" text-anchor="middle" class="t-xs t-on">ℓ = 3</text><text x="369" y="141" text-anchor="middle" class="t-xs t-on">ℓ = 4</text>
+<text x="20" y="166" class="t-xs">network</text>
+<rect x="170" y="154" width="27" height="18" rx="2" class="fill-s4"/><rect x="250" y="154" width="27" height="18" rx="2" class="fill-s4"/><rect x="330" y="154" width="27" height="18" rx="2" class="fill-s4"/><rect x="410" y="154" width="27" height="18" rx="2" class="fill-s4"/>
+<text x="460" y="167" class="t-xs">exposed: one layer's transfer, ≈ χ/L × prefill</text>
+</svg>
+<figcaption><b>Figure 13.4 — Hiding the transfer behind the prefill.</b> Sending the whole cache after the prefill adds \(\chi\) times the prefill time to TTFT (top). Sending each layer's cache while the next layer computes (bottom; four layers shown) leaves only the last layer's transfer exposed.</figcaption></figure>
+
+<p>Figure 13.4 contrasts the two strategies on a four-layer toy model. The pipelined timeline is only possible because of the layer structure of the Transformer, which produces the cache incrementally in a fixed order, and because the network and the tensor cores are independent resources that can work simultaneously. The same principle of overlapping a transfer with independent computation appeared in FlashAttention's tiling (Chapter 9) and in overlapped scheduling (§12.2), and it will appear again in tensor-parallel communication (Chapter 18).</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — RDMA and GPUDirect</div>
+<p>Ordinary networking copies data several times: from GPU memory to a buffer in CPU memory, through the operating system's network stack, onto the wire, and the reverse at the other end, with the CPU involved at every step. <em>Remote direct memory access</em> (RDMA), offered by InfiniBand and by RoCE (RDMA over Converged Ethernet), lets one machine's network card read or write another machine's registered memory directly, without the remote CPU. <em>GPUDirect RDMA</em> extends this to GPU memory, so the network card moves bytes from one GPU's HBM to another's with no copy through host memory. Abstractly, a transfer becomes a single remote assignment \(\text{dst}[a{:}a+k]\leftarrow\text{src}[b{:}b+k]\) between two address spaces. Within a node, NVLink provides the same operation at much higher bandwidth. Libraries such as NVIDIA's NIXL, Mooncake's Transfer Engine and LMCache wrap these mechanisms behind one interface for moving KV blocks.</p>
+</div>
+
+<p>The transfer can also be organised from either end. In a <em>push</em> design, the prefill instance writes the cache into blocks that the decode instance has pre-allocated. In a <em>pull</em> design, the prefill instance keeps the cache after prefill and the decode instance reads it when it is ready to admit the request, which lets the decode side apply back-pressure: if its memory is full, it simply does not pull yet, and the prefill side holds the cache a little longer. Either way the system now has two kinds of capacity to manage, prefill compute and decode memory, and the next question is how much of each to buy.</p>
+
+<h2 id="s13-5">13.5 Sizing the two pools</h2>
+<p>A colocated deployment has one size to choose: the number of replicas. A disaggregated one has two, \(n_P\) and \(n_D\), and their ratio depends on the workload. Long prompts and short answers, typical of retrieval-augmented generation and summarisation, need many prefill GPUs. Short prompts and long answers, typical of chat and reasoning, need many decode GPUs. Getting the ratio wrong leaves one pool idle while the other queues, so it is worth deriving.</p>
+<p>Consider requests arriving at rate \(\lambda\), each with \(n_{\text{in}}\) prompt tokens, of which a fraction \(h\) hit the prefix cache, and \(n_{\text{out}}\) output tokens. A prefill GPU spends \(F_P/\pi_{\text{eff}}\) seconds on each request, where \(F_P\approx(1-h)\,n_{\text{in}}\,(2N+2Ldn_{\text{in}})\) counts the linear layers and the attention of the uncached tokens. A decode GPU running batches of \(B\) sequences with step time \(t_{\text{step}}\) spends \(n_{\text{out}}\,t_{\text{step}}/B\) GPU-seconds on each request. To keep both pools busy without queues growing, the pools must be in the ratio of these costs:</p>
+\[ \frac{n_P}{n_D}\;=\;\frac{F_P/\pi_{\text{eff}}}{n_{\text{out}}\,t_{\text{step}}/B}. \]
+<p>The numerator grows with prompt length, linearly at first and then faster because of attention. The denominator also grows with context, because the TPOT target and the memory pool both limit the decode batch to \(B\propto1/t\) once contexts are long (§6.6). The ratio therefore rises steeply for short prompts and more slowly for long ones.</p>
+
+<figure class="chart" id="fig-13-5">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Prefill-to-decode GPU ratio against prompt length","height":330,
+ "x":{"label":"Prompt length (tokens, log)","log":true,"min":400,"max":40000,"ticks":[500,1000,2000,4000,8000,16000,32000]},
+ "y":{"label":"Prefill GPUs per decode GPU","min":0,"max":3.5,"ticks":[0,0.5,1,1.5,2,2.5,3,3.5]},
+ "hlines":[{"y":1,"text":"equal pools"}],
+ "series":[
+  {"name":"No prefix reuse","color":"s2","points":[[500,0.35],[1000,0.7],[2000,1.43],[4000,2.11],[8000,2.31],[16000,2.61],[32000,3.18]]},
+  {"name":"50% of prompt tokens hit the prefix cache","color":"s1","points":[[500,0.17],[1000,0.35],[2000,0.72],[4000,1.05],[8000,1.15],[16000,1.31],[32000,1.59]]}
+ ]}
+</script>
+<figcaption><b>Figure 13.5 — The right pool ratio depends on the workload.</b> Llama 3 8B on H100s, 500 output tokens, TPOT target 20 ms, FP8 cache, decode batch capped at 256, prefill at 60% MFU. The ratio rises linearly while the decode batch is at its cap, then more slowly once long contexts shrink the decode batch too. Prefix caching halves it.</figcaption></figure>
+
+<p>Figure 13.5 plots the ratio for Llama 3 8B with 500-token answers. Up to about 2,000 prompt tokens the decode batch stays at its cap of 256, so the decode cost per request is constant and the ratio grows in proportion to the prompt. Beyond that, the decode batch is limited to about \(7.8\times10^{5}/t\) sequences by the TPOT target, decode cost grows with context too, and the curve flattens, rising again slowly as attention FLOPs make long prefills superlinear. A prefix-cache hit rate of 50% halves the ratio at every length, since only uncached tokens need prefill. The practical lesson is that the pool ratio is a property of the traffic, not of the model, and that it drifts as traffic changes: a deployment serving chat by day and document summarisation by night wants different ratios at different hours. That is why production frameworks include a planner that moves GPUs between pools (§13.8).</p>
+<div class="box example">
+<div class="box-title">Worked example — sizing a deployment</div>
+<p>Serve Llama 3 8B at a peak of \(\lambda=200\) requests per second, with 2,000-token prompts (no prefix reuse), 500-token answers, TTFT under 500 ms and TPOT under 20 ms, on H100s. <strong>Prefill:</strong> \(200\times2000=4\times10^{5}\) tokens/s at \(1.66\times10^{10}\) FLOPs each is \(6.6\times10^{15}\) FLOP/s, or 11.2 GPUs at 593 TFLOP/s each. Prefill instances are queues, and running them near saturation makes TTFT explode (§11.8), so we plan for 70% utilisation: \(n_P=16\). Each prefill takes about 56 ms, so queueing at 70% leaves ample room within 500 ms. <strong>Decode:</strong> \(200\times500=10^{5}\) output tokens/s. At 2,250 mean live tokens, the TPOT target allows about 345 sequences, and we cap the batch at 256 (§12.7), so a decode GPU produces \(256/0.020=12{,}800\) tokens/s. That is 7.8 GPUs; with headroom for bursts and imbalance, \(n_D=10\). <strong>Network:</strong> each prefill GPU sends \(200/16=12.5\) caches per second of 262 MB, about 3.3 GB/s, well within a 50 GB/s link. <strong>Total:</strong> 26 GPUs, in a ratio of 1.6 prefill to 1 decode.</p>
+</div>
+<p>The example shows the shape of the calculation, but it also hides a question. The 16 prefill GPUs do nothing but compute; the 10 decode GPUs do nothing but read memory, and their tensor cores are idle most of the time. A colocated engine would use those idle tensor cores for prefill. Is the disaggregated deployment actually more efficient than a colocated one of the same size? The answer is subtle enough to deserve a proof.</p>
+
+<details class="drill">
+<summary>Drill 13.1 — When the network is too slow</summary>
+<p>A team serves Llama 2 7B (multi-head attention, 512 KiB of BF16 cache per token, \(N=6.74\)B) on H100s connected by 100 Gb/s Ethernet, and proposes disaggregation. Evaluate \(\chi\), and propose two remedies.</p>
+<p><em>Solution.</em> \(\beta_{\text{net}}=12.5\) GB/s, so \(\chi=\frac{524{,}288}{2\times6.74\times10^{9}}\times\frac{593\times10^{12}}{12.5\times10^{9}}\approx1.85\). Sending the cache takes almost twice as long as computing it, so even perfect pipelining leaves the transfer, not the prefill, on the critical path, and the network must carry nearly two bytes of cache for every byte-equivalent of prefill work. Remedies: an FP8 cache halves \(s_{kv}\) and \(\chi\) to about 0.92; a faster network (400 Gb/s RDMA) divides it by four, to about 0.46 for BF16; keeping each prefill–decode pair within one NVLink-connected node, as DistServe did, removes the slow link altogether. The most effective remedy is a model with GQA, which cuts \(s_{kv}\) fourfold.</p>
+</details>
+
+<h2 id="s13-6">13.6 When does disaggregation pay?</h2>
+<p>Let us compare the two architectures on identical hardware, with an idealised colocated engine: chunked prefill fills every decode step's idle tensor cores with prefill tokens, up to the point where the step becomes compute-bound at exactly the TPOT target. Each request requires \(F_P\) FLOPs of prefill and \(F_D\) FLOPs of decode, and the colocated engine performs both at the achieved rate \(\pi_{\text{eff}}\).</p>
+<div class="box thm">
+<div class="box-title">Proposition 13.1 — The colocation bound</div>
+<p>Suppose all GPUs are identical, the colocated engine can run compute-saturated mixed steps that meet the TPOT target, and both architectures achieve the same compute rate \(\pi_{\text{eff}}\) on prefill. Then the per-GPU throughput of the colocated engine is at least that of any disaggregated deployment.</p>
+<p><em>Proof.</em> A compute-saturated colocated engine spends \((F_P+F_D)/\pi_{\text{eff}}\) GPU-seconds per request, so it serves \(\pi_{\text{eff}}/(F_P+F_D)\) requests per GPU-second. A disaggregated deployment spends \(F_P/\pi_{\text{eff}}\) prefill GPU-seconds and \(\tau_D=n_{\text{out}}t_{\text{step}}/B\) decode GPU-seconds per request. A decode GPU cannot perform its \(F_D\) FLOPs per request faster than its compute rate allows, so \(\tau_D\ge F_D/\pi_{\text{eff}}\), with strict inequality whenever decode is memory-bound. Hence its per-GPU rate, \(1/(F_P/\pi_{\text{eff}}+\tau_D)\), is at most \(\pi_{\text{eff}}/(F_P+F_D)\). \(\square\)</p>
+</div>
+<p>The proof is short because the idea is simple. Decode leaves tensor cores idle; a colocated engine can fill them with prefill; a disaggregated decode GPU cannot. For our 8B workload with 2,000-token prompts, the idealised colocated engine serves about 14.3 requests per second per GPU, while the disaggregated deployment of the worked example serves about 10.5 at full utilisation of both pools.</p>
+
+<figure class="chart" id="fig-13-6">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Idealised per-GPU throughput, colocated against disaggregated","height":330,
+ "x":{"label":"Prompt length (tokens, log)","log":true,"min":400,"max":40000,"ticks":[500,1000,2000,4000,8000,16000,32000]},
+ "y":{"label":"Requests per second per GPU (log)","log":true,"min":0.5,"max":40,"ticks":[1,10]},
+ "series":[
+  {"name":"Colocated, compute-saturated (upper bound)","color":"s1","points":[[500,25.6],[1000,24.2],[2000,14.3],[4000,7.7],[8000,3.84],[16000,1.77],[32000,0.75]]},
+  {"name":"Disaggregated, both pools fully used","color":"s2","points":[[500,19.0],[1000,15.0],[2000,10.5],[4000,5.88],[8000,2.85],[16000,1.32],[32000,0.58]]}
+ ]}
+</script>
+<figcaption><b>Figure 13.6 — On identical hardware, ideal colocation wins on throughput.</b> Llama 3 8B, H100, 500 output tokens, TPOT 20 ms, using the cost model of §13.5. The colocated curve assumes chunked prefill can saturate compute without breaking the TPOT target, so it is an upper bound; short prompts are capped by the decode batch limit. The gap, 25–35%, is the value of the idle tensor cores on decode GPUs. Disaggregation must win back that gap through effects this model leaves out.</figcaption></figure>
+
+<p>Figure 13.6 extends the comparison across prompt lengths. The colocated curve lies above the disaggregated one everywhere, by 25–35%. If that were the whole story, nobody would disaggregate. The story is in the hypotheses of the proposition, each of which fails in a recognisable regime.</p>
+<p>The first hypothesis is that a colocated engine can saturate compute while meeting the TPOT target. Saturation means every step runs at the target, with no slack. Real traffic is bursty: prompts arrive in clusters, step times vary with the mix, and a P99 TPOT target forces the mean step well below the limit. Chunked prefill also has costs the ideal ignores, since each chunk re-reads the cache of all earlier chunks (§11.6), and very long prompts need many chunks. When targets on both TTFT and TPOT are tight, a colocated engine can be forced far from saturation, and its goodput falls below that of a disaggregated system, which meets each target with its own pool. This is the regime DistServe studied, and it is why the proposition speaks of throughput, not goodput.</p>
+<p>The second hypothesis is identical hardware. Decode needs bandwidth and memory capacity; prefill needs FLOPs. If decode can run on GPUs that offer more bandwidth per dollar, such as previous-generation parts, power-capped parts or high-memory parts like the H200, the cost comparison changes even if the throughput comparison does not. This was Splitwise's argument. The third hypothesis is the same parallelism. Prefill may want tensor parallelism to cut TTFT on long prompts; decode of a large mixture-of-experts model wants enormous batches spread across dozens of GPUs with expert parallelism, so that each expert's weights are read once for many tokens (Chapter 19). DeepSeek, for instance, deployed DeepSeek-V3 with prefill units of 32 GPUs and decode units of 320 GPUs<span class="cite"><a href="#r-dsv3">[7]</a></span>, configurations no single colocated layout could serve well. The fourth is operational. Separate pools can be scaled, upgraded and isolated independently, and a long-prompt surge no longer degrades every running stream.</p>
+<p>The decision rule that emerges is therefore not "disaggregation is faster". It is that disaggregation pays when tight joint latency targets, heterogeneous hardware, phase-specific parallelism or scale make the ideal colocated engine unattainable. Small dense models with relaxed TPOT targets on homogeneous clusters are usually served best colocated, with chunked prefill. Large MoE models, long-context workloads and tight interactive SLOs are increasingly served disaggregated. One factor amplifies all of these: when the KV cache becomes something that can be moved cheaply, it can also be stored, shared and reused across the whole cluster. That observation is the starting point of Mooncake.</p>
+
+<details class="drill">
+<summary>Drill 13.2 — Re-sizing for a new workload</summary>
+<p>The deployment of the worked example is moved to a retrieval workload with 8,000-token prompts, half of which are shared document chunks that hit the prefix cache, and 250-token answers. Estimate the new pool ratio from the model of §13.5, and say which way it moves.</p>
+<p><em>Solution.</em> Uncached prefill is 4,000 tokens at about \(1.6\times10^{10}+2\times32\times4096\times8000\approx1.8\times10^{10}\) FLOPs each, \(7.2\times10^{13}\) FLOPs, or 122 ms of prefill GPU time per request. Decode at a live context of about 8,125 tokens is limited to \(B\approx7.8\times10^{5}/8125\approx96\) sequences, so each request costs \(250\times0.020/96\approx52\) ms of decode GPU time. The ratio is \(122/52\approx2.3\) prefill GPUs per decode GPU, up from 1.4. Long prompts move capacity towards prefill, even with prefix caching, and a fixed split sized for chat would leave the prefill pool overloaded.</p>
+</details>
+
+<h2 id="s13-7">13.7 Mooncake: the KV cache at the centre</h2>
+<p>Moonshot AI serves Kimi, a chatbot known for long contexts, and its workload has two properties that shaped its serving architecture. Prompts are long, often tens of thousands of tokens, so prefill dominates cost; and many prompts share long prefixes, such as the same uploaded documents across a conversation, so the same caches are computed again and again. Mooncake (Qin et al., 2024; FAST 2025 best paper)<span class="cite"><a href="#r-mooncake">[5]</a></span> turned the observation of §13.6 into a design principle, summarised in its title: <em>trading more storage for less computation</em>.</p>
+<p>Mooncake is disaggregated into prefill and decode clusters, but its central component is neither. It is a distributed KV-cache pool built from the CPU memory and SSDs of the GPU servers themselves, resources that are plentiful and mostly idle in a GPU cluster. Every computed cache can be written into this pool, and any prefill instance can fetch a cached prefix from it over RDMA instead of recomputing it. The load-versus-recompute calculation of §10.8 decides when this pays: fetching a block costs its bytes over the network, recomputing it costs its FLOPs, and for long prefixes on a fast network fetching wins by a wide margin. The pool turns the prefix cache from a per-GPU optimisation, limited by HBM and lost when a request lands on the wrong replica, into a cluster-wide resource.</p>
+
+<figure class="diagram" id="fig-13-7">
+<svg class="dg" viewBox="0 0 720 270" role="img" aria-label="Mooncake architecture">
+<defs><marker id="a137" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="210" y="10" width="300" height="52" rx="10" class="bx4"/><text x="360" y="32" text-anchor="middle" class="t-sm t-b">Conductor (global scheduler)</text><text x="360" y="50" text-anchor="middle" class="t-xs">prefix match · instance load · transfer cost · early rejection</text>
+<rect x="40" y="90" width="280" height="70" rx="10" class="bx2"/><text x="180" y="110" text-anchor="middle" class="t-sm t-b">prefill instances</text><text x="180" y="130" text-anchor="middle" class="t-xs">long prompts; chunked pipeline parallelism</text><text x="180" y="146" text-anchor="middle" class="t-xs">fetch cached prefix, compute the rest</text>
+<rect x="400" y="90" width="280" height="70" rx="10" class="bx5"/><text x="540" y="110" text-anchor="middle" class="t-sm t-b">decode instances</text><text x="540" y="130" text-anchor="middle" class="t-xs">continuous batching</text><text x="540" y="146" text-anchor="middle" class="t-xs">TPOT-bound</text>
+<rect x="40" y="195" width="640" height="62" rx="10" class="bx3"/><text x="360" y="215" text-anchor="middle" class="t-sm t-b">distributed KV-cache pool</text><text x="360" y="234" text-anchor="middle" class="t-xs">CPU DRAM and SSD of every GPU server, connected by RDMA (Transfer Engine)</text><text x="360" y="249" text-anchor="middle" class="t-xs">blocks addressed by prefix hash; reused across requests, instances and conversations</text>
+<line x1="300" y1="62" x2="220" y2="88" class="ln" marker-end="url(#a137)"/><line x1="420" y1="62" x2="500" y2="88" class="ln" marker-end="url(#a137)"/>
+<line x1="320" y1="125" x2="398" y2="125" class="ln" marker-end="url(#a137)"/><text x="359" y="118" text-anchor="middle" class="t-xs">KV</text>
+<line x1="140" y1="193" x2="140" y2="162" class="ln" marker-end="url(#a137)"/><line x1="220" y1="162" x2="220" y2="193" class="ln" marker-end="url(#a137)"/>
+<text x="128" y="183" text-anchor="end" class="t-xs">load prefix</text><text x="232" y="183" class="t-xs">store new KV</text>
+<line x1="540" y1="162" x2="540" y2="193" class="ln dash"/>
+</svg>
+<figcaption><b>Figure 13.7 — Mooncake's KV-centric architecture.</b> A global scheduler assigns each request to a prefill instance, which loads any cached prefix from a cluster-wide pool in CPU memory and SSD, computes the rest, stores the new blocks and sends the cache to a decode instance.</figcaption></figure>
+
+<p>Figure 13.7 shows the organisation. The <strong>Conductor</strong>, Mooncake's global scheduler, makes the placement decisions. For each request and each candidate prefill instance \(i\), it can estimate the time to first token as a sum of three terms,</p>
+\[ \widehat{\text{TTFT}}_i\;=\;t^{\text{queue}}_i\;+\;t^{\text{prefill}}\big(n_{\text{in}}-h_i\big)\;+\;t^{\text{fetch}}_i(h_i), \]
+<p>where \(h_i\) is the length of the request's prefix that is cached and reachable from instance \(i\), the second term is the time to compute the uncached remainder, and the third the time to bring the cached part into the instance's HBM, zero if it is already there. Choosing the instance with the smallest estimate balances cache affinity against load, and the scheduler can also replicate hot cache blocks to more nodes when one becomes a hotspot. For very long prompts, Mooncake splits a single prefill across several nodes along the sequence dimension (chunked pipeline parallelism), so that a 100k-token prompt does not wait for one node to work through it alone.</p>
+<p>The third distinctive element addresses overload, which Kimi experienced as its popularity grew faster than its hardware. In a disaggregated system, a request that is prefilled and then cannot be decoded in time wastes all its prefill work. Mooncake therefore predicts decode load before prefill and rejects requests early, before any GPU time is spent, when they would miss their targets anyway. The paper reported that, on real traces, the architecture let Kimi serve 115% and 107% more requests on A800 and H800 clusters than its previous system, and up to 525% higher throughput in simulated long-context scenarios while meeting SLOs. Mooncake's transfer engine and storage were later open-sourced and integrated with vLLM and SGLang, and the idea of a cluster-wide, tiered KV store has become standard in the production frameworks that followed.</p>
+
+<h2 id="s13-8">13.8 Disaggregation in production</h2>
+<p>By 2025 the components of a disaggregated deployment had settled into a common shape, and several open frameworks package them. <strong>NVIDIA Dynamo</strong> (announced March 2025)<span class="cite"><a href="#r-dynamo">[6]</a></span> is an engine-agnostic orchestration layer that runs vLLM, SGLang or TensorRT-LLM workers in prefill and decode roles. It contributes a KV-aware router, a KV block manager that spills blocks from HBM to CPU memory, SSD and remote storage, a planner that monitors latency targets and moves GPUs between the prefill and decode pools, and NIXL, a transfer library that moves KV blocks over NVLink, InfiniBand or RoCE behind a single interface. <strong>llm-d</strong> (May 2025; Red Hat, Google, IBM Research, NVIDIA, CoreWeave and others)<span class="cite"><a href="#r-llmd">[8]</a></span> takes a Kubernetes-native approach: vLLM instances managed as Kubernetes workloads, an inference scheduler built on the Gateway API's inference extension that routes with prefix-cache and load awareness, and prefill–decode disaggregation using NIXL. SGLang itself supports disaggregation with Mooncake's or NIXL's transfer back ends, and its developers reported serving DeepSeek-V3 on 96 H100s with disaggregation and large-scale expert parallelism, at about 52k input and 22k output tokens per second per node<span class="cite"><a href="#r-sglangpd">[9]</a></span>.</p>
+
+<figure class="diagram" id="fig-13-8">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Control plane of a disaggregated serving framework">
+<defs><marker id="a138" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="100" width="120" height="60" rx="8" class="bx4"/><text x="75" y="124" text-anchor="middle" class="t-sm t-b">KV-aware router</text><text x="75" y="142" text-anchor="middle" class="t-xs">overlap − load</text>
+<rect x="290" y="10" width="160" height="50" rx="8" class="bx"/><text x="370" y="32" text-anchor="middle" class="t-sm t-b">planner</text><text x="370" y="48" text-anchor="middle" class="t-xs">moves GPUs between pools</text>
+<rect x="190" y="85" width="150" height="50" rx="8" class="bx2"/><text x="265" y="107" text-anchor="middle" class="t-sm">prefill workers</text><text x="265" y="123" text-anchor="middle" class="t-xs">vLLM / SGLang / TRT-LLM</text>
+<rect x="400" y="85" width="150" height="50" rx="8" class="bx5"/><text x="475" y="107" text-anchor="middle" class="t-sm">decode workers</text><text x="475" y="123" text-anchor="middle" class="t-xs">vLLM / SGLang / TRT-LLM</text>
+<line x1="340" y1="110" x2="398" y2="110" class="ln" marker-end="url(#a138)"/><text x="369" y="102" text-anchor="middle" class="t-xs">NIXL</text>
+<rect x="190" y="170" width="360" height="76" rx="10" class="bx3"/><text x="370" y="190" text-anchor="middle" class="t-sm t-b">KV block manager (tiers)</text>
+<rect x="205" y="200" width="74" height="34" rx="6" class="bx"/><text x="242" y="221" text-anchor="middle" class="t-xs">HBM</text>
+<rect x="289" y="200" width="74" height="34" rx="6" class="bx"/><text x="326" y="221" text-anchor="middle" class="t-xs">CPU DRAM</text>
+<rect x="373" y="200" width="74" height="34" rx="6" class="bx"/><text x="410" y="221" text-anchor="middle" class="t-xs">local SSD</text>
+<rect x="457" y="200" width="80" height="34" rx="6" class="bx"/><text x="497" y="221" text-anchor="middle" class="t-xs">remote store</text>
+<line x1="135" y1="120" x2="188" y2="112" class="ln" marker-end="url(#a138)"/>
+<line x1="370" y1="60" x2="300" y2="83" class="ln dash" marker-end="url(#a138)"/><line x1="370" y1="60" x2="440" y2="83" class="ln dash" marker-end="url(#a138)"/>
+<line x1="265" y1="135" x2="265" y2="168" class="ln"/><line x1="475" y1="135" x2="475" y2="168" class="ln"/>
+<text x="610" y="40" text-anchor="middle" class="t-xs">metrics: TTFT, TPOT,</text><text x="610" y="54" text-anchor="middle" class="t-xs">queue depth, KV usage</text>
+<line x1="555" y1="47" x2="452" y2="40" class="ln dash" marker-end="url(#a138)"/>
+<text x="610" y="120" text-anchor="middle" class="t-xs">each pool scales</text><text x="610" y="134" text-anchor="middle" class="t-xs">independently</text>
+</svg>
+<figcaption><b>Figure 13.8 — The control plane of a disaggregated framework.</b> A KV-aware router chooses workers, a planner resizes the prefill and decode pools from latency and load metrics, a transfer library moves KV blocks between workers, and a block manager keeps blocks in a hierarchy of memory tiers.</figcaption></figure>
+
+<p>Figure 13.8 shows the components that Dynamo and llm-d share, whatever they call them. Two of them extend ideas from earlier chapters to the cluster. The block manager is the paged KV manager of Chapter 10 with more tiers: blocks move down the hierarchy as they cool and up when a prefix hit needs them, and the load-versus-recompute calculation of §10.8 decides, tier by tier, whether to fetch or recompute. The router is the cache-aware scheduling of §10.6 and §12.4 applied across replicas rather than within one. Its decision can be written as a score. For a request whose prompt consists of blocks \(k_1,\dots,k_m\) and a worker \(w\) whose cache holds the first \(o_w\) of them, a typical router chooses</p>
+\[ w^{\star}=\arg\max_w\;\Big(o_w\;-\;\gamma\,\text{load}_w\Big), \]
+<p>where \(\text{load}_w\) counts the worker's queued prefill tokens or active blocks, and \(\gamma\) sets how many cached blocks are worth one unit of load. With \(\gamma=0\) the router chases cache hits and creates hotspots; with large \(\gamma\) it balances load and ignores the cache, and the hit rate falls to what random placement achieves. The right value depends on how expensive a miss is, which is the prefill time of a block, relative to how expensive a queue is, which is the TTFT target. This is the same trade-off as Mooncake's TTFT estimate, simplified for speed. The planner closes the loop at a slower timescale: when TTFT targets are at risk it adds prefill workers, when TPOT is at risk it adds decode workers, and the pool ratio of §13.5 is tracked as traffic changes rather than fixed at deployment.</p>
+<p>Production disaggregation also has to handle the failures and corner cases that a single engine never sees. A decode worker may fail while holding hundreds of caches, which must then be recomputed or refetched; a prefill may finish when no decode worker has memory, so its cache must wait somewhere; very short prompts may be cheaper to prefill directly on the decode worker than to route through the prefill pool, so routers often use a length threshold below which a request is served colocated. A well-built system is therefore usually hybrid: disaggregated for long prompts and large models, colocated for short requests, with a shared tiered cache beneath both.</p>
+
+<h2 id="s13-9">13.9 Disaggregating further: attention and experts</h2>
+<p>Once prefill and decode are separated, a further asymmetry appears inside decode itself, most clearly in mixture-of-experts models. A decode step has two kinds of layers. Attention reads each request's own KV cache, so its cost scales with the number of sequences and their contexts, and its memory holds per-request state. The expert FFNs read weights shared by all requests, so their cost per step is nearly fixed and is amortised over however many tokens are routed to them. Attention wants memory capacity for many caches; experts want very large batches of tokens, so that each expert's weights, read once per step, serve many tokens. On the same GPU these two wants conflict, because a GPU full of caches has no room to collect the huge batches the experts need.</p>
+<p><strong>Attention–FFN disaggregation</strong> runs the two on different GPUs. Attention nodes, replicated with data parallelism, hold the caches and run the attention layers; expert nodes hold the expert weights with expert parallelism. After each attention layer, the attention nodes send their tokens' hidden states to the experts they are routed to, and the expert outputs come back for the next layer. Because many attention nodes feed one expert pool, the experts see the sum of all their batches, which is exactly the large batch they need. ByteDance's MegaScale-Infer (2025)<span class="cite"><a href="#r-megascale">[10]</a></span> built such a system with a custom many-to-many communication library and reported up to 1.9× higher per-GPU decode throughput, and 1.7× higher throughput per unit cost on a heterogeneous cluster with different GPUs for attention and experts. StepFun's Step-3 (2025)<span class="cite"><a href="#r-step3">[11]</a></span> designed a model and its serving system together around the same split.</p>
+
+<figure class="diagram" id="fig-13-9">
+<svg class="dg" viewBox="0 0 720 200" role="img" aria-label="Ping-pong pipeline between attention and expert nodes">
+<text x="20" y="24" class="t-sm t-b">Ping-pong pipeline with three micro-batches</text>
+<text x="20" y="62" class="t-xs">attention nodes</text>
+<rect x="120" y="50" width="80" height="20" rx="2" class="fill-s2"/><text x="160" y="64" text-anchor="middle" class="t-xs t-on">mb 1</text>
+<rect x="202" y="50" width="80" height="20" rx="2" class="fill-s3"/><text x="242" y="64" text-anchor="middle" class="t-xs t-on">mb 2</text>
+<rect x="284" y="50" width="80" height="20" rx="2" class="fill-s4"/><text x="324" y="64" text-anchor="middle" class="t-xs t-on-dark">mb 3</text>
+<rect x="366" y="50" width="80" height="20" rx="2" class="fill-s2"/><text x="406" y="64" text-anchor="middle" class="t-xs t-on">mb 1</text>
+<rect x="448" y="50" width="80" height="20" rx="2" class="fill-s3"/><text x="488" y="64" text-anchor="middle" class="t-xs t-on">mb 2</text>
+<rect x="530" y="50" width="80" height="20" rx="2" class="fill-s4"/><text x="570" y="64" text-anchor="middle" class="t-xs t-on-dark">mb 3</text>
+<text x="20" y="142" class="t-xs">expert nodes</text>
+<rect x="243" y="130" width="80" height="20" rx="2" class="fill-s2"/><text x="283" y="144" text-anchor="middle" class="t-xs t-on">mb 1</text>
+<rect x="325" y="130" width="80" height="20" rx="2" class="fill-s3"/><text x="365" y="144" text-anchor="middle" class="t-xs t-on">mb 2</text>
+<rect x="407" y="130" width="80" height="20" rx="2" class="fill-s4"/><text x="447" y="144" text-anchor="middle" class="t-xs t-on-dark">mb 3</text>
+<rect x="489" y="130" width="80" height="20" rx="2" class="fill-s2"/><text x="529" y="144" text-anchor="middle" class="t-xs t-on">mb 1</text>
+<line x1="200" y1="72" x2="243" y2="128" class="ln" marker-end="url(#a139)"/><line x1="323" y1="128" x2="366" y2="72" class="ln" marker-end="url(#a139)"/>
+<defs><marker id="a139" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<text x="190" y="104" text-anchor="end" class="t-xs">dispatch</text><text x="352" y="104" class="t-xs">combine</text>
+<text x="360" y="186" text-anchor="middle" class="t-xs">while one micro-batch is at the experts, the others run attention; both node types stay busy</text>
+</svg>
+<figcaption><b>Figure 13.9 — Attention–FFN disaggregation.</b> A decode batch is split into micro-batches that alternate between attention nodes and expert nodes. With enough micro-batches to cover the communication, neither kind of node waits for the other.</figcaption></figure>
+
+<p>Splitting a layer across machines creates a dependency at every layer: the experts cannot start until attention finishes, and the next attention cannot start until the experts return. If the whole batch moved together, each kind of node would be idle half the time. The remedy, shown in Figure 13.9, is the ping-pong pipeline: split the batch into \(m\) micro-batches and keep them staggered, so that while one micro-batch is at the experts the others are running attention. We can derive how many are needed. Suppose attention and expert computation each take time \(t_c\) per micro-batch, and each one-way transfer takes \(t_x\). A micro-batch returns to the attention nodes \(2t_c+2t_x\) after it started attention. For the attention nodes never to wait, the other \(m-1\) micro-batches must fill that interval, so \((m-1)\,t_c\ge t_c+2t_x\), that is</p>
+\[ m\;\ge\;2+\frac{2\,t_x}{t_c}. \]
+<p>With fast communication, two micro-batches almost suffice; with transfers half as long as the computation, three are needed. The condition also explains the design pressures of these systems. Attention and expert times must be balanced, by choosing how many attention nodes feed each expert pool, and communication must be fast and overlapped, which is why MegaScale-Infer built its own library rather than using a generic all-to-all. These are the questions of expert parallelism, and Chapter 19 develops them in full.</p>
+
+<details class="drill">
+<summary>Drill 13.3 — Micro-batches for a ping-pong pipeline</summary>
+<p>In an attention–FFN disaggregated deployment, each micro-batch spends 1.2 ms in attention and 1.2 ms in the experts, and each dispatch or combine transfer takes 0.9 ms. How many micro-batches are needed to keep the attention nodes busy, and what happens with one fewer?</p>
+<p><em>Solution.</em> \(m\ge2+2\times0.9/1.2=3.5\), so four micro-batches. With three, each micro-batch's round trip is \(2\times1.2+2\times0.9=4.2\) ms, but the other two micro-batches cover only 2.4 ms of attention work, so in each 4.2 ms cycle the attention nodes do 3.6 ms of work and idle for 0.6 ms, about 14% of the time. Adding micro-batches has a cost too: for a fixed total batch, each micro-batch becomes smaller, and so does the batch each expert sees per pass. Faster communication is therefore worth more than more micro-batches, because it removes the idle time without shrinking the expert batch.</p>
+</details>
+
+<h2 id="looking-ahead" class="unnumbered">Looking ahead</h2>
+<p>Part IV has taken a model's forward pass and turned it into a serving system: a scheduler that batches continuously (Chapter 11), an engine that keeps the GPU fed (Chapter 12), and a cluster that places each phase where it runs best and moves caches between them (this chapter). Throughout, we treated the model's bytes as fixed: 16 GB of weights for Llama 3 8B, 128 KiB of cache per token, and every technique worked around them. Decode is memory-bound, so those bytes set the speed limit, and disaggregation's cost is set by the bytes of the cache. The most direct way to go faster is therefore to have fewer bytes. Part V asks how far we can shrink the model itself without changing what it computes in any way that matters. Chapter 14 begins with quantisation: representing weights, activations and caches in 8, 4 or even fewer bits, why some numbers resist it, and how the formats and kernels of 2023–25 made it routine.</p>
+
+<h2 id="summary">Chapter summary</h2>
+<ul>
+<li>Prefill (compute-bound, long) and decode (memory-bound, short) interfere on shared GPUs. Chunked prefill removes stalls but couples TTFT and TPOT through one token budget, which tight joint targets and long prompts make untenable.</li>
+<li>Goodput, the highest arrival rate at which a fraction \(q\) of requests meet both TTFT and TPOT targets, is the right objective; per-GPU goodput determines cost.</li>
+<li>Splitwise (2024) split phases for cost, running decode on cheaper or power-capped hardware, with layer-wise KV transfer. DistServe (2024) split them for goodput, with per-phase parallelism and bandwidth-aware placement. Headline gains were against colocated baselines without good chunked prefill.</li>
+<li>The KV-transfer ratio \(\chi=(s_{kv}/2N)(\pi_{\text{eff}}/\beta_{\text{net}})\) is independent of prompt length and TP degree. It is about 0.1 for Llama 3 8B and 0.01 for DeepSeek-V3 at 400 Gb/s, but near 2 for an MHA model over 100 Gb/s. GQA and MLA made disaggregation cheap. Layer-wise pipelining hides all but about \(\chi/L\) of the prefill time.</li>
+<li>The pool ratio \(n_P/n_D=(F_P/\pi_{\text{eff}})/(n_{\text{out}}t_{\text{step}}/B)\) depends on the traffic (prompt and output lengths, prefix hit rate) and drifts with it.</li>
+<li>Proposition 13.1: on identical hardware, an ideal compute-saturated colocated engine has at least the throughput of any disaggregated deployment, because it fills decode's idle tensor cores with prefill. Disaggregation pays when that ideal is unattainable: tight joint SLOs and bursty traffic, heterogeneous hardware, phase-specific parallelism (large-EP MoE decode), long prompts and operational isolation.</li>
+<li>Mooncake (Kimi): a cluster-wide KV pool in CPU DRAM and SSD over RDMA, a Conductor that estimates TTFT from queue, uncached prefill and fetch time, chunked pipeline parallelism for long prompts, and early rejection under overload.</li>
+<li>Production frameworks (Dynamo, llm-d, SGLang with Mooncake or NIXL) provide KV-aware routing (cache overlap minus weighted load), tiered KV block managers, transfer libraries and planners that resize the pools.</li>
+<li>Attention–FFN disaggregation (MegaScale-Infer, Step-3) separates per-request attention from shared expert weights; a ping-pong pipeline needs \(m\ge2+2t_x/t_c\) micro-batches.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+<div class="mcq" data-id="ch13-mcq-01" data-topic="§13.1 Interference">
+<p class="q">Under colocation with prefill run as separate steps, what do running decodes experience when a long prompt arrives?</p>
+<ol class="opts"><li>Nothing</li><li data-correct>A stall: an inter-token gap as long as the whole prefill</li><li>Faster steps</li><li>Preemption of their KV cache</li></ol>
+<div class="explain">A 4k-token prefill on Llama 3 8B takes about 130 ms against a 10 ms decode step.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-02" data-topic="§13.1 Interference">
+<p class="q">Why does chunked prefill not fully solve interference?</p>
+<ol class="opts"><li>It cannot be implemented with paged KV</li><li data-correct>One token budget controls both TTFT (falls with larger budget) and TPOT (rises with larger budget once compute-bound)</li><li>It disables prefix caching</li><li>It only works for MoE models</li></ol>
+<div class="explain">Two objectives, one knob.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-03" data-topic="§13.1 Interference">
+<p class="q">In the model \(t_{\text{step}}(b)\approx\max(W/\beta,\,2Nb/\pi_{\text{eff}})\), increasing the budget \(b\) leaves TPOT unchanged as long as:</p>
+<ol class="opts"><li>\(b\) is a power of two</li><li data-correct>The step remains memory-bound</li><li>\(b&lt;B\)</li><li>The model is quantised</li></ol>
+<div class="explain">The first few hundred prefill tokens are nearly free because decode leaves compute idle.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-04" data-topic="§13.2 Goodput">
+<p class="q">Goodput is:</p>
+<ol class="opts"><li>Total tokens per second</li><li data-correct>The highest arrival rate at which a fraction \(q\) of requests meet both TTFT and TPOT targets</li><li>Throughput divided by cost</li><li>Mean latency at peak load</li></ol>
+<div class="explain">Defined by DistServe.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-05" data-topic="§13.2 Goodput">
+<p class="q">A system meets TTFT for 95% of requests and TPOT for 95%. Its joint attainment is:</p>
+<ol class="opts"><li>Exactly 95%</li><li data-correct>At least 90%, and possibly less than 95%</li><li>Exactly 90.25%</li><li>100%</li></ol>
+<div class="explain">By the union bound, at most 10% fail one condition; joint attainment lies between 90% and 95%.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-06" data-topic="§13.2 Goodput">
+<p class="q">Why is per-GPU goodput the right figure of merit for comparing architectures?</p>
+<ol class="opts"><li>It is easy to measure</li><li data-correct>It determines how many GPUs a peak load requires, hence cost</li><li>It ignores latency</li><li>It equals MFU</li></ol>
+<div class="explain">GPUs needed = peak load / per-GPU goodput.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-07" data-topic="§13.3 Splitwise">
+<p class="q">Splitwise's key observation from Azure traces was that token generation:</p>
+<ol class="opts"><li>Needs the newest GPUs</li><li data-correct>Does not need the compute capability of the latest GPUs and can run with lower power and cost</li><li>Is compute-bound</li><li>Cannot be batched</li></ol>
+<div class="explain">Hence prompt, token and mixed pools, possibly on different hardware.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-08" data-topic="§13.3 Splitwise">
+<p class="q">Splitwise transferred the KV cache:</p>
+<ol class="opts"><li>After the whole request finished</li><li data-correct>Layer by layer over InfiniBand while the prompt was still being processed</li><li>Through the CPU only</li><li>By recomputation on the decode machine</li></ol>
+<div class="explain">Layer-wise transfer hides most of the cost.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-09" data-topic="§13.3 DistServe">
+<p class="q">Which ideas did DistServe introduce? (select all that apply)</p>
+<ol class="opts"><li data-correct>Goodput as the objective</li><li data-correct>Separate parallelism configurations per phase</li><li data-correct>Bandwidth-aware placement, pairing instances within NVLink nodes when the network is slow</li><li>FP4 KV caches</li></ol>
+<div class="explain">It searched configurations with an SLO-attainment simulator.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-10" data-topic="§13.3 DistServe">
+<p class="q">DistServe's headline results (7.4× more requests or 12.6× tighter SLOs) were measured against:</p>
+<ol class="opts"><li>Chunked-prefill engines of 2025</li><li data-correct>Colocated systems of the time, such as vLLM and DeepSpeed-MII, mostly without good chunked prefill</li><li>Single-GPU llama.cpp</li><li>Disaggregated baselines</li></ol>
+<div class="explain">Chunked prefill narrows the gap considerably.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-11" data-topic="§13.4 KV transfer">
+<p class="q">The KV-transfer ratio is \(\chi=(s_{kv}/2N)(\pi_{\text{eff}}/\beta_{\text{net}})\). It is independent of:</p>
+<ol class="opts"><li>The model</li><li>The network</li><li data-correct>The prompt length and the tensor-parallel degree</li><li>The KV dtype</li></ol>
+<div class="explain">Both transfer and prefill scale linearly with tokens and divide evenly across TP ranks.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-12" data-topic="§13.4 KV transfer">
+<p class="q">Ignoring attention FLOPs makes the formula for \(\chi\):</p>
+<ol class="opts"><li>Exact</li><li data-correct>An upper bound, tight for short prompts</li><li>A lower bound</li><li>Meaningless</li></ol>
+<div class="explain">Attention lengthens prefill, which only lowers the true ratio.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-13" data-topic="§13.4 KV transfer">
+<p class="q">For Llama 3 8B at 400 Gb/s per GPU and 60% prefill MFU, \(\chi\) is about:</p>
+<ol class="opts"><li>2</li><li>0.5</li><li data-correct>0.1</li><li>0.001</li></ol>
+<div class="explain">About 0.097; a 2,000-token cache (262 MB) takes 5.2 ms against a 56 ms prefill.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-14" data-topic="§13.4 KV transfer">
+<p class="q">Which architectural change most reduced the cost of disaggregation?</p>
+<ol class="opts"><li>Larger vocabularies</li><li data-correct>Grouped-query and latent attention, which shrink \(s_{kv}\)</li><li>Deeper models</li><li>RoPE</li></ol>
+<div class="explain">DeepSeek-V3's MLA gives \(\chi\approx0.011\) at 400 Gb/s, against 0.46 for an MHA 7B model.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-15" data-topic="§13.4 KV transfer">
+<p class="q">With perfect layer-wise pipelining and \(\chi&lt;1\), the transfer time added to TTFT is about:</p>
+<ol class="opts"><li>\(\chi\) times the prefill</li><li data-correct>\(\chi/L\) times the prefill</li><li>Zero</li><li>\(L\chi\) times the prefill</li></ol>
+<div class="explain">Only the last layer's transfer is exposed.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-16" data-topic="§13.4 RDMA">
+<p class="q">GPUDirect RDMA allows:</p>
+<ol class="opts"><li>GPUs to execute CPU code</li><li data-correct>A network card to move data directly between GPU memories on different machines without staging in host memory</li><li>Faster tokenisation</li><li>Peer-to-peer NVLink only</li></ol>
+<div class="explain">It removes copies through CPU memory and the OS network stack.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-17" data-topic="§13.4 Push and pull">
+<p class="q">An advantage of a pull design, where the decode instance reads the cache when ready, is:</p>
+<ol class="opts"><li>Lower prefill FLOPs</li><li data-correct>Natural back-pressure: a decode instance with no free memory simply does not pull yet</li><li>No need for RDMA</li><li>No need for a router</li></ol>
+<div class="explain">The prefill side holds the cache until the decode side can admit the request.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-18" data-topic="§13.5 Sizing">
+<p class="q">The pool ratio \(n_P/n_D\) equals:</p>
+<ol class="opts"><li>\(n_{\text{in}}/n_{\text{out}}\)</li><li data-correct>(prefill GPU-seconds per request) / (decode GPU-seconds per request)</li><li>Always 1</li><li>\(\pi/\beta\)</li></ol>
+<div class="explain">\((F_P/\pi_{\text{eff}})/(n_{\text{out}}t_{\text{step}}/B)\).</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-19" data-topic="§13.5 Sizing">
+<p class="q">A 50% prefix-cache hit rate changes the pool ratio by roughly:</p>
+<ol class="opts"><li>Doubling it</li><li data-correct>Halving it</li><li>No change</li><li>Squaring it</li></ol>
+<div class="explain">Only uncached tokens need prefill.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-20" data-topic="§13.5 Sizing">
+<p class="q">Why does the pool ratio grow more slowly for very long prompts?</p>
+<ol class="opts"><li>Prefill gets faster</li><li data-correct>Long contexts also shrink the TPOT- and memory-limited decode batch, raising decode cost per request</li><li>The network gets faster</li><li>Attention is free</li></ol>
+<div class="explain">\(B\propto1/t\) once contexts are long.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-21" data-topic="§13.5 Sizing">
+<p class="q">Why plan prefill instances at about 70% utilisation rather than 100%?</p>
+<ol class="opts"><li>To save power</li><li data-correct>Queueing delay, hence TTFT, grows without bound as utilisation approaches 1</li><li>Because of RDMA limits</li><li>To leave room for decode</li></ol>
+<div class="explain">The utilisation–waiting law of §11.8.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-22" data-topic="§13.6 Colocation bound">
+<p class="q">Proposition 13.1 says that on identical hardware an ideal compute-saturated colocated engine:</p>
+<ol class="opts"><li>Is always slower</li><li data-correct>Has at least the per-GPU throughput of any disaggregated deployment</li><li>Has lower TTFT</li><li>Uses less memory</li></ol>
+<div class="explain">It fills decode's idle tensor cores with prefill.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-23" data-topic="§13.6 Colocation bound">
+<p class="q">The key inequality in the proof is:</p>
+<ol class="opts"><li>\(F_P\ge F_D\)</li><li data-correct>\(\tau_D\ge F_D/\pi_{\text{eff}}\): a decode GPU spends at least its compute time per request, more when memory-bound</li><li>\(\chi\le1\)</li><li>\(B\le256\)</li></ol>
+<div class="explain">Memory-bound decode wastes compute that colocation can use.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-24" data-topic="§13.6 When it pays">
+<p class="q">Which conditions favour disaggregation despite the colocation bound? (select all that apply)</p>
+<ol class="opts"><li data-correct>Tight joint TTFT and TPOT targets with bursty traffic</li><li data-correct>Cheaper or different hardware for decode</li><li data-correct>Large MoE decode needing wide expert parallelism</li><li>A small dense model with relaxed TPOT on homogeneous GPUs</li></ol>
+<div class="explain">The last case is usually best served colocated with chunked prefill.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-25" data-topic="§13.6 When it pays">
+<p class="q">DeepSeek-V3's own deployment used decode units of about:</p>
+<ol class="opts"><li>8 GPUs</li><li>32 GPUs</li><li data-correct>320 GPUs</li><li>3,200 GPUs</li></ol>
+<div class="explain">Prefill units used 32 GPUs; decode needed very wide expert parallelism.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-26" data-topic="§13.7 Mooncake">
+<p class="q">Mooncake's distributed KV pool is built mainly from:</p>
+<ol class="opts"><li>Extra HBM</li><li data-correct>The CPU DRAM and SSDs of the GPU servers, connected by RDMA</li><li>Cloud object storage only</li><li>Tape</li></ol>
+<div class="explain">Trading more storage for less computation.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-27" data-topic="§13.7 Mooncake">
+<p class="q">Mooncake's Conductor estimates TTFT for an instance as the sum of:</p>
+<ol class="opts"><li>Decode time and transfer time</li><li data-correct>Queueing time, prefill time of the uncached remainder, and the time to fetch the cached prefix</li><li>Only queueing time</li><li>Only prefill time</li></ol>
+<div class="explain">It balances cache affinity against load.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-28" data-topic="§13.7 Mooncake">
+<p class="q">Why does Mooncake reject some requests early under overload?</p>
+<ol class="opts"><li>To save network bandwidth</li><li data-correct>A request that is prefilled but cannot be decoded in time wastes all its prefill work</li><li>To enforce fairness</li><li>Because the KV pool is full</li></ol>
+<div class="explain">Prediction-based early rejection avoids wasted prefill.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-29" data-topic="§13.8 Production">
+<p class="q">NVIDIA Dynamo's planner:</p>
+<ol class="opts"><li>Compiles kernels</li><li data-correct>Moves GPUs between the prefill and decode pools based on latency and load metrics</li><li>Chooses sampling parameters</li><li>Quantises the model</li></ol>
+<div class="explain">The pool ratio is tracked as traffic changes.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-30" data-topic="§13.8 Routing">
+<p class="q">In the routing score \(o_w-\gamma\,\text{load}_w\), setting \(\gamma=0\) leads to:</p>
+<ol class="opts"><li>Random placement</li><li data-correct>Cache-chasing hotspots</li><li>Perfect balance</li><li>No cache hits</li></ol>
+<div class="explain">Large \(\gamma\) ignores the cache; the right value weighs miss cost against queueing cost.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-31" data-topic="§13.8 Production">
+<p class="q">Why do routers often serve very short prompts colocated on decode workers?</p>
+<ol class="opts"><li>Short prompts cannot be transferred</li><li data-correct>Routing and transfer overhead exceeds the cost of a short prefill on the decode worker</li><li>Decode workers have no KV cache</li><li>It is required by the OpenAI API</li></ol>
+<div class="explain">Hybrid systems use a length threshold.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-32" data-topic="§13.9 AFD">
+<p class="q">Attention–FFN disaggregation helps MoE decode because:</p>
+<ol class="opts"><li>Attention becomes compute-bound</li><li data-correct>Many attention nodes feed one expert pool, so experts see the large batches they need while attention nodes hold the caches</li><li>It removes the KV cache</li><li>It eliminates communication</li></ol>
+<div class="explain">Per-request state and shared weights want different resources.</div>
+</div>
+
+<div class="mcq" data-id="ch13-mcq-33" data-topic="§13.9 AFD">
+<p class="q">With compute \(t_c\) per stage per micro-batch and one-way transfer \(t_x\), a ping-pong pipeline keeps attention busy if the number of micro-batches satisfies:</p>
+<ol class="opts"><li>\(m\ge1\)</li><li data-correct>\(m\ge2+2t_x/t_c\)</li><li>\(m\ge t_c/t_x\)</li><li>\(m=L\)</li></ol>
+<div class="explain">The round trip \(2t_c+2t_x\) must be covered by the other \(m-1\) micro-batches.</div>
+</div>
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+<details class="qa" data-id="ch13-qa-01">
+<summary><span class="lvl warm">Warm-up</span> What is disaggregated serving, and what problem does it solve?</summary>
+<div class="answer">
+<p>Disaggregated serving runs the prefill phase and the decode phase of each request on different GPUs (or machines). A prefill instance computes the prompt's KV cache and the first token, sends the cache over NVLink or an RDMA network to a decode instance, and the decode instance generates the remaining tokens. It solves prefill–decode interference: on shared GPUs, prefill steps either stall running decodes (TPOT spikes) or, with chunked prefill, lengthen every step, so a single token budget trades TTFT against TPOT. Separate pools give each latency target its own control: the prefill pool's size and parallelism set TTFT, the decode pool's set TPOT. It also allows different hardware and parallelism per phase. The cost is KV transfer, more complex routing and placement, and a distributed system to operate.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch13-qa-02">
+<summary><span class="lvl warm">Warm-up</span> Define goodput. Why is it better than throughput for evaluating a serving system?</summary>
+<div class="answer">
+<p>Goodput is the highest arrival rate at which at least a fraction \(q\) of requests meet both their TTFT and TPOT targets; per-GPU goodput divides by the number of GPUs. Throughput alone can always be increased by larger batches and longer prefill chunks at the expense of latency, so two systems with equal throughput can be useless or excellent depending on their latency. Goodput fixes the latency requirement and asks how much load fits under it, which is exactly what determines how many GPUs a product needs. The joint condition matters: meeting each target separately for 95% of requests does not mean 95% meet both.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch13-qa-03">
+<summary><span class="lvl core">Core</span> Derive the KV-transfer ratio \(\chi\) and evaluate it for Llama 3 8B and DeepSeek-V3.</summary>
+<div class="answer">
+<p>Transfer time for an \(n\)-token prompt is \(n\,s_{kv}/\beta_{\text{net}}\); prefill time is about \(2Nn/\pi_{\text{eff}}\) (ignoring attention). Their ratio is \(\chi=(s_{kv}/2N)(\pi_{\text{eff}}/\beta_{\text{net}})\): bytes of cache per prefill FLOP times FLOPs per network byte. Prompt length cancels, and so does TP degree since cache and FLOPs split evenly and each GPU has its own NIC. With \(\pi_{\text{eff}}=593\) TFLOP/s (60% of H100 peak) and 50 GB/s (400 Gb/s): Llama 3 8B, \(131{,}072/(1.606\times10^{10})\times593\times10^{12}/5\times10^{10}\approx0.097\); DeepSeek-V3 with MLA (68.6 KiB/token, 37B active) \(\approx0.011\). An MHA 7B model is about 0.46, and 1.85 over 100 Gb/s. Including attention FLOPs lowers \(\chi\), so these are upper bounds. Layer-wise pipelining then hides all but about \(\chi/L\) of the prefill time.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch13-qa-04">
+<summary><span class="lvl core">Core</span> Explain layer-wise KV transfer. What engineering problems does it create?</summary>
+<div class="answer">
+<p>The prefill computes layers in order, and layer \(\ell\)'s cache is final once layer \(\ell\) completes, so the engine can send it while layer \(\ell+1\) computes. With \(\chi&lt;1\) the network keeps up and only the last layer's transfer is exposed. Problems: the decode instance must allocate blocks for the whole request before the first layer arrives, so admission must be decided at prefill start; many small transfers per layer and per request are inefficient, so systems batch layers or requests and use registered memory regions; paged layouts mean each layer's cache is scattered across blocks, requiring scatter-gather transfers or contiguous staging; the prefill and decode instances may use different TP degrees or block sizes, so the cache must be re-sharded or re-laid out in transit; and failures midway need cleanup on both sides.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch13-qa-05">
+<summary><span class="lvl core">Core</span> How would you size the prefill and decode pools for a workload?</summary>
+<div class="answer">
+<p>Compute GPU-seconds per request for each phase. Prefill: \(F_P/\pi_{\text{eff}}\) with \(F_P\approx(1-h)n_{\text{in}}(2N+2Ldn_{\text{in}})\), where \(h\) is the prefix hit rate. Decode: \(n_{\text{out}}t_{\text{step}}/B\), where \(B\) is the largest batch meeting the TPOT target and fitting the KV pool at the mean live context (capped by <code>max_num_seqs</code>). Multiply each by the peak arrival rate to get busy GPUs, then add headroom: prefill is a queue that sets TTFT, so plan around 70% utilisation; decode needs room for bursts and imbalance. Check the network: each prefill GPU sends (requests/s × \(n_{\text{in}}s_{kv}\)) bytes per second. For Llama 3 8B at 200 req/s, 2k in, 500 out, 20 ms TPOT: about 16 prefill and 10 decode H100s. Then validate with an open-loop load test, and let a planner adjust the ratio as traffic drifts.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch13-qa-06">
+<summary><span class="lvl core">Core</span> Why did grouped-query attention and MLA matter so much for disaggregation?</summary>
+<div class="answer">
+<p>Disaggregation moves every prompt's KV cache, and its cost relative to prefill is \(\chi\propto s_{kv}/2N\). Multi-head attention models of 2023 had \(s_{kv}\) of hundreds of KiB to MiB per token (512 KiB for Llama 2 7B), so a 100 Gb/s network spent longer sending a cache than computing it. GQA cut \(s_{kv}\) by the group size (Llama 3 8B: 128 KiB), and MLA by a further large factor (DeepSeek-V3: about 69 KiB for a 37B-active model). At 400 Gb/s, \(\chi\) dropped from about 0.46 to 0.1 and 0.01. These techniques were invented to shrink the cache for decode memory and bandwidth, but they also made the cache cheap to move and store, enabling disaggregation and cluster-wide KV pools like Mooncake's.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch13-qa-07">
+<summary><span class="lvl core">Core</span> Describe Mooncake. What does "trading more storage for less computation" mean?</summary>
+<div class="answer">
+<p>Mooncake is the serving platform of Moonshot AI's Kimi. It is disaggregated into prefill and decode clusters, but centred on a distributed KV-cache pool built from the CPU DRAM and SSDs of the GPU servers, connected by RDMA through its Transfer Engine. Computed caches are stored in the pool and later requests sharing a prefix fetch them instead of recomputing; for long prefixes on fast networks, fetching is far cheaper than prefill (§10.8). The Conductor schedules each request to the prefill instance minimising an estimated TTFT of queueing plus uncached prefill plus fetch time, replicates hot blocks, and splits very long prefills across nodes (chunked pipeline parallelism). Under overload it predicts decode load and rejects requests before prefill, avoiding wasted work. The paper reported 115% and 107% more requests on A800 and H800 clusters on real traces, and up to 525% in simulated long-context scenarios.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch13-qa-08">
+<summary><span class="lvl deep">Deep-dive</span> Prove that ideal colocation is at least as efficient as disaggregation on identical hardware. Then explain why people disaggregate anyway.</summary>
+<div class="answer">
+<p>A compute-saturated colocated engine uses \((F_P+F_D)/\pi_{\text{eff}}\) GPU-seconds per request. A disaggregated deployment uses \(F_P/\pi_{\text{eff}}\) on prefill and \(\tau_D=n_{\text{out}}t_{\text{step}}/B\) on decode, and \(\tau_D\ge F_D/\pi_{\text{eff}}\) because a GPU cannot exceed its compute rate (strictly greater when decode is memory-bound). So per-GPU throughput is \(1/(F_P/\pi_{\text{eff}}+\tau_D)\le\pi_{\text{eff}}/(F_P+F_D)\). Intuitively, colocation fills decode's idle tensor cores with prefill. For Llama 3 8B at 2k/500 the ideal colocated engine gives about 14.3 req/s/GPU versus 10.5 disaggregated. People disaggregate because the hypotheses fail: compute saturation at the TPOT target leaves no slack for bursts and P99 targets, so with tight joint SLOs colocated goodput collapses; hardware can differ per phase (bandwidth-rich or cheaper decode GPUs); parallelism can differ (TP prefill for TTFT; wide expert-parallel decode for MoE); chunked prefill has overheads for long prompts; and separate pools isolate failures and scale independently.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch13-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Design a KV-aware router for a fleet of 64 replicas. What score would it use and how would you tune it?</summary>
+<div class="answer">
+<p>Each replica (or its KV block manager) publishes which prefix-block hashes it holds; the router keeps an approximate index (for example per-replica hash sets or a radix tree of block hashes, updated by events or periodic sync). For a request, compute its block hashes, find each replica's overlap \(o_w\) (number of leading blocks cached), and choose \(\arg\max_w(o_w-\gamma\,\text{load}_w)\), with load measured as queued prefill tokens plus active decode blocks. Better, estimate TTFT directly: queue time plus prefill of the uncached tokens plus fetch time from a lower tier, as Mooncake does. Tune \(\gamma\) by replaying traces: \(\gamma\to0\) creates hotspots on popular prefixes; large \(\gamma\) reduces hit rate to random placement. Add safeguards: cap per-replica queue length, replicate hot prefixes to several replicas, use consistent hashing on a session id as a fallback when the index is stale, and route very short prompts by load alone. Measure hit rate, TTFT percentiles and load imbalance.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch13-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> What happens to latency in a disaggregated system when a decode worker fails, and how would you handle it?</summary>
+<div class="answer">
+<p>The worker held caches for hundreds of in-flight requests; their streams stop. Options: re-prefill each affected request on the prefill pool from its prompt plus tokens generated so far (prompt + output is just a longer prompt), then resume decoding elsewhere; this costs a TTFT-like pause for each user and a burst of prefill load. If caches were also written to a tiered store (CPU DRAM, SSD, remote), the new decode worker can fetch them instead, which is faster when \(\chi\) is small. Engineering: the router must detect failure (heartbeats), keep per-request state (prompt, generated tokens, sampling state and seed) outside the worker, rate-limit recovery so the prefill pool is not overwhelmed, and prioritise recovering requests over new arrivals to bound user-visible stalls. Streams should resume without duplicating tokens already sent.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch13-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> Explain attention–FFN disaggregation and derive the micro-batch condition for the ping-pong pipeline.</summary>
+<div class="answer">
+<p>In MoE decode, attention reads per-request caches (cost grows with sequences and context; needs memory capacity), while expert FFNs read shared weights once per step (cost amortised over routed tokens; needs huge batches). AFD puts attention on data-parallel attention nodes and experts on expert-parallel nodes; many attention nodes feed one expert pool, so experts see large aggregate batches (MegaScale-Infer reports up to 1.9× per-GPU decode throughput). Each layer then requires dispatch and combine transfers, and the dependency between them would idle each side half the time, so the batch is split into \(m\) micro-batches that alternate. With per-stage compute \(t_c\) and one-way transfer \(t_x\), a micro-batch returns to attention after \(2t_c+2t_x\); the other \(m-1\) micro-batches must cover the interval after its own attention, \((m-1)t_c\ge t_c+2t_x\), so \(m\ge2+2t_x/t_c\). Balanced stage times and fast many-to-many communication are therefore essential.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch13-qa-12">
+<summary><span class="lvl deep">Deep-dive</span> When is it better to recompute a prefix than to fetch its KV cache from a remote tier?</summary>
+<div class="answer">
+<p>Fetching \(h\) tokens costs about \(h\,s_{kv}/\beta_{\text{tier}}\) plus a fixed latency; recomputing costs about \(h(2N+2Ldh)/\pi_{\text{eff}}\), and recomputation also occupies prefill compute that other requests could use. The fetch-to-recompute ratio is \(\chi\) evaluated with the tier's bandwidth: for Llama 3 8B, about 0.1 over 400 Gb/s RDMA, about 0.08 from local CPU memory over PCIe Gen5 (≈64 GB/s), but around 1 from an SSD at a few GB/s. So fetch from DRAM and RDMA pools almost always; fetch from SSD for long prefixes if the fetch can be pipelined with computing the uncached suffix; recompute short prefixes, where fixed latencies dominate. Attention FLOPs grow with prefix length, so long prefixes favour fetching even more. MLA models favour fetching at every tier.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch13-qa-13">
+<summary><span class="lvl design">Design</span> Design the serving architecture for a 600B-parameter MoE model with long-context RAG traffic (16k-token prompts, 400-token answers) and interactive SLOs.</summary>
+<div class="answer">
+<p>Disaggregate. Prefill: compute-bound on long prompts; instances of a few nodes using expert parallelism and possibly sequence or context parallelism for 16k prompts; sized from \(F_P\) at about 70% utilisation to meet TTFT. Decode: wide expert parallelism across many GPUs (tens to hundreds) so each expert sees large batches; attention data-parallel with MLA or GQA caches; consider attention–FFN disaggregation at very large scale. KV transfer over 400–800 Gb/s RDMA with layer-wise pipelining; with MLA, \(\chi\) is about 0.01. RAG prompts share documents, so add a cluster-wide tiered KV store (HBM, CPU DRAM, SSD) and a KV-aware router that estimates TTFT from queue, uncached prefill and fetch time; order prompts so shared documents come first. A planner adjusts the prefill-to-decode ratio, which for long prompts will be high (Figure 13.5). Add early rejection under overload, failure recovery by re-prefill or fetch, and metrics for TTFT and TPOT percentiles, hit rate and transfer latency. Validate with trace replay before production.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch13-qa-14">
+<summary><span class="lvl design">Design</span> A team runs Llama 3 8B for chat (1k-token prompts, 300-token answers, relaxed 50 ms TPOT) on 16 H100s and wants to disaggregate. What do you advise?</summary>
+<div class="answer">
+<p>Probably do not, or at least benchmark first. The model is small and dense, prompts are short, TPOT is relaxed and the hardware is homogeneous, so the hypotheses of the colocation bound hold well: a colocated engine with chunked prefill can fill decode's idle tensor cores with prefill and will have higher per-GPU throughput (Figure 13.6 shows a 25–35% advantage). Short prompts also make transfer and routing overhead relatively large, and the operational complexity is real. Better levers: run 16 TP=1 replicas behind a prefix-aware router; FP8 weights and cache; tune the token budget and <code>max_num_seqs</code>; ensure prefix caching works on the system prompt. Reconsider if targets tighten (for example sub-20 ms P99 TPOT with bursty long prompts), if prompts grow long, or if cheaper decode hardware becomes available.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch13-qa-15">
+<summary><span class="lvl design">Design</span> How would you build the planner that resizes prefill and decode pools?</summary>
+<div class="answer">
+<p>Inputs: per-pool metrics every few seconds (TTFT and TPOT percentiles against targets, queue depth and wait, prefill utilisation, decode KV usage and batch size), plus traffic features (arrival rate, prompt and output length distributions, hit rate). Model: the sizing formula of §13.5 gives target \(n_P\) and \(n_D\) from forecast traffic; a feedback controller corrects for model error, adding prefill capacity when TTFT burn rate rises with high queue wait, and decode capacity when TPOT or KV usage approaches limits. Actions: convert workers between roles (cheap if the same model weights are loaded, only the engine role changes), or scale pools up and down. Constraints: hysteresis and minimum dwell times to avoid oscillation, draining a decode worker before reassigning (or migrating its caches), respecting topology (keep prefill and decode in the same network domain), and leaving headroom for bursts. Validate by replaying traces in a simulator before enabling automatic actions.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch13-qa-16">
+<summary><span class="lvl core">Core</span> Compare push and pull KV transfer, and name the transfer libraries used in practice.</summary>
+<div class="answer">
+<p>Push: the prefill instance writes the cache into blocks pre-allocated on the decode instance, possibly layer by layer during prefill; this minimises TTFT but requires the decode side to commit memory at admission. Pull: the prefill instance keeps the cache, and the decode instance reads it (RDMA read) when it has room; this gives natural back-pressure and lets the decode scheduler decide when to admit, at the cost of holding caches on the prefill side and a possible extra delay. Hybrid systems push to a staging tier (CPU DRAM pool) that decode pulls from. Libraries: NVIDIA NIXL (used by Dynamo, llm-d, vLLM and SGLang), Mooncake's Transfer Engine, LMCache; underneath, GPUDirect RDMA over InfiniBand or RoCE across nodes and NVLink within a node.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-splitwise">P. Patel, E. Choukse, C. Zhang, A. Shah, Í. Goiri, S. Maleki, R. Bianchini. Splitwise: Efficient Generative LLM Inference Using Phase Splitting. <em>ISCA</em>, 2024. <a href="https://arxiv.org/abs/2311.18677">arXiv:2311.18677</a>.</li>
+<li id="r-distserve">Y. Zhong, S. Liu, J. Chen, J. Hu, Y. Zhu, X. Liu, X. Jin, H. Zhang. DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving. <em>OSDI</em>, 2024. <a href="https://arxiv.org/abs/2401.09670">arXiv:2401.09670</a>.</li>
+<li id="r-tetri">C. Hu et al. Inference without Interference: Disaggregate LLM Inference for Mixed Downstream Workloads (TetriInfer). 2024. <a href="https://arxiv.org/abs/2401.11181">arXiv:2401.11181</a>.</li>
+<li id="r-sarathi">A. Agrawal et al. Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve. <em>OSDI</em>, 2024. <a href="https://arxiv.org/abs/2403.02310">arXiv:2403.02310</a>.</li>
+<li id="r-mooncake">R. Qin et al. Mooncake: Trading More Storage for Less Computation — A KVCache-centric Architecture for Serving LLM Chatbot. <em>FAST</em>, 2025. <a href="https://arxiv.org/abs/2407.00079">arXiv:2407.00079</a>.</li>
+<li id="r-dynamo">NVIDIA. Dynamo: a datacenter-scale distributed inference serving framework, and NIXL, the NVIDIA Inference Xfer Library. 2025. <a href="https://github.com/ai-dynamo/dynamo">github.com/ai-dynamo/dynamo</a>.</li>
+<li id="r-dsv3">DeepSeek-AI. DeepSeek-V3 Technical Report (§3.4, inference and deployment). 2024. <a href="https://arxiv.org/abs/2412.19437">arXiv:2412.19437</a>.</li>
+<li id="r-llmd">llm-d: Kubernetes-native distributed inference serving. 2025. <a href="https://github.com/llm-d/llm-d">github.com/llm-d/llm-d</a>.</li>
+<li id="r-sglangpd">The SGLang Team. Deploying DeepSeek with PD Disaggregation and Large-Scale Expert Parallelism on 96 H100 GPUs. LMSYS blog, 5 May 2025. <a href="https://lmsys.org/blog/2025-05-05-large-scale-ep/">lmsys.org</a>.</li>
+<li id="r-megascale">R. Zhu et al. MegaScale-Infer: Serving Mixture-of-Experts at Scale with Disaggregated Expert Parallelism. 2025. <a href="https://arxiv.org/abs/2504.02263">arXiv:2504.02263</a>.</li>
+<li id="r-step3">StepFun. Step-3 is Large yet Affordable: Model-system Co-design for Cost-effective Decoding. 2025. <a href="https://arxiv.org/abs/2507.19427">arXiv:2507.19427</a>.</li>
+<li>LMCache: a KV-cache layer for LLM serving engines. <a href="https://github.com/LMCache/LMCache">github.com/LMCache/LMCache</a>.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

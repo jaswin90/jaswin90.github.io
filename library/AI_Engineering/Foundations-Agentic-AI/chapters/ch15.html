@@ -1,0 +1,585 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 15 · Multi-Agent Systems — Foundations of Agentic AI</title>
+<meta name="description" content="Chapter 15 of Foundations of Agentic AI: why many agents, from the contract net to MetaGPT, ensembles and debate with correlated errors, orchestrator-workers and Amdahl's law, roles, communication topologies, failure modes, and when to use one agent or many.">
+<script>try{var t=localStorage.getItem('aai-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script defer src="/library/assets/book-shim.js" data-library="/library/" data-field="/library/AI_Engineering/" data-field-title="AI Engineering"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-chapter="ch15" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Part V · Many Agents — Chapter 15</div>
+<h1 id="top">Multi-Agent Systems</h1>
+<p class="lede">If one agent can delegate to another, a system can contain many: a lead that plans and workers that search, a writer and a critic, debaters and a judge. Many agents can work in parallel, bring independent perspectives and check each other. They also multiply cost, lose information at every handover and fail in ways no single agent does. This chapter asks when many agents genuinely beat one, and how to build the systems in which they do.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Chapter 14 introduced sub-agents as a way to keep one agent's context clean: a self-contained piece of work goes to a fresh context and comes back as a short summary. That technique is the simplest multi-agent system, and it raises a natural generalisation. Several agents could work on different sub-tasks at the same time. Agents with different instructions, tools or models could bring different strengths. Agents could check one another's work, argue opposite sides of a question, or vote. Between 2023 and 2025 all of these were tried, under names such as role-playing, debate, society of minds, crews and orchestrator–worker systems, and some of them became the architecture of production systems such as deep-research agents.</p>
+<p>The record is mixed, and the reasons are instructive. Multi-agent systems help when the work divides cleanly into parts that can proceed independently, when the agents' errors are genuinely independent so that combining them cancels noise, or when one agent's job is to check another's. They hurt when the work is tightly coupled, so that agents act on inconsistent pictures of the task; when their errors are correlated, so that combining them adds cost without adding information; and when the coordination itself (messages, handovers, conflicting decisions) introduces more errors than the extra agents remove. This chapter develops each side quantitatively, with models of ensembles, parallel speed-up and communication cost, surveys the patterns and the evidence, and ends with a decision procedure.</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>State the four sources of benefit from multiple agents (parallelism, context isolation, independent errors, adversarial checking) and the costs that offset them.</li>
+<li>Trace multi-agent systems from distributed AI and the contract net protocol to CAMEL, ChatDev, MetaGPT and AutoGen.</li>
+<li>Analyse ensembles and debate with correlated errors, and explain why correlation limits their gains.</li>
+<li>Describe the orchestrator–worker pattern and compute its speed-up with Amdahl's law and its token cost.</li>
+<li>Compare communication topologies by message cost and failure modes.</li>
+<li>Recognise the failure modes catalogued for multi-agent LLM systems, and decide when to use one agent or many.</li>
+</ol>
+</div>
+<p>We use self-consistency and Condorcet's theorem (§5.4), critique and judges (Chapter 7), protocols (Chapter 12) and sub-agents (§14.5).</p>
+
+<h2 id="s15-1">15.1 Why more than one agent?</h2>
+<p>A single agent with a good harness can, in principle, do anything a team of agents can, by doing the team's work in sequence in one context. So the case for many agents must rest on something a single agent cannot get, and there are exactly four such things.</p>
+<p><strong>Parallelism.</strong> Independent pieces of work can run at the same time in separate agents, shortening wall-clock time. A research question with ten sub-questions can be answered in the time of the slowest sub-question rather than the sum of all ten. <strong>Context isolation.</strong> Each agent has its own context, so bulky intermediate work in one does not pollute the others (§14.5); a team of agents can collectively process far more material than fits in any one context. <strong>Independent errors.</strong> Agents that reason separately, perhaps with different prompts or models, make partly independent mistakes, and combining their answers can cancel some of them, the logic of self-consistency (§5.4) extended across agents. <strong>Adversarial checking.</strong> An agent whose job is to find flaws in another's work, or to argue against it, is a critic in the sense of Chapter 7, and a critic with a different context and incentive can catch errors the author is blind to.</p>
+<p>Against these stand three costs. <strong>Tokens</strong>: every agent pays its own prefix and ramp-up, and passing information between agents means writing it out and reading it back, so multi-agent systems routinely use several times more tokens than a single agent on the same task. <strong>Information loss at handovers</strong>: each message between agents is a compression of what the sender knew (§14.5), and decisions made in one context are invisible in another unless explicitly communicated. <strong>Coordination errors</strong>: agents can duplicate each other's work, contradict each other, wait on each other, or fail to stop, failure modes that do not exist for a single agent. Figure 15.1 shows the three patterns through which the benefits are usually sought.</p>
+
+<figure class="diagram" id="fig-15-1">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="Three multi-agent patterns: orchestrator-workers, pipeline of roles, debate with a judge">
+<defs><marker id="ah151" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<text x="115" y="22" text-anchor="middle" class="t-b">orchestrator–workers</text>
+<text x="360" y="22" text-anchor="middle" class="t-b">pipeline of roles</text>
+<text x="605" y="22" text-anchor="middle" class="t-b">debate + judge</text>
+<line x1="235" y1="10" x2="235" y2="240" class="grid"/><line x1="485" y1="10" x2="485" y2="240" class="grid"/>
+<rect x="65" y="40" width="100" height="34" rx="8" class="fill-acc"/><text x="115" y="62" text-anchor="middle" class="t-on t-xs">lead / planner</text>
+<g class="t-xs"><rect x="15" y="130" width="60" height="30" rx="6" class="bx3"/><text x="45" y="150" text-anchor="middle">worker</text>
+<rect x="85" y="130" width="60" height="30" rx="6" class="bx3"/><text x="115" y="150" text-anchor="middle">worker</text>
+<rect x="155" y="130" width="60" height="30" rx="6" class="bx3"/><text x="185" y="150" text-anchor="middle">worker</text></g>
+<line x1="100" y1="74" x2="50" y2="128" class="ln" marker-end="url(#ah151)" marker-start="url(#ah151)"/><line x1="115" y1="74" x2="115" y2="128" class="ln" marker-end="url(#ah151)" marker-start="url(#ah151)"/><line x1="130" y1="74" x2="180" y2="128" class="ln" marker-end="url(#ah151)" marker-start="url(#ah151)"/>
+<text x="115" y="196" text-anchor="middle" class="t-xs">parallel sub-tasks,</text><text x="115" y="212" text-anchor="middle" class="t-xs">isolated contexts</text>
+<g class="t-xs"><rect x="300" y="40" width="120" height="30" rx="6" class="bx2"/><text x="360" y="60" text-anchor="middle">product manager</text>
+<rect x="300" y="88" width="120" height="30" rx="6" class="bx3"/><text x="360" y="108" text-anchor="middle">architect</text>
+<rect x="300" y="136" width="120" height="30" rx="6" class="bx3"/><text x="360" y="156" text-anchor="middle">engineer</text>
+<rect x="300" y="184" width="120" height="30" rx="6" class="bx4"/><text x="360" y="204" text-anchor="middle">QA reviewer</text></g>
+<line x1="360" y1="70" x2="360" y2="86" class="ln" marker-end="url(#ah151)"/><line x1="360" y1="118" x2="360" y2="134" class="ln" marker-end="url(#ah151)"/><line x1="360" y1="166" x2="360" y2="182" class="ln" marker-end="url(#ah151)"/>
+<path d="M420,199 C460,199 460,151 422,151" class="ln dash" marker-end="url(#ah151)"/>
+<text x="360" y="234" text-anchor="middle" class="t-xs">specialised prompts and artefacts</text>
+<g class="t-xs"><rect x="510" y="50" width="80" height="34" rx="8" class="bx3"/><text x="550" y="72" text-anchor="middle">debater A</text>
+<rect x="620" y="50" width="80" height="34" rx="8" class="bx2"/><text x="660" y="72" text-anchor="middle">debater B</text>
+<rect x="560" y="150" width="90" height="36" rx="8" class="bx4"/><text x="605" y="173" text-anchor="middle">judge</text></g>
+<line x1="590" y1="62" x2="618" y2="62" class="ln" marker-end="url(#ah151)" marker-start="url(#ah151)"/><text x="605" y="46" text-anchor="middle" class="t-xs">rounds</text>
+<line x1="550" y1="84" x2="590" y2="148" class="ln" marker-end="url(#ah151)"/><line x1="660" y1="84" x2="620" y2="148" class="ln" marker-end="url(#ah151)"/>
+<text x="605" y="212" text-anchor="middle" class="t-xs">opposing arguments,</text><text x="605" y="228" text-anchor="middle" class="t-xs">independent verdict</text>
+</svg>
+<figcaption><b>Figure 15.1 — Three multi-agent patterns.</b> An orchestrator splits work among parallel workers with isolated contexts. A pipeline passes artefacts between agents with specialised roles, with feedback from review. In debate, agents argue and a judge decides. Each pattern seeks a different one of the four benefits.</figcaption></figure>
+
+<p>Figure 15.1's three patterns map onto the four benefits: orchestrator–worker systems exploit parallelism and context isolation; pipelines of roles exploit specialisation (each agent's context and instructions are focused on one kind of work) and adversarial checking (the reviewer); debate and voting exploit independent errors and adversarial checking. Keeping the mapping in mind is the best defence against the most common mistake in multi-agent design, which is to add agents for their own sake. An extra agent is worth its cost only if it delivers one of the four benefits more cheaply than any single-agent alternative.</p>
+
+<h2 id="s15-2">15.2 From distributed AI to LLM societies</h2>
+<p>Multi-agent systems are much older than language models. Distributed artificial intelligence in the 1980s asked how independent problem solvers could cooperate, and produced the <strong>contract net protocol</strong> (Smith, 1980): a manager announces a task, contractors bid according to their capabilities and load, the manager awards the contract, and the contractor may in turn subcontract<span class="cite"><a href="#ref-contractnet">[1]</a></span>. Its structure, decomposition by announcement and award, is visible in today's orchestrators. The 1990s added agent communication languages with standard "speech acts" (inform, request, propose), the BDI architectures of §1.4 applied to teams, and a large body of game theory on how self-interested agents negotiate, form coalitions and reach agreements. These systems shared the weakness of all pre-LLM agents: each agent's competence had to be programmed by hand.</p>
+<p>Language models made it trivial to create agents with any role by writing a prompt, and in 2023 a burst of work explored what such "societies" could do. <strong>CAMEL</strong> (Li et al., March 2023) set two agents to role-play a user and an assistant collaborating on a task, with "inception prompts" to keep them in role, and used the resulting dialogues as data<span class="cite"><a href="#ref-camel">[2]</a></span>. <strong>Generative Agents</strong> (§13.4) populated a village with 25 interacting agents. <strong>ChatDev</strong> (Qian et al., 2023) simulated a software company, with agents as chief executive, programmer, tester and so on, communicating in pairs through phases of design, coding and testing<span class="cite"><a href="#ref-chatdev">[3]</a></span>. <strong>MetaGPT</strong> (Hong et al., 2023) argued that unstructured chat between agents compounds errors, and encoded human <em>standard operating procedures</em> instead: agents with roles such as product manager, architect and engineer each produced a structured artefact (a requirements document, a design, code) that the next consumed, rather than chatting freely<span class="cite"><a href="#ref-metagpt">[4]</a></span>. <strong>AutoGen</strong> (Wu et al., 2023) provided a general framework for conversations among configurable agents, including humans and tool executors, which became widely used<span class="cite"><a href="#ref-autogen">[5]</a></span>.</p>
+<p>The lesson of this period, most explicit in MetaGPT, is that the structure of communication matters more than the number or personas of the agents. Free-form conversation among agents is a long, unverified trajectory in which each message can introduce an error that later messages build on; structured artefacts passed between stages are checkpoints that can be validated, exactly as the milestones of §14.6 are. Much of the value attributed to "role-playing agents" in early demonstrations came from this decomposition into stages with intermediate artefacts, which a single agent following the same procedure can also exploit. That observation sets up the central question of the chapter: what can several agents do that one agent with the same procedure cannot?</p>
+
+<h2 id="s15-3">15.3 Ensembles and debate</h2>
+<p>The simplest use of several agents is to ask each the same question and combine their answers. If the agents' errors were independent, this would inherit the full power of Condorcet's theorem (§5.4): with each agent right with probability \(p>\tfrac12\), majority accuracy rises towards one as agents are added. Du and colleagues (2023) went a step further with <strong>multi-agent debate</strong>: several model instances answer, then read each other's answers and reasoning, revise their own, and repeat for a few rounds before a final answer is taken<span class="cite"><a href="#ref-du">[6]</a></span>. Debate improved accuracy on arithmetic and grade-school mathematics and reduced factual errors in generated biographies compared with a single model, and with plain voting in several settings, because agents could correct each other's specific mistakes rather than merely outvote them.</p>
+<p>The limit of all such methods is correlation. Copies of the same model, given the same question, tend to make the same mistakes for the same reasons; their votes are not independent, and the effective number of voters is smaller than the number of agents. A simple model makes the effect precise. Suppose that with probability \(\varrho\) all \(k\) agents share one draw (they are, in effect, a single agent), and otherwise they are independent, each right with probability \(p\). The ensemble's accuracy is</p>
+<div class="box formula">
+\[ \Pr[\text{ensemble correct}]=\varrho\,p+(1-\varrho)\,P_{\text{maj}}(k,p), \]
+</div>
+<p>where \(P_{\text{maj}}\) is the independent majority accuracy of §5.4. As \(k\to\infty\) it tends not to 1 but to \(\varrho p+(1-\varrho)\), so correlation puts a ceiling on what any number of agents can achieve. Figure 15.2 plots it for \(p=0.7\).</p>
+
+<figure class="chart" id="fig-15-2">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Majority accuracy of k agents (each right 70% of the time) with correlated errors","height":330,
+ "x":{"label":"Number of agents k (log)","log":true,"min":1,"max":15,"ticks":[1,3,5,9,15]},
+ "y":{"label":"Probability the majority is right","min":0.65,"max":1,"fmt":"pct"},
+ "series":[
+  {"name":"independent (ϱ = 0)","color":"s1","points":[[1,0.7],[3,0.784],[5,0.8369],[9,0.9012],[15,0.95]]},
+  {"name":"ϱ = 0.3","color":"s3","points":[[1,0.7],[3,0.7588],[5,0.7958],[9,0.8408],[15,0.875]]},
+  {"name":"ϱ = 0.6","color":"s2","points":[[1,0.7],[3,0.7336],[5,0.7548],[9,0.7805],[15,0.8]]}
+ ]}
+</script>
+<figcaption><b>Figure 15.2 — Correlation caps the value of more agents.</b> With independent agents, fifteen voters reach 95%. If 30% of the time the agents err together, fifteen reach 87.5% with a ceiling of 91%; at 60% correlation, 80% with a ceiling of 82%. Diversity, not number, is what ensembles buy.</figcaption></figure>
+
+<p>Figure 15.2 turns into design advice. The return from extra agents of the same model with the same prompt falls off quickly, because their correlation is high. Returns are better when agents are made genuinely different: different models (whose training data and biases differ), different prompts or framings, different tools or evidence (one searches the web, another reads the code), or different roles (one must find flaws, another must defend). This is why practitioners who use ensembles mix model families, and why the most effective "debate" setups give agents different information or opposing assignments rather than asking identical agents to discuss.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — three models or one model three times?</div>
+<p>A support team asks agents to classify whether a refund request is eligible under a complex policy. One frontier model is right 80% of the time; two other models from different families are right 75% and 72%. Copies of the same model share their errors with \(\varrho\approx0.5\); different models with \(\varrho\approx0.15\).</p>
+<p><b>Same model, three times.</b> Independent majority of three at 0.8: \(0.8^3+3\times0.8^2\times0.2=0.896\). With \(\varrho=0.5\): \(0.5\times0.8+0.5\times0.896=0.848\).</p>
+<p><b>Three different models.</b> Independent majority with \(p=(0.80,0.75,0.72)\): \(P=p_1p_2p_3+p_1p_2(1-p_3)+p_1(1-p_2)p_3+(1-p_1)p_2p_3=0.432+0.168+0.144+0.108=0.852\). With \(\varrho=0.15\) (taking the shared draw as the best model's): \(0.15\times0.8+0.85\times0.852=0.844\).</p>
+<p><b>Verdict.</b> Roughly equal here: the weaker models' lower accuracy offsets their greater independence. Diversity pays when the alternatives are nearly as accurate; otherwise a single stronger model, or the strong model with external checks (Chapter 7), may be the better buy. Measuring \(\varrho\), by checking how often agents err on the same items, is what makes the choice principled.</p>
+</div>
+
+<p>Debate has a second, more ambitious motivation that comes from AI safety. Irving, Christiano and Amodei (2018) proposed <strong>debate</strong> as a way for humans to judge the answers of systems more capable than themselves: two agents argue opposite sides, each pointing out the other's flaws, and a human judge decides who is right, on the theory that it is easier to judge an argument than to produce a correct answer, especially when each side has an incentive to expose the other's errors<span class="cite"><a href="#ref-irving">[7]</a></span>. Experiments with language models later supported the idea in a controlled setting: Khan and colleagues (2024) gave debaters access to a text that the judge could not see and found that judges, both models and people, answered reading-comprehension questions much more accurately when they watched a debate (76% for model judges and 88% for human judges) than with naive baselines (48% and 60%), and more accurately still when the debaters were more persuasive<span class="cite"><a href="#ref-khan">[8]</a></span>. For agent engineering, the practical descendant is the adversarial critic: an agent assigned to find what is wrong with another agent's output, whose findings are then judged, the scalable-oversight pattern of §7.7.</p>
+
+<h2 id="s15-4">15.4 Orchestrator and workers</h2>
+<p>The multi-agent pattern that has proved most valuable in production is the <strong>orchestrator–worker</strong> system: a lead agent analyses the task, decomposes it into sub-tasks, dispatches them to worker agents running in parallel with their own contexts and tools, collects their results, and decides whether to dispatch more or to synthesise an answer. It is the sub-agent pattern of §14.5 with parallel workers and a dedicated coordinator. Figure 15.3 shows it as used in deep-research systems.</p>
+
+<figure class="diagram" id="fig-15-3">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Orchestrator–worker research system with parallel sub-agents">
+<defs><marker id="ah153" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker>
+<marker id="ah153a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead-acc"/></marker></defs>
+<rect x="20" y="100" width="100" height="50" rx="8" class="bx2"/><text x="70" y="122" text-anchor="middle" class="t-sm">question</text><text x="70" y="140" text-anchor="middle" class="t-xs">from user</text>
+<rect x="160" y="80" width="150" height="90" rx="10" class="fill-acc"/><text x="235" y="106" text-anchor="middle" class="t-on t-b">lead agent</text><text x="235" y="126" text-anchor="middle" class="t-on t-xs">plan, decompose,</text><text x="235" y="142" text-anchor="middle" class="t-on t-xs">dispatch, synthesise</text><text x="235" y="158" text-anchor="middle" class="t-on t-xs">(memory: plan file)</text>
+<g class="t-xs">
+<rect x="370" y="20" width="160" height="40" rx="8" class="bx3"/><text x="450" y="38" text-anchor="middle">worker: sub-question 1</text><text x="450" y="52" text-anchor="middle">search · read · extract</text>
+<rect x="370" y="75" width="160" height="40" rx="8" class="bx3"/><text x="450" y="93" text-anchor="middle">worker: sub-question 2</text><text x="450" y="107" text-anchor="middle">search · read · extract</text>
+<rect x="370" y="130" width="160" height="40" rx="8" class="bx3"/><text x="450" y="148" text-anchor="middle">worker: sub-question 3</text><text x="450" y="162" text-anchor="middle">search · read · extract</text>
+<rect x="370" y="185" width="160" height="40" rx="8" class="bx3"/><text x="450" y="203" text-anchor="middle">worker: sub-question 4</text><text x="450" y="217" text-anchor="middle">search · read · extract</text>
+</g>
+<line x1="310" y1="110" x2="368" y2="40" class="ln" marker-end="url(#ah153)"/><line x1="310" y1="120" x2="368" y2="95" class="ln" marker-end="url(#ah153)"/><line x1="310" y1="130" x2="368" y2="150" class="ln" marker-end="url(#ah153)"/><line x1="310" y1="140" x2="368" y2="205" class="ln" marker-end="url(#ah153)"/>
+<rect x="580" y="90" width="120" height="70" rx="10" class="bx4"/><text x="640" y="114" text-anchor="middle" class="t-sm">citation check</text><text x="640" y="132" text-anchor="middle" class="t-xs">verify claims</text><text x="640" y="148" text-anchor="middle" class="t-xs">against sources</text>
+<path d="M530,40 C560,40 560,100 578,110" class="ln-acc" marker-end="url(#ah153a)"/><path d="M530,205 C560,205 560,150 578,140" class="ln-acc" marker-end="url(#ah153a)"/>
+<line x1="120" y1="125" x2="158" y2="125" class="ln" marker-end="url(#ah153)"/>
+<path d="M640,160 C640,250 235,250 235,172" class="ln dash" marker-end="url(#ah153)"/><text x="440" y="250" text-anchor="middle" class="t-xs">condensed findings → lead decides: more searching, or write the report</text>
+</svg>
+<figcaption><b>Figure 15.3 — An orchestrator–worker research system.</b> The lead agent plans and dispatches sub-questions to workers that search and read in parallel, each in its own context, and return condensed findings; a checking stage verifies citations; the lead decides whether to dispatch further work or to write the answer.</figcaption></figure>
+
+<p>Anthropic described such a system in detail in 2025: a lead agent (Claude Opus 4) that spawned sub-agents (Claude Sonnet 4) to explore different aspects of a research question in parallel, followed by a citation-checking step<span class="cite"><a href="#ref-multiresearch">[9]</a></span>. On an internal research evaluation it outperformed a single-agent configuration of the stronger model by 90.2%. The same report was candid about the price: agents used about four times as many tokens as chat interactions, and the multi-agent system about fifteen times as many. Its analysis of a browsing benchmark found that token usage alone explained most of the variance in performance, which suggests that much of the multi-agent advantage on such tasks comes from being able to spend more tokens productively, in parallel contexts, than a single context allows. It also listed what had to be engineered: teaching the lead to delegate with clear objectives, output formats and boundaries; scaling effort to query complexity (one agent for simple facts, many for broad comparisons); and preventing duplicated work.</p>
+<p>Two quantities govern whether an orchestrator pays. The first is <em>speed-up</em>, which is limited by the parts of the task that cannot be parallelised: planning, synthesis, and any sub-task that depends on another. If a fraction \(f\) of the work can be spread across \(n\) workers and the rest is sequential, Amdahl's law gives the speed-up</p>
+\[ S(n)=\frac{1}{(1-f)+f/n}, \]
+<p>which tends to \(1/(1-f)\) however many workers are added. Figure 15.4 plots it. The second is <em>cost</em>: workers each pay a prefix and ramp-up, and their findings must be condensed and read by the lead, so total tokens grow roughly linearly with the number of workers, while quality gains saturate.</p>
+
+<figure class="chart" id="fig-15-4">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Amdahl's law: speed-up from n parallel workers","height":320,
+ "x":{"label":"Number of workers n (log)","log":true,"min":1,"max":32,"ticks":[1,2,4,8,16,32]},
+ "y":{"label":"Speed-up","min":0,"max":14},
+ "series":[
+  {"name":"95% parallelisable","color":"s1","points":[[1,1],[2,1.9],[4,3.48],[8,5.93],[16,9.14],[32,12.55]]},
+  {"name":"80%","color":"s3","points":[[1,1],[2,1.67],[4,2.5],[8,3.33],[16,4.0],[32,4.44]]},
+  {"name":"50%","color":"s2","points":[[1,1],[2,1.33],[4,1.6],[8,1.78],[16,1.88],[32,1.94]]}
+ ]}
+</script>
+<figcaption><b>Figure 15.4 — The sequential part sets the limit.</b> If planning and synthesis are 20% of the work, no number of workers gives more than a fivefold speed-up, and eight workers already give 3.3×. Breadth-first tasks with little coordination are where orchestrators shine.</figcaption></figure>
+
+<div class="box example">
+<div class="box-title">Worked example — single agent or orchestrator for a comparison report?</div>
+<p>A research question asks for a comparison of eight products on six criteria. A single agent would take about 120 steps (15 per product) in one context, about 40 minutes, and its context would require repeated compaction, losing detail. An orchestrator spends 10 steps planning, dispatches eight workers of 15 steps each in parallel, and spends 15 steps synthesising.</p>
+<p><b>Time.</b> Sequential fraction: 25 of 145 steps, so \(f=120/145=0.83\). With 8 workers, \(S=1/(0.17+0.83/8)=1/(0.17+0.104)=3.65\): about 11 minutes.</p>
+<p><b>Tokens.</b> Single agent: 120 steps on a context averaging, say, 70,000 tokens: 8.4 million token-reads. Orchestrator: workers 8 × 15 steps × 25,000 average = 3.0 million; lead 25 steps × 20,000 = 0.5 million; plus eight 2,000-token findings written and read: about 3.6 million. Fewer here, because no context grows large; in many tasks the orchestrator uses more, through duplicated exploration and per-agent prefixes.</p>
+<p><b>Quality.</b> Each worker sees one product in depth with a focused context; the risk moves to synthesis, where the lead must combine eight findings consistently, which is why the plan should fix the criteria and output format for every worker in advance.</p>
+</div>
+
+<h2 id="s15-5">15.5 Roles and specialisation</h2>
+<p>Many multi-agent systems assign agents roles: planner, coder, reviewer, tester; researcher, writer, editor; or, in the simulations of 2023, chief executive and product manager. It is worth being precise about what a role actually changes, because the anthropomorphic framing can obscure it. An agent's "role" is its system prompt, its tools, its context and possibly its model. A reviewer agent differs from the coder agent not by having a different personality but by reading the diff and the requirements without the coder's history of reasoning, with instructions to look for flaws and perhaps with tools (a test runner, a linter) the coder did not use. Those differences are real and valuable: a fresh context is free of the coder's assumptions, which is the independence that makes a critic useful (§7.4); a focused prompt raises per-step accuracy on that kind of work; a narrower tool set reduces selection errors (§8.8) and risk (§8.9).</p>
+<p>What a role does <em>not</em> provide is knowledge or ability the underlying model lacks. A "senior security expert" persona does not know more about security than the same model without the label, although the instruction may focus its attention. Experiments that compare role-playing teams with a single agent following the same procedure often find much of the gain attributable to the procedure, the decomposition into stages with artefacts that MetaGPT emphasised, rather than to the multiplicity of agents. The practical rule is to create a separate agent for a role when that role needs a <em>different context</em> (independence from another agent's reasoning, or a fresh window for bulky work), <em>different tools or permissions</em>, or a <em>different model</em> (a cheaper one for routine work, a stronger one for judgement), and otherwise to implement the role as a stage within a single agent's procedure.</p>
+<p>The role structure most consistently useful in practice is the pairing of a <strong>producer</strong> with an <strong>independent checker</strong>: a coder and a reviewer, a writer and a fact-checker, a planner and a plan critic. It is the evaluator–optimizer pattern of §7.8 with the evaluator in its own context, and its value rests on the checker's independence and on the checker having something external to check against (tests, sources, requirements). Without the latter, the checker is intrinsic self-correction with extra steps, and inherits its limits.</p>
+
+<h2 id="s15-6">15.6 Communication and coordination</h2>
+<p>Agents in a system must exchange information, and the pattern of exchange, the <strong>topology</strong>, determines cost, latency and failure modes. Figure 15.5 shows the three basic topologies.</p>
+
+<figure class="diagram" id="fig-15-5">
+<svg class="dg" viewBox="0 0 720 240" role="img" aria-label="Communication topologies: star, chain, fully connected">
+<text x="120" y="22" text-anchor="middle" class="t-b">star (orchestrator)</text>
+<text x="360" y="22" text-anchor="middle" class="t-b">chain (pipeline)</text>
+<text x="600" y="22" text-anchor="middle" class="t-b">fully connected (chat room)</text>
+<line x1="240" y1="10" x2="240" y2="230" class="grid"/><line x1="480" y1="10" x2="480" y2="230" class="grid"/>
+<circle cx="120" cy="110" r="18" class="fill-acc"/>
+<g><circle cx="120" cy="45" r="13" class="bx3"/><circle cx="180" cy="80" r="13" class="bx3"/><circle cx="180" cy="145" r="13" class="bx3"/><circle cx="120" cy="175" r="13" class="bx3"/><circle cx="60" cy="145" r="13" class="bx3"/><circle cx="60" cy="80" r="13" class="bx3"/></g>
+<g class="ln"><line x1="120" y1="92" x2="120" y2="58"/><line x1="136" y1="102" x2="168" y2="86"/><line x1="136" y1="118" x2="168" y2="140"/><line x1="120" y1="128" x2="120" y2="162"/><line x1="104" y1="118" x2="72" y2="140"/><line x1="104" y1="102" x2="72" y2="86"/></g>
+<text x="120" y="208" text-anchor="middle" class="t-xs">n − 1 links; lead is the bottleneck</text>
+<g><circle cx="270" cy="110" r="13" class="bx3"/><circle cx="315" cy="110" r="13" class="bx3"/><circle cx="360" cy="110" r="13" class="bx3"/><circle cx="405" cy="110" r="13" class="bx3"/><circle cx="450" cy="110" r="13" class="bx3"/></g>
+<g class="ln"><line x1="283" y1="110" x2="302" y2="110"/><line x1="328" y1="110" x2="347" y2="110"/><line x1="373" y1="110" x2="392" y2="110"/><line x1="418" y1="110" x2="437" y2="110"/></g>
+<text x="360" y="208" text-anchor="middle" class="t-xs">n − 1 links; errors propagate downstream</text>
+<g><circle cx="600" cy="50" r="13" class="bx3"/><circle cx="657" cy="92" r="13" class="bx3"/><circle cx="635" cy="160" r="13" class="bx3"/><circle cx="565" cy="160" r="13" class="bx3"/><circle cx="543" cy="92" r="13" class="bx3"/></g>
+<g class="ln"><line x1="600" y1="50" x2="657" y2="92"/><line x1="600" y1="50" x2="635" y2="160"/><line x1="600" y1="50" x2="565" y2="160"/><line x1="600" y1="50" x2="543" y2="92"/><line x1="657" y1="92" x2="635" y2="160"/><line x1="657" y1="92" x2="565" y2="160"/><line x1="657" y1="92" x2="543" y2="92"/><line x1="635" y1="160" x2="565" y2="160"/><line x1="635" y1="160" x2="543" y2="92"/><line x1="565" y1="160" x2="543" y2="92"/></g>
+<text x="600" y="208" text-anchor="middle" class="t-xs">n(n − 1)/2 links; every message read by all</text>
+</svg>
+<figcaption><b>Figure 15.5 — Three topologies.</b> A star routes everything through a coordinator; a chain passes artefacts stage by stage; a fully connected group lets every agent talk to every other. Their costs grow linearly, linearly and quadratically with the number of agents.</figcaption></figure>
+
+<p>Figure 15.5's link counts translate directly into tokens. In a fully connected group where each of \(n\) agents posts one message of \(u\) tokens per round to a shared conversation that every agent reads, each round adds \(nu\) tokens to every agent's context, so the reading cost per round is \(n\cdot nu=n^2u\) and grows with every round as the shared history lengthens. A star with a coordinator that sends each worker a task and receives a result costs about \(2(n-1)u\) per round, and only the coordinator's context grows with \(n\). A chain costs \((n-1)u\) and has the latency of its length. Free-form "group chat" among many agents is therefore the most expensive topology, and also the most error-prone, because every agent's context fills with the others' messages, including their mistakes (§3.3's imitation of context applies with force).</p>
+<p>Two coordination mechanisms reduce these costs. A <strong>shared workspace</strong> (sometimes called a blackboard, after the blackboard architectures of 1980s AI) replaces messages with a common store of artefacts: plans, findings, code, notes. Agents read what they need and write their results, as the long-horizon agent of Chapter 14 reads and writes its plan and notes. This turns quadratic message traffic into reads of a structured store, and leaves a durable, inspectable record. <strong>Structured messages</strong> replace free-form chat with typed artefacts (a task specification with objectives, constraints, output format and done criteria; a result with findings, evidence and confidence), which is MetaGPT's lesson again, and which protocols such as A2A formalise for agents of different owners (§12.6).</p>
+<p>Coordination also needs rules for <strong>termination and conflict</strong>. Who decides that the work is done? A star has an obvious answer, the coordinator, which is one reason it is the most common production topology. Peer groups can loop indefinitely, with agents politely deferring to or contradicting each other; they need a round limit, a designated decider or a voting rule. When two agents' work conflicts (two workers edit the same file; two findings contradict), the system needs a rule for which wins, or a step that reconciles them, since an agent that silently overwrites another's work produces exactly the inconsistency of §14.2 at system scale.</p>
+
+<details class="drill">
+<summary>Drill 15.1 — the cost of a group chat</summary>
+<p>Five agents discuss a design in a shared conversation for 6 rounds, each posting a 400-token message per round, with a 3,000-token prefix each. Compare the total tokens read with a star in which a coordinator sends each of four workers a 400-token task and receives a 400-token result per round, over the same 6 rounds.</p>
+<p>Group chat: in round \(j\), each agent reads its prefix plus all messages so far, \(3{,}000+5\times400\times j\) tokens (taking the round's own messages as read). Summed over 5 agents and \(j=1..6\): \(5\times(6\times3{,}000+2{,}000\times21)=5\times(18{,}000+42{,}000)=300{,}000\). Star: workers read their prefix plus their task each round, \(4\times6\times3{,}400=81{,}600\); the coordinator reads its prefix plus 4 results per round, accumulating: \(6\times3{,}000+1{,}600\times21=51{,}600\); total about 133,000. The group chat reads more than twice as much, and the gap grows quadratically with agents and rounds.</p>
+</details>
+
+<h2 id="s15-7">15.7 How multi-agent systems fail</h2>
+<p>A systematic study by Cemri and colleagues (2025) analysed hundreds of execution traces of popular open-source multi-agent frameworks on coding and problem-solving tasks, and organised the failures they found into a taxonomy, MAST, of fourteen failure modes in three categories<span class="cite"><a href="#ref-mast">[10]</a></span>. Their headline finding was that many failures came not from the limitations of individual models but from the design of the system. Figure 15.6 summarises the categories.</p>
+
+<figure class="diagram" id="fig-15-6">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-label="Three categories of multi-agent failure">
+<rect x="20" y="30" width="215" height="180" rx="10" class="bx2"/><text x="127" y="54" text-anchor="middle" class="t-sm t-b">specification and design</text>
+<g class="t-xs"><text x="32" y="80">· task or role specs ambiguous</text><text x="32" y="100">· agents disobey their role</text><text x="32" y="120">· steps repeated</text><text x="32" y="140">· conversation history lost</text><text x="32" y="160">· no clear end condition</text></g>
+<rect x="252" y="30" width="215" height="180" rx="10" class="bx3"/><text x="359" y="54" text-anchor="middle" class="t-sm t-b">inter-agent misalignment</text>
+<g class="t-xs"><text x="264" y="80">· information not shared</text><text x="264" y="100">· requests for clarification ignored</text><text x="264" y="120">· derailment from the task</text><text x="264" y="140">· reasoning and action mismatch</text><text x="264" y="160">· agents talk past each other</text></g>
+<rect x="484" y="30" width="215" height="180" rx="10" class="bx4"/><text x="591" y="54" text-anchor="middle" class="t-sm t-b">verification and termination</text>
+<g class="t-xs"><text x="496" y="80">· premature termination</text><text x="496" y="100">· no or incomplete verification</text><text x="496" y="120">· incorrect verification</text><text x="496" y="140">· "done" claimed falsely</text></g>
+<text x="360" y="226" text-anchor="middle" class="t-xs">after Cemri et al. (2025); most remedies are design changes, not better models</text>
+</svg>
+<figcaption><b>Figure 15.6 — Why multi-agent systems fail.</b> Failures cluster into poor specification of tasks and roles, misalignment between agents (information not shared, clarifications ignored), and weak verification and termination. Each category corresponds to a remedy from earlier chapters.</figcaption></figure>
+
+<p>Figure 15.6 reads as a map back to the rest of the book. Specification failures are context-engineering failures (Chapter 4): workers given vague objectives duplicate work or solve the wrong problem, which is why Anthropic's research system had to teach its lead agent to give each worker an objective, an output format, guidance on tools and sources, and clear task boundaries. Misalignment failures are handover failures (§14.5): information that one agent has and another needs is not passed, or is passed in a form the receiver misreads. Verification failures are the stopping and checking failures of §2.7 and Chapter 7, now distributed across agents, with the additional hazard that each agent may assume another has verified. The study's interventions (clearer role specifications, better orchestration, explicit verification steps) helped but did not eliminate the failures, a reminder that multi-agent designs inherit every single-agent failure mode and add their own.</p>
+<p>The sharpest version of the sceptical case was made by engineers at Cognition in a 2025 essay titled "Don't Build Multi-Agents"<span class="cite"><a href="#ref-cognition">[11]</a></span>. Their argument was that reliable agents need every action to be informed by the full context of decisions made so far, and that splitting work among agents with separate contexts inevitably makes them act on conflicting implicit assumptions: two sub-agents building parts of a game, each making reasonable but different choices about style, produce parts that do not fit. Their recommendation was a single-threaded agent with careful context management (compaction, Chapter 14) for tightly coupled work. This is not in conflict with the success of orchestrator–worker research systems; it locates the boundary. Research is <em>breadth-first</em>: sub-questions are largely independent, and their results combine by aggregation. Building a coherent artefact is <em>depth-first</em>: each part depends on decisions made in others, and splitting it multiplies the chances of inconsistency.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — the price of inconsistency</div>
+<p>A feature requires four components that must agree on five interface decisions (names, data formats, error conventions). A single agent makes each decision once and applies it consistently. Four parallel sub-agents, each building one component from a brief specification, must each infer the decisions; suppose each infers any given unspecified decision the same way as the others with probability 0.8.</p>
+<p><b>Probability all four agree on one decision.</b> If agreement means each of the other three matches the first: \(0.8^3=0.512\). On all five decisions: \(0.512^5=0.035\).</p>
+<p><b>With the decisions written into the shared specification first.</b> Agreement on specified decisions is close to certain; only genuinely unforeseen decisions remain. If the plan fixes four of the five, the probability of full agreement is about 0.51.</p>
+<p><b>Lesson.</b> Parallel construction is viable only after the interfaces are designed, which is sequential work. Amdahl's law (§15.4) applies with the interface design in the sequential fraction, and skipping it makes the parallel fraction produce parts that do not fit.</p>
+</div>
+
+<h3 id="owners">Agents with different principals</h3>
+<p>Everything so far assumed that the agents in a system serve one principal and share one goal. A growing class of multi-agent interactions does not: a customer's personal assistant negotiating a rebooking with an airline's support agent, two companies' procurement agents agreeing a price, many users' shopping agents bidding in the same market. Here the agents' objectives differ by design, and the tools of game theory, developed for exactly this situation in the 1990s agent literature (§15.2), become relevant again. Each agent should pursue its own principal's interest within the rules; the interaction's outcome depends on the protocol (who may offer what, when the negotiation ends, what is binding), and good protocols make honest behaviour a sensible strategy rather than relying on the agents' goodwill.</p>
+<p>Language-model agents add three concerns that classical game theory did not face. They are <em>persuadable</em>: an agent can be talked into concessions its principal would not make, through flattery, false urgency or injected instructions in the other side's messages (§8.9), so the counterparty's messages must be treated as untrusted input and binding commitments should pass through deterministic checks of the principal's limits (a maximum price, a policy). They may <em>collude</em> without intending to: agents built on the same model, negotiating for different principals, can converge on outcomes that favour neither principal or reflect shared biases, and studies of language-model agents in simulated markets have observed tacit coordination on prices. And they make <em>transparency</em> questions pressing: whether a counterparty is an agent, for whom it acts, and with what authority. The engineering response mirrors Chapter 12's: explicit authority bounds in each agent's credentials, verifiable identity for agents acting across organisations, protocols with structured offers rather than free text where stakes are high, and human approval for commitments above a threshold.</p>
+
+<h3 id="observability">Seeing inside a multi-agent system</h3>
+<p>When a multi-agent system produces a wrong answer, the first question is which agent, and which handover, introduced the error. Answering it requires observability designed in from the start. The standard approach, borrowed from distributed-systems tracing, records each agent's work as a <em>span</em> with a parent: the lead's span contains the spans of the workers it dispatched, each of which contains its model calls and tool calls, with their inputs, outputs, tokens and latencies. A trace of a whole run is then a tree that can be inspected, searched ("which worker fetched this source?") and aggregated ("what fraction of tokens went to workers that found nothing?"). Two measurements are particularly informative for multi-agent designs: the <em>duplication rate</em>, the fraction of worker effort spent on ground another worker covered, which reveals vague delegation; and the <em>handover fidelity</em>, checked by sampling worker findings and comparing them with what the lead's synthesis says they found, which reveals information lost or distorted in the summary. Chapter 21 develops tracing as part of operating agents in production.</p>
+
+<h2 id="s15-8">15.8 When should you use many agents?</h2>
+<p>We can now state a decision procedure, built from the four benefits and the evidence. Use a <strong>single agent</strong>, with the context management of Chapter 14, by default, and especially when the work is tightly coupled (building one coherent artefact), when decisions made early must be respected later, and when cost or latency budgets are tight. Use an <strong>orchestrator with parallel workers</strong> when the work is breadth-first: many sub-tasks that can be specified independently, whose intermediate material is bulky and whose results combine by aggregation (research, surveys, codebase-wide searches, evaluating many candidates), and when the value of speed or thoroughness justifies several times the tokens. Use an <strong>independent checker</strong> agent when there is something external to check against and the checker's independence from the producer's context matters (review, fact-checking, plan critique). Use <strong>ensembles or debate</strong> for high-stakes decisions where the agents can be made genuinely diverse (different models, information or assignments), and measure their correlation before relying on them. Avoid free-form group chats among many peers except for exploration or simulation, where their cost and unpredictability are acceptable.</p>
+<p>In every case the multi-agent design should beat the strongest single-agent baseline given the same budget, not merely a weak single agent, since many reported multi-agent gains disappear against a single agent with the same total tokens and a good procedure. And every multi-agent system should be built with the machinery the earlier chapters developed for one agent: precise task specifications, structured handovers, shared durable state, explicit verification, termination rules and budgets, and observability across agents, so that when a result is wrong it is possible to find which agent, and which handover, made it so.</p>
+
+<details class="drill">
+<summary>Drill 15.2 — Amdahl for a research agent</summary>
+<p>A deep-research task spends 6 minutes planning, 40 minutes of searching and reading that can be split across sub-agents, and 8 minutes synthesising. (a) What is the speed-up with 4 and with 10 sub-agents? (b) What is the maximum?</p>
+<p>Total 54 minutes, parallel fraction \(f=40/54=0.741\). (a) \(n=4\): \(1/(0.259+0.185)=2.25\) (24 minutes). \(n=10\): \(1/(0.259+0.074)=3.0\) (18 minutes). (b) \(1/0.259=3.86\) (14 minutes). Shortening planning and synthesis, for example by letting workers write their findings directly into the report's structure, raises the ceiling more than adding workers.</p>
+</details>
+
+<details class="drill">
+<summary>Drill 15.3 — measuring correlation</summary>
+<p>Three copies of an agent answer 200 yes/no questions. Each is right on 140 (70%). On 50 questions all three are wrong together. Under the mixture model of §15.3, estimate \(\varrho\) and the expected majority accuracy.</p>
+<p>If independent, all three wrong would happen on \(200\times0.3^3=5.4\) questions; observed 50. In the mixture model, all-wrong occurs with probability \(\varrho\times0.3+(1-\varrho)\times0.027\). Setting this to \(50/200=0.25\): \(0.027+0.273\varrho=0.25\), \(\varrho\approx0.82\). Majority accuracy \(\approx0.82\times0.7+0.18\times0.784=0.574+0.141=0.715\), barely above one agent. Diversify the agents before relying on votes.</p>
+</details>
+
+<h2 id="s15-9">15.9 Debugging a multi-agent system: who failed, and when?</h2>
+<p>When a single agent fails, its trace shows the step that went wrong (§19.8). When a multi-agent system fails, the failure is often distributed: the orchestrator gave an ambiguous instruction, a worker made a reasonable assumption that was wrong, a reviewer passed it, and the final answer was wrong in a way no single message reveals. Attributing failures to agents and steps is the prerequisite for fixing them, and it is harder than it looks. Zhang and colleagues (2025) built a dataset of failed multi-agent runs annotated with the responsible agent and the decisive step, and found that even strong models asked to attribute the failure identified the right agent only about half the time and the decisive step far less often<span class="cite"><a href="#ref-whowhen">[12]</a></span>.</p>
+<p>Three techniques make attribution tractable. <strong>Structured traces</strong>: every message between agents is a span with its sender, recipient, the instruction or result, and links to the context it was produced from, so that the flow of information can be followed rather than reconstructed. <strong>Per-role evaluation</strong>: each role is evaluated on its own inputs and outputs, with role-specific checks (did the planner's sub-tasks cover the question; did each worker answer its sub-task; did the reviewer catch planted errors), which localises regressions to a role. <strong>Counterfactual replay</strong>: re-run the system from a checkpoint with one agent's output replaced by a corrected one (from a person or a stronger model) and see whether the final outcome changes. If replacing the planner's output fixes the run and replacing any worker's does not, the planner was decisive. The idea is the same as the oracle-retriever diagnostic of §9.10, and averaged over many runs it estimates each role's contribution to the failure rate, a crude cousin of a Shapley value.</p>
+<p>Attribution also exposes the cost structure that §15.8 warned about. Multi-agent systems use several times the tokens of a single agent, and traces aggregated by role show where they go: often to workers re-reading the same documents, or to coordination messages that carry little information. A system whose failures are mostly attributable to one role, and whose tokens are mostly spent in another, has two separate improvements available, and only per-role measurement shows them.</p>
+<p>A practical routine follows from this. Keep a small set of failed runs as a standing attribution set, annotated by a person with the responsible role and step. When the system changes, re-run attribution on new failures and compare the distribution across roles with the previous version: a shift in which role is responsible is often the first sign of a regression, visible before the overall success rate moves outside its confidence interval. And when an automated attributor is used to label failures at scale, measure its agreement with the human-annotated set first, exactly as a judge is calibrated in §19.6, since its errors will otherwise be mistaken for changes in the system.</p>
+
+<h2 id="looking-ahead" class="unnumbered">Looking ahead</h2>
+<p>This chapter's patterns (orchestrator and workers, producer and checker, pipelines of stages, ensembles) are instances of a small number of architectural building blocks that also appear inside single-agent systems: chains of model calls, routers, parallel branches, loops with evaluators. Practitioners need a vocabulary for these blocks, a way to decide how much autonomy each part of a system should have, and frameworks that implement them as reliable software, with state, retries, persistence and observability. How should an agent system be architected, when is a fixed workflow better than an agent at each point, how are agent graphs built and executed durably, and what do the popular frameworks actually provide? Chapter 16 takes up agent architectures and frameworks.</p>
+
+<h2 id="summary">Chapter summary</h2>
+<ul>
+<li>Multiple agents offer parallelism, context isolation, independent errors and adversarial checking; they cost tokens, lose information at handovers and add coordination errors. Add an agent only for one of the four benefits.</li>
+<li>History: contract net protocol (1980), agent communication and game theory (1990s); CAMEL, Generative Agents, ChatDev, MetaGPT (structured SOP artefacts), AutoGen (2023). Structure of communication matters more than personas.</li>
+<li><b>Ensembles and debate</b> help when errors are independent; with correlation \(\varrho\), accuracy tends to \(\varrho p+(1-\varrho)\). Diversify models, information and assignments. Debate also serves oversight (Irving 2018; judges 76–88% vs 48–60% baselines in Khan 2024).</li>
+<li><b>Orchestrator–workers</b> excel at breadth-first tasks: Anthropic's research system beat a single agent by 90.2% on its evaluation using about 15× chat tokens. Speed-up obeys Amdahl's law \(1/((1-f)+f/n)\).</li>
+<li>Roles are prompts, contexts, tools and models; create a separate agent when a role needs a different context, tools, permissions or model. The producer–independent-checker pair is the most consistently useful role structure.</li>
+<li>Topologies: star \(2(n-1)\) messages per round, chain \(n-1\), fully connected group chat \(O(n^2)\) reads and growing; prefer shared workspaces and structured messages; define termination and conflict rules.</li>
+<li>Failures (MAST): specification, inter-agent misalignment, verification and termination. Tightly coupled, depth-first work suffers inconsistency when split; design interfaces before parallel construction.</li>
+<li>Default to one well-managed agent; use orchestrators for breadth, checkers for verification, diverse ensembles for high-stakes decisions; always compare with the strongest single agent at equal budget.</li>
+<li>Attribute multi-agent failures with structured traces, per-role evaluation and counterfactual replay; automated attribution is still unreliable and must be calibrated against human labels.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ch15-mcq-01" data-topic="§15.1 Benefits">
+<p class="q">Select all genuine sources of benefit from using several agents rather than one.</p>
+<ol class="opts"><li data-correct>Parallelism</li><li data-correct>Context isolation</li><li data-correct>Independent errors that can cancel</li><li>Agents with more knowledge than the underlying model</li></ol>
+<div class="explain">Also adversarial checking. Personas add no knowledge.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-02" data-topic="§15.1 Costs">
+<p class="q">Which is a cost specific to multi-agent systems?</p>
+<ol class="opts"><li>Prompt caching</li><li data-correct>Information lost at handovers between agents' contexts</li><li>Constrained decoding</li><li>Tool schemas</li></ol>
+<div class="explain">Each message compresses what the sender knew.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-03" data-topic="§15.2 History">
+<p class="q">The contract net protocol (1980) decomposes work by:</p>
+<ol class="opts"><li>Voting</li><li data-correct>A manager announcing tasks, contractors bidding, and the manager awarding contracts</li><li>Debate</li><li>Gradient descent</li></ol>
+<div class="explain">Its announce–bid–award structure prefigures orchestrators.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-04" data-topic="§15.2 MetaGPT">
+<p class="q">MetaGPT's key design choice was to:</p>
+<ol class="opts"><li>Let agents chat freely</li><li data-correct>Encode standard operating procedures in which agents pass structured artefacts rather than free-form chat</li><li>Use a single agent</li><li>Train a new model</li></ol>
+<div class="explain">Artefacts act as checkable milestones.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-05" data-topic="§15.2 Lesson">
+<p class="q">Much of the value attributed to role-playing teams in early demonstrations came from:</p>
+<ol class="opts"><li>The personas' expertise</li><li data-correct>Decomposition into stages with intermediate artefacts, which a single agent can also follow</li><li>Larger models</li><li>Random seeds</li></ol>
+<div class="explain">Structure of communication matters more than personas.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-06" data-topic="§15.3 Debate">
+<p class="q">In multi-agent debate (Du et al., 2023), agents:</p>
+<ol class="opts"><li>Answer once and are voted on</li><li data-correct>Read each other's answers and reasoning and revise over several rounds</li><li>Never see each other's answers</li><li>Are trained against each other</li></ol>
+<div class="explain">Agents can correct specific mistakes rather than just outvote them.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-07" data-topic="§15.3 Correlation">
+<p class="q">In the mixture model with correlation \(\varrho\), as the number of agents grows the ensemble's accuracy tends to:</p>
+<ol class="opts"><li>1</li><li>\(p\)</li><li data-correct>\(\varrho p+(1-\varrho)\)</li><li>\(1-\varrho\)</li></ol>
+<div class="explain">Correlated draws cap the gain.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-08" data-topic="§15.3 Correlation">
+<p class="q">With \(p=0.7\) and \(\varrho=0.3\), the ceiling of ensemble accuracy is:</p>
+<ol class="opts"><li>0.70</li><li>0.79</li><li data-correct>0.91</li><li>1.00</li></ol>
+<div class="explain">\(0.3\times0.7+0.7=0.91\).</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-09" data-topic="§15.3 Diversity">
+<p class="q">Which change most reduces the correlation between ensemble members?</p>
+<ol class="opts"><li>More copies of the same model and prompt</li><li data-correct>Different model families, information or assignments</li><li>Lower temperature</li><li>Longer prompts</li></ol>
+<div class="explain">Diversity, not number, is what ensembles buy.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-10" data-topic="§15.3 Measuring correlation">
+<p class="q">Three agents each right 70% of the time are all wrong together on 25% of questions. This indicates:</p>
+<ol class="opts"><li>Independence</li><li data-correct>Strong correlation; voting will help little</li><li>Anti-correlation</li><li>A perfect ensemble</li></ol>
+<div class="explain">Independence predicts 2.7%; the estimate is \(\varrho\approx0.82\).</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-11" data-topic="§15.3 Safety debate">
+<p class="q">The safety motivation for debate (Irving et al., 2018) is that:</p>
+<ol class="opts"><li>Debate is cheaper than voting</li><li data-correct>Judging arguments in which each side exposes the other's flaws may be easier than producing correct answers, enabling oversight of stronger systems</li><li>Debaters always agree</li><li>Debate removes hallucinations</li></ol>
+<div class="explain">Khan et al. (2024) found debate raised judge accuracy substantially.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-12" data-topic="§15.4 Orchestrator">
+<p class="q">The orchestrator–worker pattern is best suited to:</p>
+<ol class="opts"><li>Tightly coupled construction of one artefact</li><li data-correct>Breadth-first tasks with many independent sub-tasks whose results aggregate</li><li>Single-fact look-ups</li><li>Tasks with no tools</li></ol>
+<div class="explain">Research, surveys, broad searches.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-13" data-topic="§15.4 Evidence">
+<p class="q">Anthropic's multi-agent research system reported using roughly how many times the tokens of chat interactions?</p>
+<ol class="opts"><li>1×</li><li>4×</li><li data-correct>15×</li><li>100×</li></ol>
+<div class="explain">Single agents about 4×, the multi-agent system about 15×.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-14" data-topic="§15.4 Amdahl">
+<p class="q">If 80% of a task is parallelisable, the maximum speed-up from any number of workers is:</p>
+<ol class="opts"><li>2×</li><li data-correct>5×</li><li>8×</li><li>Unlimited</li></ol>
+<div class="explain">\(1/(1-f)=1/0.2\).</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-15" data-topic="§15.4 Amdahl">
+<p class="q">With 95% parallelisable work and 8 workers, the speed-up is about:</p>
+<ol class="opts"><li>8</li><li data-correct>5.9</li><li>3.3</li><li>1.9</li></ol>
+<div class="explain">\(1/(0.05+0.95/8)\approx5.93\).</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-16" data-topic="§15.4 Delegation quality">
+<p class="q">What did the research-system report say the lead agent must give each worker?</p>
+<ol class="opts"><li>Its full context</li><li data-correct>A clear objective, output format, guidance on tools and sources, and task boundaries</li><li>A persona</li><li>Nothing; workers infer</li></ol>
+<div class="explain">Vague delegation caused duplicated or misdirected work.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-17" data-topic="§15.5 Roles">
+<p class="q">When should a role be implemented as a separate agent rather than a stage in one agent's procedure?</p>
+<ol class="opts"><li>Always</li><li data-correct>When it needs a different context, tools, permissions or model</li><li>When it has a persona name</li><li>Never</li></ol>
+<div class="explain">Otherwise the procedure alone delivers the benefit.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-18" data-topic="§15.5 Checker">
+<p class="q">Why is an independent reviewer agent more useful than asking the coder to review itself?</p>
+<ol class="opts"><li>It is a larger model</li><li data-correct>Its fresh context is free of the coder's assumptions, giving independence, especially with external checks</li><li>It has a senior persona</li><li>It writes more</li></ol>
+<div class="explain">Independence plus something external to check against.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-19" data-topic="§15.6 Topology">
+<p class="q">In a fully connected group chat of \(n\) agents each posting \(u\) tokens per round, the reading cost per round scales as:</p>
+<ol class="opts"><li>\(nu\)</li><li data-correct>\(n^2u\), and grows with rounds</li><li>\(u\)</li><li>\(\log n\)</li></ol>
+<div class="explain">Every agent reads every message, and history accumulates.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-20" data-topic="§15.6 Shared workspace">
+<p class="q">A shared workspace (blackboard) reduces coordination cost by:</p>
+<ol class="opts"><li>Removing agents</li><li data-correct>Replacing broadcast messages with reads and writes of a structured, durable store</li><li>Encrypting messages</li><li>Lowering temperature</li></ol>
+<div class="explain">Agents read only what they need.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-21" data-topic="§15.6 Termination">
+<p class="q">Why do peer groups of agents need explicit termination rules?</p>
+<ol class="opts"><li>To save money only</li><li data-correct>Without a decider, round limit or voting rule they can loop, deferring to or contradicting each other</li><li>Because tools fail</li><li>Because caches expire</li></ol>
+<div class="explain">Stars have a natural decider, the coordinator.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-22" data-topic="§15.6 Drill">
+<p class="q">In Drill 15.1, the group chat read about how many times as many tokens as the star?</p>
+<ol class="opts"><li>The same</li><li data-correct>More than twice</li><li>Ten times</li><li>Half</li></ol>
+<div class="explain">About 300,000 against 133,000, with the gap growing quadratically.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-23" data-topic="§15.7 MAST">
+<p class="q">The MAST taxonomy groups multi-agent failures into:</p>
+<ol class="opts"><li>Latency, cost, accuracy</li><li data-correct>Specification and design, inter-agent misalignment, verification and termination</li><li>Model, data, hardware</li><li>Tools, memory, protocols</li></ol>
+<div class="explain">Fourteen modes in three categories, many due to system design.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-24" data-topic="§15.7 Cognition">
+<p class="q">The "Don't Build Multi-Agents" argument holds that splitting work among agents is risky mainly because:</p>
+<ol class="opts"><li>Agents are expensive</li><li data-correct>Agents with separate contexts make conflicting implicit decisions on tightly coupled work</li><li>Protocols are immature</li><li>Models cannot call tools</li></ol>
+<div class="explain">It applies to depth-first construction, less to breadth-first research.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-25" data-topic="§15.7 Inconsistency">
+<p class="q">Four parallel builders each match the others on an unspecified decision with probability 0.8. The probability all four agree on five such decisions is about:</p>
+<ol class="opts"><li>0.80</li><li>0.51</li><li data-correct>0.035</li><li>0.33</li></ol>
+<div class="explain">\((0.8^3)^5=0.512^5\approx0.035\).</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-26" data-topic="§15.7 Remedy">
+<p class="q">The remedy for inconsistency in parallel construction is to:</p>
+<ol class="opts"><li>Add more builders</li><li data-correct>Design and write down the interfaces first, sequentially, before parallel work</li><li>Raise temperature</li><li>Use a group chat</li></ol>
+<div class="explain">The interface design belongs in Amdahl's sequential fraction.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-27" data-topic="§15.8 Default">
+<p class="q">The chapter's recommended default architecture is:</p>
+<ol class="opts"><li>A fully connected team</li><li data-correct>A single well-managed agent, adding agents only for a specific benefit</li><li>An ensemble of identical agents</li><li>A debate for every task</li></ol>
+<div class="explain">Many agents for breadth, checking or diverse high-stakes decisions.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-28" data-topic="§15.8 Baselines">
+<p class="q">A fair test of a multi-agent design compares it with:</p>
+<ol class="opts"><li>A weak single agent</li><li data-correct>The strongest single-agent baseline given the same total budget</li><li>No baseline</li><li>Human performance only</li></ol>
+<div class="explain">Many reported gains vanish against an equal-budget single agent.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-29" data-topic="§15.3 Worked example">
+<p class="q">In the eligibility example, why did three different models not beat one model three times by much?</p>
+<ol class="opts"><li>Different models are always correlated</li><li data-correct>The weaker models' lower accuracy offset their greater independence</li><li>Voting does not work</li><li>The task was too easy</li></ol>
+<div class="explain">Diversity pays when alternatives are nearly as accurate.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-30" data-topic="§15.4 Tokens">
+<p class="q">The research report found that, on a browsing benchmark, token usage explained much of the performance variance. What does that suggest?</p>
+<ol class="opts"><li>Tokens are irrelevant</li><li data-correct>Much of the multi-agent advantage comes from spending more tokens productively across parallel contexts</li><li>Single agents are always better</li><li>Prompts do not matter</li></ol>
+<div class="explain">Parallel contexts allow more total useful computation.</div>
+</div>
+
+<div class="mcq" data-id="ch15-mcq-31" data-topic="§15.8 Drill">
+<p class="q">A task spends 6 minutes planning, 40 parallelisable minutes and 8 minutes synthesising. Its maximum speed-up is about:</p>
+<ol class="opts"><li>2.25×</li><li data-correct>3.9×</li><li>10×</li><li>54×</li></ol>
+<div class="explain">\(1/(14/54)\approx3.86\).</div>
+</div>
+<div class="mcq" data-id="ch15-mcq-32" data-topic="§15.9 Failure attribution">
+<p class="q">Counterfactual replay attributes a multi-agent failure by:</p>
+<ol class="opts"><li>Asking each agent who failed</li><li data-correct>Re-running from a checkpoint with one agent's output replaced by a corrected one and checking whether the outcome changes</li><li>Counting tokens per agent</li><li>Removing the orchestrator</li></ol>
+<div class="explain">Averaged over runs it estimates each role's contribution to failures.</div>
+</div>
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer out loud first, then reveal the model answer and rate yourself.</p>
+
+<details class="qa" data-id="ch15-qa-01">
+<summary><span class="lvl warm">Warm-up</span> When do multi-agent systems beat a single agent?</summary>
+<div class="answer"><p>When the task benefits from parallelism (independent sub-tasks), context isolation (bulky intermediate work), independent errors (diverse agents whose answers can be combined), or adversarial checking (an independent reviewer with something external to check against). They lose when work is tightly coupled, errors are correlated, or coordination costs and handover losses exceed the benefit. Default to one well-managed agent and compare any multi-agent design with an equal-budget single agent.</p></div>
+</details>
+
+<details class="qa" data-id="ch15-qa-02">
+<summary><span class="lvl warm">Warm-up</span> Describe the orchestrator–worker pattern.</summary>
+<div class="answer"><p>A lead agent analyses the task, decomposes it into sub-tasks, dispatches them with clear objectives, output formats and boundaries to worker agents running in parallel in their own contexts, collects condensed results, and either dispatches more work or synthesises the answer, often with a verification stage. It suits breadth-first work such as research. Costs: many more tokens, synthesis risk, and the need to avoid duplicated work; speed-up is bounded by Amdahl's law.</p></div>
+</details>
+
+<details class="qa" data-id="ch15-qa-03">
+<summary><span class="lvl warm">Warm-up</span> What is multi-agent debate and why might it help?</summary>
+<div class="answer"><p>Several agents answer a question, read each other's answers and reasoning, and revise over rounds before a final answer or a judge's verdict. It helps when agents make different mistakes that others can point out, and it supports oversight because judging opposing arguments can be easier than answering. It helps little when agents are copies with correlated errors, and it costs several times the tokens of one answer.</p></div>
+</details>
+
+<details class="qa" data-id="ch15-qa-04">
+<summary><span class="lvl core">Core</span> Quantify why ensembles of identical agents give diminishing returns.</summary>
+<div class="answer"><p>Errors of copies of one model are correlated. In a mixture model where with probability \(\varrho\) all agents share a draw and otherwise vote independently with accuracy \(p\), ensemble accuracy is \(\varrho p+(1-\varrho)P_{\text{maj}}(k,p)\), with ceiling \(\varrho p+1-\varrho\). At \(p=0.7\), \(\varrho=0.6\), fifteen agents reach only 80% (ceiling 82%). Estimate \(\varrho\) from how often agents err together; reduce it by diversifying models, prompts, information and roles.</p></div>
+</details>
+
+<details class="qa" data-id="ch15-qa-05">
+<summary><span class="lvl core">Core</span> Apply Amdahl's law to a multi-agent research system.</summary>
+<div class="answer"><p>If planning and synthesis are sequential and searching is parallelisable with fraction \(f\), speed-up with \(n\) workers is \(1/((1-f)+f/n)\), capped at \(1/(1-f)\). For 6 min planning, 40 min searching, 8 min synthesis, \(f=0.74\): 4 workers give 2.25×, 10 give 3×, the maximum is 3.9×. To go faster, shrink planning and synthesis (e.g. workers write directly into the report structure) rather than adding workers.</p></div>
+</details>
+
+<details class="qa" data-id="ch15-qa-06">
+<summary><span class="lvl core">Core</span> Why is a free-form group chat among many agents usually a bad architecture?</summary>
+<div class="answer"><p>Reading cost scales as \(n^2\) per round and grows with history; every agent's context fills with others' messages, including their mistakes, which models tend to imitate; there is no natural decider, so termination and conflict resolution are ad hoc; and information is unstructured, so handovers are lossy. Prefer a star with a coordinator, structured messages and a shared workspace.</p></div>
+</details>
+
+<details class="qa" data-id="ch15-qa-07">
+<summary><span class="lvl core">Core</span> What does giving an agent a role actually change?</summary>
+<div class="answer"><p>Its system prompt, tools, context and possibly its model. These can raise per-step accuracy (focused instructions), provide independence (a fresh context for a reviewer), reduce risk (narrow permissions) and cut cost (a cheaper model for routine work). A persona does not add knowledge the model lacks. Implement roles as separate agents only when they need a different context, tools, permissions or model; otherwise as stages of one agent's procedure.</p></div>
+</details>
+
+<details class="qa" data-id="ch15-qa-08">
+<summary><span class="lvl core">Core</span> What are the main failure modes of multi-agent LLM systems?</summary>
+<div class="answer"><p>From the MAST study: specification and design failures (ambiguous task or role specs, role violations, repeated steps, lost history, no end condition), inter-agent misalignment (information not shared, clarification requests ignored, derailment, reasoning–action mismatch), and verification and termination failures (premature stops, missing or wrong verification, false completion claims). Remedies are mostly design: precise delegation, structured handovers, shared state, explicit verification and termination rules.</p></div>
+</details>
+
+<details class="qa" data-id="ch15-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Reconcile "multi-agent research systems beat single agents" with "don't build multi-agents".</summary>
+<div class="answer"><p>They describe different task structures. Breadth-first tasks (research, surveys) decompose into nearly independent sub-tasks whose results aggregate; parallel contexts let the system spend more tokens productively and keep each context focused, so multi-agent wins. Depth-first tasks (building one coherent artefact) involve many interdependent decisions; separate contexts make inconsistent implicit choices, and the probability of global consistency falls exponentially with the number of unspecified shared decisions. The synthesis: decompose only where interfaces are explicit and results combine by aggregation; keep coupled work in one context with good compaction, or design interfaces first.</p></div>
+</details>
+
+<details class="qa" data-id="ch15-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> How would you estimate whether adding a reviewer agent will help?</summary>
+<div class="answer"><p>Treat it as the critic of Chapter 7: on a labelled sample, measure its true-positive rate on flawed outputs and false-positive rate on good ones, and the fix and break rates of revisions it triggers. Revision helps only if TPR/FPR exceeds \(\frac{a_0}{1-a_0}\cdot\frac{b}{c}\). Independence from the producer (fresh context, different model) and external evidence (tests, sources) raise TPR and lower FPR. Compare end-to-end accuracy and cost with and without the reviewer, and with a single agent given the same budget.</p></div>
+</details>
+
+<details class="qa" data-id="ch15-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> Model the token cost of an orchestrator system versus a single agent.</summary>
+<div class="answer"><p>Single agent: \(\sum_t n_t\), quadratic in steps as context grows, with compaction. Orchestrator: lead \(\sum\) over its few steps on a small context, plus each worker's \(\sum\) over its steps on its own small context, plus prefixes per worker and the findings written and read. Because no context grows large, quadratic terms shrink; but per-worker prefixes, ramp-up and duplicated exploration add linear terms. Which is cheaper depends on how bulky intermediate material is and how independent sub-tasks are; in practice orchestrators often use more total tokens and buy speed and thoroughness.</p></div>
+</details>
+
+<details class="qa" data-id="ch15-qa-12">
+<summary><span class="lvl design">Design</span> Design a multi-agent deep-research system.</summary>
+<div class="answer"><p>Lead agent: classify query complexity, write a plan with sub-questions, each with objective, scope, preferred sources, output schema (claims, evidence, URLs, confidence) and stopping criteria; record the plan in a shared workspace. Workers (cheaper model), launched in parallel: search, fetch, extract relevant passages, return structured findings; no access to private data if browsing the open web (avoid the trifecta). Lead: merge findings, detect gaps and contradictions, dispatch follow-ups, cap rounds and budget. Citation checker: verify each claim against fetched sources. Writer: produce the report from verified findings. Observability across agents; evaluation against expert reference answers and citation accuracy; compare with a single-agent baseline at equal cost.</p></div>
+</details>
+
+<details class="qa" data-id="ch15-qa-13">
+<summary><span class="lvl design">Design</span> Should a coding agent use sub-agents to implement a feature spanning four modules?</summary>
+<div class="answer"><p>Only after the interfaces are fixed. First, one agent (or a human) designs and records the interfaces, data formats and conventions in a shared spec, with tests encoding them. Then sub-agents may implement modules in parallel against the spec, each in its own sandbox branch, with the integration tests as the verifier; the lead merges and resolves conflicts. Without the spec, parallel construction produces parts that do not fit. If the feature is small, a single agent with good context management is simpler and more reliable.</p></div>
+</details>
+
+<details class="qa" data-id="ch15-qa-14">
+<summary><span class="lvl design">Design</span> How would you use multiple agents for a high-stakes decision, such as approving a large refund exception?</summary>
+<div class="answer"><p>Use a diverse ensemble or debate: independent assessments by different models (or the same model with different evidence views), an adversarial agent tasked with arguing against approval citing policy, and a judge (model or human) deciding with the arguments visible. Measure correlation of the assessors on historical cases; require agreement or escalate to a human on disagreement. Keep the deterministic policy check as the final gate, since no ensemble should override hard rules.</p></div>
+</details>
+
+<details class="qa" data-id="ch15-qa-15">
+<summary><span class="lvl core">Core</span> Compare star, chain and fully connected topologies for agent communication.</summary>
+<div class="answer"><p>Star: coordinator plus workers, about \(2(n-1)\) messages per round, a clear decider, bottleneck at the coordinator's context; the common production choice. Chain: stages passing artefacts, \(n-1\) messages, latency proportional to length, errors propagate downstream, but artefacts are checkpoints. Fully connected: everyone reads everyone, \(O(n^2)\) reads per round and growing, expressive but costly, error-prone and hard to terminate. Shared workspaces and structured messages reduce costs in all three.</p></div>
+</details>
+
+<details class="qa" data-id="ch15-qa-16">
+<summary><span class="lvl core">Core</span> What did early LLM multi-agent systems such as ChatDev and MetaGPT teach?</summary>
+<div class="answer"><p>That language models make it easy to instantiate agents with any role, and that free-form conversation among them compounds errors; MetaGPT's improvement came from structured procedures where agents exchange typed artefacts (requirements, designs, code) that can be checked. The structure, not the number or personas of agents, carried most of the benefit, and a single agent following the same procedure can capture much of it.</p></div>
+</details>
+
+<details class="qa" data-id="ch15-qa-17">
+<summary><span class="lvl deep">Deep-dive</span> What new risks arise when agents negotiate on behalf of different principals?</summary>
+<div class="answer"><p>Persuadability: the counterparty's messages can manipulate an agent into concessions (flattery, false urgency, injected instructions), so treat them as untrusted input and enforce the principal's limits deterministically before any binding commitment. Tacit collusion or shared bias: agents built on similar models may converge on outcomes that serve neither principal. Authority and identity: each side needs to know who the agent acts for and what it may commit to, which calls for scoped credentials and verifiable identity. Protocol design: structured offers, explicit deadlines and binding rules make honest strategies sensible. High-stakes commitments should require human approval.</p></div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="ref-contractnet">R. G. Smith. The Contract Net Protocol: High-Level Communication and Control in a Distributed Problem Solver. <em>IEEE Transactions on Computers</em>, C-29(12), 1980.</li>
+<li id="ref-camel">G. Li et al. CAMEL: Communicative Agents for "Mind" Exploration of Large Language Model Society. <em>NeurIPS</em>, 2023. <a href="https://arxiv.org/abs/2303.17760">arXiv:2303.17760</a>.</li>
+<li id="ref-chatdev">C. Qian et al. ChatDev: Communicative Agents for Software Development. <em>ACL</em>, 2024. <a href="https://arxiv.org/abs/2307.07924">arXiv:2307.07924</a>.</li>
+<li id="ref-metagpt">S. Hong et al. MetaGPT: Meta Programming for a Multi-Agent Collaborative Framework. <em>ICLR</em>, 2024. <a href="https://arxiv.org/abs/2308.00352">arXiv:2308.00352</a>.</li>
+<li id="ref-autogen">Q. Wu et al. AutoGen: Enabling Next-Gen LLM Applications via Multi-Agent Conversation. 2023. <a href="https://arxiv.org/abs/2308.08155">arXiv:2308.08155</a>.</li>
+<li id="ref-du">Y. Du, S. Li, A. Torralba, J. B. Tenenbaum, I. Mordatch. Improving Factuality and Reasoning in Language Models through Multiagent Debate. <em>ICML</em>, 2024. <a href="https://arxiv.org/abs/2305.14325">arXiv:2305.14325</a>.</li>
+<li id="ref-irving">G. Irving, P. Christiano, D. Amodei. AI safety via debate. 2018. <a href="https://arxiv.org/abs/1805.00899">arXiv:1805.00899</a>.</li>
+<li id="ref-khan">A. Khan et al. Debating with More Persuasive LLMs Leads to More Truthful Answers. <em>ICML</em>, 2024. <a href="https://arxiv.org/abs/2402.06782">arXiv:2402.06782</a>.</li>
+<li id="ref-multiresearch">Anthropic. How we built our multi-agent research system. Anthropic engineering blog, June 2025. <a href="https://www.anthropic.com/engineering/multi-agent-research-system">anthropic.com</a>.</li>
+<li id="ref-mast">M. Cemri et al. Why Do Multi-Agent LLM Systems Fail? 2025. <a href="https://arxiv.org/abs/2503.13657">arXiv:2503.13657</a>.</li>
+<li id="ref-cognition">W. Yan. Don't Build Multi-Agents. Cognition blog, June 2025. <a href="https://cognition.ai/blog/dont-build-multi-agents">cognition.ai</a>.</li>
+<li id="ref-whowhen">S. Zhang et al. Which Agent Causes Task Failures and When? On Automated Failure Attribution of LLM Multi-Agent Systems. 2025. <a href="https://arxiv.org/abs/2505.00212">arXiv:2505.00212</a>.</li>
+<li>Further reading: G. M. Amdahl, Validity of the single processor approach to achieving large scale computing capabilities, <em>AFIPS</em>, 1967; M. Wooldridge, <em>An Introduction to MultiAgent Systems</em>, 2nd ed., Wiley, 2009.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

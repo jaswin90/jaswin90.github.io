@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bibliography — Introduction to LLM Engineering</title>
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/css/book.css">
+<script defer src="assets/js/book.js"></script>
+<script defer src="/library/assets/book-shim.js" data-library="/library/" data-field="/library/AI_Engineering/" data-field-title="AI Engineering"></script>
+<script type="module" src="assets/js/auth.js"></script>
+</head>
+<body data-root="./">
+<div class="cover">
+<h1>Bibliography</h1>
+<p class="sub">The primary sources behind the whole book, grouped by topic and ordered roughly chronologically within each group, so the list doubles as a history of the field. Each chapter also has its own reference list.</p>
+
+<h2>Core reading (start here)</h2>
+<ol class="refs">
+<li>J. Austin et al. <em>How to Scale Your Model: A Systems View of LLMs on TPUs</em>. Google DeepMind, 2025. <a href="https://jax-ml.github.io/scaling-book/">jax-ml.github.io/scaling-book</a></li>
+<li>R. Pope et al. Efficiently Scaling Transformer Inference. MLSys 2023. <a href="https://arxiv.org/abs/2211.05102">arXiv:2211.05102</a></li>
+<li>W. Kwon et al. Efficient Memory Management for LLM Serving with PagedAttention. SOSP 2023. <a href="https://arxiv.org/abs/2309.06180">arXiv:2309.06180</a></li>
+<li>T. Dao et al. FlashAttention. NeurIPS 2022. <a href="https://arxiv.org/abs/2205.14135">arXiv:2205.14135</a></li>
+<li>Z. Zhou et al. A Survey on Efficient Inference for Large Language Models. 2024. <a href="https://arxiv.org/abs/2404.14294">arXiv:2404.14294</a></li>
+<li>S. Park et al. A Survey on Inference Engines for Large Language Models. 2025. <a href="https://arxiv.org/abs/2505.01658">arXiv:2505.01658</a></li>
+<li>D. B. Kirk and W. W. Hwu. <em>Programming Massively Parallel Processors</em>, 4th ed. Morgan Kaufmann, 2022.</li>
+<li>Chip Huyen. <em>AI Engineering</em>. O'Reilly, 2025.</li>
+<li>H. He. Making Deep Learning Go Brrrr From First Principles. 2022. <a href="https://horace.io/brrr_intro.html">horace.io</a></li>
+<li>kipply. Transformer Inference Arithmetic. 2022. <a href="https://kipp.ly/transformer-inference-arithmetic/">kipp.ly</a></li>
+<li>L. Weng. Large Transformer Model Inference Optimization. 2023. <a href="https://lilianweng.github.io/posts/2023-01-10-inference-optimization/">lilianweng.github.io</a></li>
+<li>A. Gordić. Inside vLLM: Anatomy of a High-Throughput LLM Inference System. vLLM blog, 2025. <a href="https://vllm.ai/blog/2025-09-05-anatomy-of-vllm">vllm.ai</a></li>
+</ol>
+
+<h2>History of language modelling and scaling</h2>
+<ol class="refs">
+<li>C. E. Shannon. A Mathematical Theory of Communication, 1948; Prediction and Entropy of Printed English, 1951.</li>
+<li>R. Kneser, H. Ney. Improved backing-off for m-gram language modeling. ICASSP 1995.</li>
+<li>Y. Bengio et al. A Neural Probabilistic Language Model. JMLR 2003.</li>
+<li>S. Hochreiter, J. Schmidhuber. Long Short-Term Memory. Neural Computation 1997.</li>
+<li>T. Mikolov et al. Efficient Estimation of Word Representations in Vector Space. 2013. <a href="https://arxiv.org/abs/1301.3781">arXiv:1301.3781</a></li>
+<li>I. Sutskever et al. Sequence to Sequence Learning with Neural Networks. 2014. <a href="https://arxiv.org/abs/1409.3215">arXiv:1409.3215</a></li>
+<li>D. Bahdanau et al. Neural Machine Translation by Jointly Learning to Align and Translate. 2014. <a href="https://arxiv.org/abs/1409.0473">arXiv:1409.0473</a></li>
+<li>A. Vaswani et al. Attention Is All You Need. 2017. <a href="https://arxiv.org/abs/1706.03762">arXiv:1706.03762</a></li>
+<li>T. Brown et al. Language Models are Few-Shot Learners. 2020. <a href="https://arxiv.org/abs/2005.14165">arXiv:2005.14165</a></li>
+<li>J. Kaplan et al. Scaling Laws for Neural Language Models. 2020. <a href="https://arxiv.org/abs/2001.08361">arXiv:2001.08361</a></li>
+<li>J. Hoffmann et al. Training Compute-Optimal Large Language Models. 2022. <a href="https://arxiv.org/abs/2203.15556">arXiv:2203.15556</a></li>
+<li>N. Sardana et al. Beyond Chinchilla-Optimal. 2023. <a href="https://arxiv.org/abs/2401.00448">arXiv:2401.00448</a></li>
+<li>C. Snell et al. Scaling LLM Test-Time Compute Optimally. 2024. <a href="https://arxiv.org/abs/2408.03314">arXiv:2408.03314</a></li>
+<li>DeepSeek-AI. DeepSeek-R1. 2025. <a href="https://arxiv.org/abs/2501.12948">arXiv:2501.12948</a></li>
+</ol>
+
+<h2>Architecture</h2>
+<ol class="refs">
+<li>N. Shazeer. Fast Transformer Decoding: One Write-Head is All You Need (MQA). 2019. <a href="https://arxiv.org/abs/1911.02150">arXiv:1911.02150</a></li>
+<li>J. Ainslie et al. GQA. 2023. <a href="https://arxiv.org/abs/2305.13245">arXiv:2305.13245</a></li>
+<li>J. Su et al. RoFormer (RoPE). 2021. <a href="https://arxiv.org/abs/2104.09864">arXiv:2104.09864</a></li>
+<li>B. Zhang, R. Sennrich. RMSNorm. 2019. <a href="https://arxiv.org/abs/1910.07467">arXiv:1910.07467</a></li>
+<li>N. Shazeer. GLU Variants Improve Transformer. 2020. <a href="https://arxiv.org/abs/2002.05202">arXiv:2002.05202</a></li>
+<li>M. Geva et al. Transformer Feed-Forward Layers Are Key-Value Memories. 2021. <a href="https://arxiv.org/abs/2012.14913">arXiv:2012.14913</a></li>
+<li>DeepSeek-AI. DeepSeek-V2 (MLA). 2024. <a href="https://arxiv.org/abs/2405.04434">arXiv:2405.04434</a>; DeepSeek-V3. <a href="https://arxiv.org/abs/2412.19437">arXiv:2412.19437</a></li>
+<li>A. Gu, T. Dao. Mamba. 2023. <a href="https://arxiv.org/abs/2312.00752">arXiv:2312.00752</a></li>
+</ol>
+
+<h2>Decoding and structured generation</h2>
+<ol class="refs">
+<li>A. Holtzman et al. The Curious Case of Neural Text Degeneration. 2019. <a href="https://arxiv.org/abs/1904.09751">arXiv:1904.09751</a></li>
+<li>F. Stahlberg, B. Byrne. On NMT Search Errors and Model Errors: Cat Got Your Tongue? 2019. <a href="https://arxiv.org/abs/1908.10090">arXiv:1908.10090</a></li>
+<li>M. N. Nguyen et al. Min-p Sampling for Creative and Coherent LLM Outputs. 2024. <a href="https://arxiv.org/abs/2407.01082">arXiv:2407.01082</a></li>
+<li>C. Meister et al. Locally Typical Sampling. 2023. <a href="https://arxiv.org/abs/2202.00666">arXiv:2202.00666</a></li>
+<li>B. T. Willard, R. Louf. Efficient Guided Generation for Large Language Models (Outlines). 2023. <a href="https://arxiv.org/abs/2307.09702">arXiv:2307.09702</a></li>
+<li>Y. Dong et al. XGrammar. 2024. <a href="https://arxiv.org/abs/2411.15100">arXiv:2411.15100</a></li>
+<li>H. He and Thinking Machines Lab. Defeating Nondeterminism in LLM Inference. 2025.</li>
+</ol>
+
+<h2>Hardware and performance modelling</h2>
+<ol class="refs">
+<li>S. Williams, A. Waterman, D. Patterson. Roofline. CACM 2009.</li>
+<li>C. Yang, T. Kurth, S. Williams. Hierarchical Roofline Analysis for GPUs. 2020. <a href="https://arxiv.org/abs/2009.05257">arXiv:2009.05257</a></li>
+<li>Z. Yuan et al. LLM Inference Unveiled: Survey and Roofline Model Insights. 2024. <a href="https://arxiv.org/abs/2402.16363">arXiv:2402.16363</a></li>
+<li>M. Osama et al. Stream-K. PPoPP 2023. <a href="https://arxiv.org/abs/2301.03598">arXiv:2301.03598</a></li>
+<li>N. P. Jouppi et al. In-Datacenter Performance Analysis of a Tensor Processing Unit. ISCA 2017. <a href="https://arxiv.org/abs/1704.04760">arXiv:1704.04760</a></li>
+<li>A. Gholami et al. AI and Memory Wall. IEEE Micro 2024. <a href="https://arxiv.org/abs/2403.14123">arXiv:2403.14123</a></li>
+<li>NVIDIA. Volta (2017), Ampere A100 (2020), Hopper H100 (2022) and Blackwell (2024) architecture whitepapers.</li>
+<li>P. Tillet et al. Triton. MAPL 2019.</li>
+<li>M. Horowitz. Computing's Energy Problem (and What We Can Do About It). ISSCC 2014.</li>
+<li>W. Luo et al. Benchmarking and Dissecting the Nvidia Hopper GPU Architecture. 2024. <a href="https://arxiv.org/abs/2402.13499">arXiv:2402.13499</a></li>
+<li>Microbenchmarking NVIDIA's Blackwell Architecture. 2025. <a href="https://arxiv.org/abs/2512.02189">arXiv:2512.02189</a></li>
+<li>Google Cloud. TPU7x (Ironwood) documentation. <a href="https://docs.cloud.google.com/tpu/docs/tpu7x">docs.cloud.google.com</a></li>
+</ol>
+
+<h2>Attention kernels and memory management</h2>
+<ol class="refs">
+<li>M. Milakov, N. Gimelshein. Online normalizer calculation for softmax. 2018. <a href="https://arxiv.org/abs/1805.02867">arXiv:1805.02867</a></li>
+<li>J. Ansel et al. PyTorch 2 (TorchDynamo and TorchInductor). ASPLOS 2024.</li>
+<li>B. F. Spector et al. ThunderKittens. 2024. <a href="https://arxiv.org/abs/2410.20399">arXiv:2410.20399</a></li>
+<li>NVIDIA. CUTLASS and CuTe. <a href="https://github.com/NVIDIA/cutlass">github.com/NVIDIA/cutlass</a></li>
+<li>T. Dao. FlashAttention-2. 2023. <a href="https://arxiv.org/abs/2307.08691">arXiv:2307.08691</a></li>
+<li>J. Shah et al. FlashAttention-3. 2024. <a href="https://arxiv.org/abs/2407.08608">arXiv:2407.08608</a></li>
+<li>FlashAttention-4: Algorithm and Kernel Pipelining Co-Design for Asymmetric Hardware Scaling. 2026. <a href="https://arxiv.org/abs/2603.05451">arXiv:2603.05451</a></li>
+<li>T. Dao, D. Haziza, F. Massa, G. Sizov. Flash-Decoding for long-context inference. 2023.</li>
+<li>Z. Ye et al. FlashInfer. MLSys 2025. <a href="https://arxiv.org/abs/2501.01005">arXiv:2501.01005</a></li>
+<li>DeepSeek-AI. FlashMLA. 2025. <a href="https://github.com/deepseek-ai/FlashMLA">github.com/deepseek-ai/FlashMLA</a></li>
+<li>J. Dong et al. Flex Attention. 2024. <a href="https://arxiv.org/abs/2412.05496">arXiv:2412.05496</a></li>
+<li>L. Zheng et al. SGLang / RadixAttention. 2023. <a href="https://arxiv.org/abs/2312.07104">arXiv:2312.07104</a></li>
+<li>R. Prabhu et al. vAttention. ASPLOS 2025. <a href="https://arxiv.org/abs/2405.04437">arXiv:2405.04437</a></li>
+<li>B. Gao et al. CachedAttention. USENIX ATC 2024. <a href="https://arxiv.org/abs/2403.19708">arXiv:2403.19708</a></li>
+<li>J. Yao et al. CacheBlend. EuroSys 2025. <a href="https://arxiv.org/abs/2405.16444">arXiv:2405.16444</a></li>
+<li>P. J. Denning. Virtual Memory. ACM Computing Surveys, 1970.</li>
+<li>G. Xiao et al. StreamingLLM (attention sinks). 2023. <a href="https://arxiv.org/abs/2309.17453">arXiv:2309.17453</a></li>
+<li>Z. Zhang et al. H2O. 2023. <a href="https://arxiv.org/abs/2306.14048">arXiv:2306.14048</a></li>
+<li>Y. Li et al. SnapKV. 2024. <a href="https://arxiv.org/abs/2404.14469">arXiv:2404.14469</a></li>
+<li>J. Tang et al. Quest. 2024. <a href="https://arxiv.org/abs/2406.10774">arXiv:2406.10774</a></li>
+<li>Z. Liu et al. KIVI. 2024. <a href="https://arxiv.org/abs/2402.02750">arXiv:2402.02750</a></li>
+<li>W. Brandon et al. Cross-Layer Attention. 2024. <a href="https://arxiv.org/abs/2405.12981">arXiv:2405.12981</a></li>
+<li>Y. Sun et al. YOCO. 2024. <a href="https://arxiv.org/abs/2405.05254">arXiv:2405.05254</a></li>
+<li>Gemma Team. Gemma 3 Technical Report. 2025. <a href="https://arxiv.org/abs/2503.19786">arXiv:2503.19786</a></li>
+<li>Character.AI. Optimizing AI Inference at Character.AI. 2024.</li>
+</ol>
+
+<h2>Serving systems and scheduling</h2>
+<ol class="refs">
+<li>G.-I. Yu et al. Orca. OSDI 2022.</li>
+<li>A. Agrawal et al. Sarathi-Serve. OSDI 2024. <a href="https://arxiv.org/abs/2403.02310">arXiv:2403.02310</a></li>
+<li>Y. Fu et al. Efficient LLM Scheduling by Learning to Rank. NeurIPS 2024. <a href="https://arxiv.org/abs/2408.15792">arXiv:2408.15792</a></li>
+<li>Y. Sheng et al. Fairness in Serving Large Language Models (VTC). OSDI 2024. <a href="https://arxiv.org/abs/2401.00588">arXiv:2401.00588</a></li>
+<li>B. Sun et al. Llumnix. OSDI 2024. <a href="https://arxiv.org/abs/2406.03243">arXiv:2406.03243</a></li>
+<li>M. Harchol-Balter. Performance Modeling and Design of Computer Systems. Cambridge, 2013.</li>
+<li>The SGLang Team. SGLang v0.4: Zero-Overhead Batch Scheduler. LMSYS blog, Dec 2024. <a href="https://lmsys.org/blog/2024-12-04-sglang-v0-4/">lmsys.org</a></li>
+<li>The vLLM Team. vLLM V1: A Major Upgrade to vLLM's Core Architecture. Jan 2025. <a href="https://vllm.ai/blog/2025-01-27-v1-alpha-release">vllm.ai</a></li>
+<li>A. Gordić. Inside vLLM: Anatomy of a High-Throughput LLM Inference System. 2025. <a href="https://www.aleksagordic.com/blog/vllm">aleksagordic.com</a></li>
+<li>K. Zhu et al. NanoFlow. 2024. <a href="https://arxiv.org/abs/2408.12757">arXiv:2408.12757</a></li>
+<li>NVIDIA. TensorRT-LLM documentation. <a href="https://nvidia.github.io/TensorRT-LLM/">nvidia.github.io/TensorRT-LLM</a></li>
+<li>P. Patel et al. Splitwise: Efficient Generative LLM Inference Using Phase Splitting. ISCA 2024. <a href="https://arxiv.org/abs/2311.18677">arXiv:2311.18677</a></li>
+<li>Y. Zhong et al. DistServe: Disaggregating Prefill and Decoding for Goodput-optimized LLM Serving. OSDI 2024. <a href="https://arxiv.org/abs/2401.09670">arXiv:2401.09670</a></li>
+<li>R. Qin et al. Mooncake: A KVCache-centric Architecture for Serving LLM Chatbot. FAST 2025. <a href="https://arxiv.org/abs/2407.00079">arXiv:2407.00079</a></li>
+<li>NVIDIA. Dynamo and NIXL. 2025. <a href="https://github.com/ai-dynamo/dynamo">github.com/ai-dynamo/dynamo</a></li>
+<li>R. Zhu et al. MegaScale-Infer: Disaggregated Expert Parallelism. 2025. <a href="https://arxiv.org/abs/2504.02263">arXiv:2504.02263</a></li>
+<li>P. Patel et al. Splitwise. ISCA 2024. <a href="https://arxiv.org/abs/2311.18677">arXiv:2311.18677</a></li>
+<li>Y. Zhong et al. DistServe. OSDI 2024. <a href="https://arxiv.org/abs/2401.09670">arXiv:2401.09670</a></li>
+<li>R. Qin et al. Mooncake. FAST 2025. <a href="https://arxiv.org/abs/2407.00079">arXiv:2407.00079</a></li>
+<li>vLLM team. vLLM V1: A Major Upgrade to vLLM's Core Architecture. 2025. <a href="https://vllm.ai/blog/2025-01-27-v1-alpha-release">vllm.ai blog</a></li>
+<li>Y. Sheng et al. S-LoRA. 2023. <a href="https://arxiv.org/abs/2311.03285">arXiv:2311.03285</a></li>
+</ol>
+
+<h2>Compression</h2>
+<ol class="refs">
+<li>T. Dettmers et al. LLM.int8(). 2022. <a href="https://arxiv.org/abs/2208.07339">arXiv:2208.07339</a></li>
+<li>G. Xiao et al. SmoothQuant. 2022. <a href="https://arxiv.org/abs/2211.10438">arXiv:2211.10438</a></li>
+<li>E. Frantar et al. GPTQ. 2022. <a href="https://arxiv.org/abs/2210.17323">arXiv:2210.17323</a></li>
+<li>J. Lin et al. AWQ. 2023. <a href="https://arxiv.org/abs/2306.00978">arXiv:2306.00978</a></li>
+<li>P. Micikevicius et al. FP8 Formats for Deep Learning. 2022. <a href="https://arxiv.org/abs/2209.05433">arXiv:2209.05433</a></li>
+<li>B. D. Rouhani et al. Microscaling Data Formats for Deep Learning (OCP MX). 2023. <a href="https://arxiv.org/abs/2310.10537">arXiv:2310.10537</a></li>
+<li>S. Ashkboos et al. QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs. 2024. <a href="https://arxiv.org/abs/2404.00456">arXiv:2404.00456</a></li>
+<li>Z. Liu et al. SpinQuant: LLM Quantization with Learned Rotations. 2024. <a href="https://arxiv.org/abs/2405.16406">arXiv:2405.16406</a></li>
+<li>E. Frantar et al. MARLIN: Mixed-Precision Auto-Regressive Parallel Inference. 2024. <a href="https://arxiv.org/abs/2408.11743">arXiv:2408.11743</a></li>
+<li>E. Frantar, D. Alistarh. SparseGPT. 2023. <a href="https://arxiv.org/abs/2301.00774">arXiv:2301.00774</a></li>
+<li>M. Sun et al. Wanda: A Simple and Effective Pruning Approach for LLMs. 2023. <a href="https://arxiv.org/abs/2306.11695">arXiv:2306.11695</a></li>
+<li>G. Hinton, O. Vinyals, J. Dean. Distilling the Knowledge in a Neural Network. 2015. <a href="https://arxiv.org/abs/1503.02531">arXiv:1503.02531</a></li>
+<li>R. Agarwal et al. On-Policy Distillation of Language Models (GKD). 2024. <a href="https://arxiv.org/abs/2306.13649">arXiv:2306.13649</a></li>
+<li>S. Muralidharan et al. Compact Language Models via Pruning and Knowledge Distillation (Minitron). 2024. <a href="https://arxiv.org/abs/2407.14679">arXiv:2407.14679</a></li>
+<li>Z. Liu et al. Deja Vu: Contextual Sparsity for Efficient LLMs. 2023. <a href="https://arxiv.org/abs/2310.17157">arXiv:2310.17157</a></li>
+<li>Y. Gu et al. MiniLLM. 2023. <a href="https://arxiv.org/abs/2306.08543">arXiv:2306.08543</a></li>
+<li>E. Kurtic et al. "Give Me BF16 or Give Me Death"? Accuracy–Performance Trade-Offs in LLM Quantization. 2024. <a href="https://arxiv.org/abs/2411.02355">arXiv:2411.02355</a></li>
+<li>Bridging the Gap Between Promise and Performance for Microscaling FP4 Quantization. 2025. <a href="https://arxiv.org/abs/2509.23202">arXiv:2509.23202</a></li>
+</ol>
+
+<h2>Fine-tuning and parameter-efficient adaptation</h2>
+<ol class="refs">
+<li>E. J. Hu et al. LoRA: Low-Rank Adaptation of Large Language Models. 2021. <a href="https://arxiv.org/abs/2106.09685">arXiv:2106.09685</a></li>
+<li>T. Dettmers et al. QLoRA: Efficient Finetuning of Quantized LLMs. 2023. <a href="https://arxiv.org/abs/2305.14314">arXiv:2305.14314</a></li>
+<li>A. Aghajanyan, L. Zettlemoyer, S. Gupta. Intrinsic Dimensionality Explains the Effectiveness of Language Model Fine-Tuning. 2020. <a href="https://arxiv.org/abs/2012.13255">arXiv:2012.13255</a></li>
+<li>D. Biderman et al. LoRA Learns Less and Forgets Less. 2024. <a href="https://arxiv.org/abs/2405.09673">arXiv:2405.09673</a></li>
+<li>S. Rajbhandari et al. ZeRO: Memory Optimizations Toward Training Trillion Parameter Models. 2019. <a href="https://arxiv.org/abs/1910.02054">arXiv:1910.02054</a></li>
+<li>Y. Zhao et al. PyTorch FSDP. 2023. <a href="https://arxiv.org/abs/2304.11277">arXiv:2304.11277</a></li>
+<li>S.-Y. Liu et al. DoRA: Weight-Decomposed Low-Rank Adaptation. 2024. <a href="https://arxiv.org/abs/2402.09353">arXiv:2402.09353</a></li>
+<li>S. Hayou, N. Ghosh, B. Yu. LoRA+. 2024. <a href="https://arxiv.org/abs/2402.12354">arXiv:2402.12354</a></li>
+<li>D. Kalajdzievski. rsLoRA: A Rank Stabilization Scaling Factor for Fine-Tuning with LoRA. 2023. <a href="https://arxiv.org/abs/2312.03732">arXiv:2312.03732</a></li>
+<li>N. Houlsby et al. Parameter-Efficient Transfer Learning for NLP. 2019. <a href="https://arxiv.org/abs/1902.00751">arXiv:1902.00751</a></li>
+<li>X. L. Li, P. Liang. Prefix-Tuning. 2021. <a href="https://arxiv.org/abs/2101.00190">arXiv:2101.00190</a></li>
+<li>B. Lester, R. Al-Rfou, N. Constant. The Power of Scale for Parameter-Efficient Prompt Tuning. 2021. <a href="https://arxiv.org/abs/2104.08691">arXiv:2104.08691</a></li>
+<li>C. Zhou et al. LIMA: Less Is More for Alignment. 2023. <a href="https://arxiv.org/abs/2305.11206">arXiv:2305.11206</a></li>
+</ol>
+
+<h2>Distributed inference and MoE</h2>
+<ol class="refs">
+<li>D. Dai et al. DeepSeekMoE. 2024. <a href="https://arxiv.org/abs/2401.06066">arXiv:2401.06066</a></li>
+<li>L. Wang et al. Auxiliary-Loss-Free Load Balancing for MoE. 2024. <a href="https://arxiv.org/abs/2408.15664">arXiv:2408.15664</a></li>
+<li>Kimi Team. Kimi K2. 2025. <a href="https://arxiv.org/abs/2507.20534">arXiv:2507.20534</a></li>
+<li>S. A. Jacobs et al. DeepSpeed Ulysses. 2023. <a href="https://arxiv.org/abs/2309.14509">arXiv:2309.14509</a></li>
+<li>A. Yang et al. Context Parallelism for Scalable Million-Token Inference. 2024. <a href="https://arxiv.org/abs/2411.01783">arXiv:2411.01783</a></li>
+<li>R. Thakur, R. Rabenseifner, W. Gropp. Optimization of Collective Communication Operations in MPICH. IJHPCA, 2005.</li>
+<li>P. Patarasuk, X. Yuan. Bandwidth Optimal All-reduce Algorithms for Clusters of Workstations. JPDC, 2009.</li>
+<li>NVIDIA. NCCL documentation. <a href="https://docs.nvidia.com/deeplearning/nccl/">docs.nvidia.com</a></li>
+<li>DeepSeek-AI. DeepEP. 2025. <a href="https://github.com/deepseek-ai/DeepEP">github.com/deepseek-ai/DeepEP</a></li>
+<li>M. Shoeybi et al. Megatron-LM. 2019. <a href="https://arxiv.org/abs/1909.08053">arXiv:1909.08053</a></li>
+<li>D. Narayanan et al. Efficient Large-Scale Language Model Training on GPU Clusters. 2021. <a href="https://arxiv.org/abs/2104.04473">arXiv:2104.04473</a></li>
+<li>H. Liu et al. Ring Attention. 2023. <a href="https://arxiv.org/abs/2310.01889">arXiv:2310.01889</a></li>
+<li>N. Shazeer et al. Outrageously Large Neural Networks (MoE). 2017. <a href="https://arxiv.org/abs/1701.06538">arXiv:1701.06538</a></li>
+<li>W. Fedus et al. Switch Transformers. 2021. <a href="https://arxiv.org/abs/2101.03961">arXiv:2101.03961</a></li>
+<li>A. Q. Jiang et al. Mixtral of Experts. 2024. <a href="https://arxiv.org/abs/2401.04088">arXiv:2401.04088</a></li>
+</ol>
+
+<h2>Long context</h2>
+<ol class="refs">
+<li>S. Chen et al. Position Interpolation. 2023. <a href="https://arxiv.org/abs/2306.15595">arXiv:2306.15595</a></li>
+<li>B. Peng et al. YaRN. 2023. <a href="https://arxiv.org/abs/2309.00071">arXiv:2309.00071</a></li>
+<li>N. F. Liu et al. Lost in the Middle. 2023. <a href="https://arxiv.org/abs/2307.03172">arXiv:2307.03172</a></li>
+<li>C.-P. Hsieh et al. RULER. 2024. <a href="https://arxiv.org/abs/2404.06654">arXiv:2404.06654</a></li>
+<li>J. Tang et al. Quest. 2024. <a href="https://arxiv.org/abs/2406.10774">arXiv:2406.10774</a></li>
+<li>J. Yuan et al. Native Sparse Attention. 2025. <a href="https://arxiv.org/abs/2502.11089">arXiv:2502.11089</a></li>
+<li>E. Lu et al. MoBA. 2025. <a href="https://arxiv.org/abs/2502.13189">arXiv:2502.13189</a></li>
+<li>Z. Li et al. RAG or Long-Context LLMs? (Self-Route). 2024. <a href="https://arxiv.org/abs/2407.16833">arXiv:2407.16833</a></li>
+</ol>
+
+<h2>Recurrent and hybrid architectures</h2>
+<ol class="refs">
+<li>A. Katharopoulos et al. Transformers are RNNs. 2020. <a href="https://arxiv.org/abs/2006.16236">arXiv:2006.16236</a></li>
+<li>A. Gu et al. S4. 2021. <a href="https://arxiv.org/abs/2111.00396">arXiv:2111.00396</a></li>
+<li>A. Gu, T. Dao. Mamba. 2023. <a href="https://arxiv.org/abs/2312.00752">arXiv:2312.00752</a></li>
+<li>T. Dao, A. Gu. Mamba-2 / SSD. 2024. <a href="https://arxiv.org/abs/2405.21060">arXiv:2405.21060</a></li>
+<li>S. Yang et al. Gated DeltaNet. 2024. <a href="https://arxiv.org/abs/2412.06464">arXiv:2412.06464</a></li>
+<li>S. Arora et al. Zoology. 2023. <a href="https://arxiv.org/abs/2312.04927">arXiv:2312.04927</a></li>
+<li>O. Lieber et al. Jamba. 2024. <a href="https://arxiv.org/abs/2403.19887">arXiv:2403.19887</a></li>
+<li>MiniMax-01. 2025. <a href="https://arxiv.org/abs/2501.08313">arXiv:2501.08313</a></li>
+<li>NVIDIA. Nemotron-H. 2025. <a href="https://arxiv.org/abs/2504.03624">arXiv:2504.03624</a></li>
+<li>Kimi Linear. 2025. <a href="https://arxiv.org/abs/2510.26692">arXiv:2510.26692</a></li>
+</ol>
+
+<h2>Reinforcement learning and alignment</h2>
+<ol class="refs">
+<li>R. J. Williams. Simple Statistical Gradient-Following Algorithms for Connectionist Reinforcement Learning. 1992. <a href="https://doi.org/10.1007/BF00992696">doi:10.1007/BF00992696</a></li>
+<li>J. Schulman et al. Trust Region Policy Optimization. 2015. <a href="https://arxiv.org/abs/1502.05477">arXiv:1502.05477</a></li>
+<li>J. Schulman et al. Generalized Advantage Estimation. 2015. <a href="https://arxiv.org/abs/1506.02438">arXiv:1506.02438</a></li>
+<li>J. Schulman et al. Proximal Policy Optimization Algorithms. 2017. <a href="https://arxiv.org/abs/1707.06347">arXiv:1707.06347</a></li>
+<li>P. Christiano et al. Deep Reinforcement Learning from Human Preferences. 2017. <a href="https://arxiv.org/abs/1706.03741">arXiv:1706.03741</a></li>
+<li>D. M. Ziegler et al. Fine-Tuning Language Models from Human Preferences. 2019. <a href="https://arxiv.org/abs/1909.08593">arXiv:1909.08593</a></li>
+<li>N. Stiennon et al. Learning to Summarize from Human Feedback. 2020. <a href="https://arxiv.org/abs/2009.01325">arXiv:2009.01325</a></li>
+<li>L. Ouyang et al. Training Language Models to Follow Instructions with Human Feedback (InstructGPT). 2022. <a href="https://arxiv.org/abs/2203.02155">arXiv:2203.02155</a></li>
+<li>S. Huang et al. The N+ Implementation Details of RLHF with PPO. 2024. <a href="https://arxiv.org/abs/2403.17031">arXiv:2403.17031</a></li>
+<li>A. Ahmadian et al. Back to Basics: Revisiting REINFORCE Style Optimization (RLOO). 2024. <a href="https://arxiv.org/abs/2402.14740">arXiv:2402.14740</a></li>
+<li>G. Sheng et al. HybridFlow (veRL). 2024. <a href="https://arxiv.org/abs/2409.19256">arXiv:2409.19256</a></li>
+<li>J. Hu et al. OpenRLHF. 2024. <a href="https://arxiv.org/abs/2405.11143">arXiv:2405.11143</a></li>
+<li>R. Rafailov et al. Direct Preference Optimization: Your Language Model is Secretly a Reward Model. 2023. <a href="https://arxiv.org/abs/2305.18290">arXiv:2305.18290</a></li>
+<li>L. Gao, J. Schulman, J. Hilton. Scaling Laws for Reward Model Overoptimization. 2022. <a href="https://arxiv.org/abs/2210.10760">arXiv:2210.10760</a></li>
+<li>Y. Bai et al. Training a Helpful and Harmless Assistant with RLHF. 2022. <a href="https://arxiv.org/abs/2204.05862">arXiv:2204.05862</a></li>
+<li>Y. Bai et al. Constitutional AI: Harmlessness from AI Feedback. 2022. <a href="https://arxiv.org/abs/2212.08073">arXiv:2212.08073</a></li>
+<li>M. G. Azar et al. A General Theoretical Paradigm to Understand Learning from Human Preferences (IPO). 2023. <a href="https://arxiv.org/abs/2310.12036">arXiv:2310.12036</a></li>
+<li>K. Ethayarajh et al. KTO: Model Alignment as Prospect Theoretic Optimization. 2024. <a href="https://arxiv.org/abs/2402.01306">arXiv:2402.01306</a></li>
+<li>J. Hong, N. Lee, J. Thorne. ORPO. 2024. <a href="https://arxiv.org/abs/2403.07691">arXiv:2403.07691</a></li>
+<li>Y. Meng, M. Xia, D. Chen. SimPO. 2024. <a href="https://arxiv.org/abs/2405.14734">arXiv:2405.14734</a></li>
+<li>S. Xu et al. Is DPO Superior to PPO for LLM Alignment? 2024. <a href="https://arxiv.org/abs/2404.10719">arXiv:2404.10719</a></li>
+<li>L. Zheng et al. Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena. 2023. <a href="https://arxiv.org/abs/2306.05685">arXiv:2306.05685</a></li>
+</ol>
+
+<h2>Reasoning and test-time compute</h2>
+<ol class="refs">
+<li>Z. Shao et al. DeepSeekMath (GRPO). 2024. <a href="https://arxiv.org/abs/2402.03300">arXiv:2402.03300</a></li>
+<li>Z. Liu et al. Understanding R1-Zero-Like Training: A Critical Perspective (Dr. GRPO). 2025. <a href="https://arxiv.org/abs/2503.20783">arXiv:2503.20783</a></li>
+<li>Q. Yu et al. DAPO: An Open-Source LLM Reinforcement Learning System at Scale. 2025. <a href="https://arxiv.org/abs/2503.14476">arXiv:2503.14476</a></li>
+<li>Y. Yue et al. Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model? 2025. <a href="https://arxiv.org/abs/2504.13837">arXiv:2504.13837</a></li>
+<li>N. Lambert et al. Tülu 3 (RLVR). 2024. <a href="https://arxiv.org/abs/2411.15124">arXiv:2411.15124</a></li>
+<li>Kimi Team. Kimi k1.5: Scaling Reinforcement Learning with LLMs. 2025. <a href="https://arxiv.org/abs/2501.12599">arXiv:2501.12599</a></li>
+<li>P. Wang et al. Math-Shepherd. 2023. <a href="https://arxiv.org/abs/2312.08935">arXiv:2312.08935</a></li>
+<li>W. Fu et al. AReaL: Asynchronous Reinforcement Learning for Language Reasoning. 2025. <a href="https://arxiv.org/abs/2505.24298">arXiv:2505.24298</a></li>
+<li>J. Wei et al. Chain-of-Thought Prompting. 2022. <a href="https://arxiv.org/abs/2201.11903">arXiv:2201.11903</a></li>
+<li>X. Wang et al. Self-Consistency. 2022. <a href="https://arxiv.org/abs/2203.11171">arXiv:2203.11171</a></li>
+<li>H. Lightman et al. Let's Verify Step by Step. 2023. <a href="https://arxiv.org/abs/2305.20050">arXiv:2305.20050</a></li>
+<li>DeepSeek-AI. DeepSeek-R1. 2025. <a href="https://arxiv.org/abs/2501.12948">arXiv:2501.12948</a></li>
+<li>C. Snell et al. Scaling LLM Test-Time Compute Optimally. 2024. <a href="https://arxiv.org/abs/2408.03314">arXiv:2408.03314</a></li>
+<li>B. Brown et al. Large Language Monkeys. 2024. <a href="https://arxiv.org/abs/2407.21787">arXiv:2407.21787</a></li>
+<li>N. Muennighoff et al. s1: Simple Test-Time Scaling. 2025. <a href="https://arxiv.org/abs/2501.19393">arXiv:2501.19393</a></li>
+<li>Z. Shao et al. DeepSeekMath (GRPO). 2024. <a href="https://arxiv.org/abs/2402.03300">arXiv:2402.03300</a></li>
+</ol>
+
+<h2>Serving at scale</h2>
+<ol class="refs">
+<li>E. J. Hu et al. LoRA. 2021. <a href="https://arxiv.org/abs/2106.09685">arXiv:2106.09685</a></li>
+<li>L. Chen et al. Punica. 2023. <a href="https://arxiv.org/abs/2310.18547">arXiv:2310.18547</a></li>
+<li>Y. Sheng et al. S-LoRA. 2023. <a href="https://arxiv.org/abs/2311.03285">arXiv:2311.03285</a></li>
+<li>L. Chen et al. FrugalGPT. 2023. <a href="https://arxiv.org/abs/2305.05176">arXiv:2305.05176</a></li>
+<li>I. Ong et al. RouteLLM. 2024. <a href="https://arxiv.org/abs/2406.18665">arXiv:2406.18665</a></li>
+<li>V. Mirrokni et al. Consistent Hashing with Bounded Loads. 2016. <a href="https://arxiv.org/abs/1608.01350">arXiv:1608.01350</a></li>
+<li>M. Mitzenmacher. The Power of Two Choices in Randomized Load Balancing. 1996/2001.</li>
+<li>J. Dean, L. A. Barroso. The Tail at Scale. CACM, 2013.</li>
+</ol>
+
+<h2>Benchmarking and evaluation</h2>
+<ol class="refs">
+<li>V. J. Reddi et al. MLPerf Inference Benchmark. 2019. <a href="https://arxiv.org/abs/1911.02549">arXiv:1911.02549</a></li>
+<li>L. Zheng et al. Judging LLM-as-a-Judge. 2023. <a href="https://arxiv.org/abs/2306.05685">arXiv:2306.05685</a></li>
+<li>E. Miller. Adding Error Bars to Evals. 2024. <a href="https://arxiv.org/abs/2411.00640">arXiv:2411.00640</a></li>
+<li>L. Zheng et al. LMSYS-Chat-1M. 2023. <a href="https://arxiv.org/abs/2309.11998">arXiv:2309.11998</a></li>
+<li>G. Tene. How NOT to Measure Latency (coordinated omission). 2013–2015.</li>
+<li>B. Beyer et al. Site Reliability Engineering (SLOs, burn-rate alerting). 2016.</li>
+</ol>
+
+<h2>On-device inference</h2>
+<ol class="refs">
+<li>G. Gerganov et al. llama.cpp / ggml / GGUF. <a href="https://github.com/ggml-org/llama.cpp">github.com/ggml-org/llama.cpp</a></li>
+<li>Apple. MLX. <a href="https://github.com/ml-explore/mlx">github.com/ml-explore/mlx</a></li>
+<li>K. Alizadeh et al. LLM in a Flash. 2023. <a href="https://arxiv.org/abs/2312.11514">arXiv:2312.11514</a></li>
+<li>Apple Intelligence Foundation Language Models. 2024. <a href="https://arxiv.org/abs/2407.21075">arXiv:2407.21075</a></li>
+<li>Z. Xue et al. PowerInfer-2. 2024. <a href="https://arxiv.org/abs/2406.06282">arXiv:2406.06282</a></li>
+<li>M. Abdin et al. Phi-3 Technical Report. 2024. <a href="https://arxiv.org/abs/2404.14219">arXiv:2404.14219</a></li>
+</ol>
+
+<h2>Speculative decoding</h2>
+<ol class="refs">
+<li>Y. Li et al. EAGLE-2. 2024. <a href="https://arxiv.org/abs/2406.16858">arXiv:2406.16858</a></li>
+<li>X. Miao et al. SpecInfer. 2023. <a href="https://arxiv.org/abs/2305.09781">arXiv:2305.09781</a></li>
+<li>J. Chen et al. MagicDec. 2024. <a href="https://arxiv.org/abs/2408.11049">arXiv:2408.11049</a></li>
+<li>Y. Leviathan et al. Fast Inference from Transformers via Speculative Decoding. 2022. <a href="https://arxiv.org/abs/2211.17192">arXiv:2211.17192</a></li>
+<li>C. Chen et al. Accelerating LLM Decoding with Speculative Sampling. 2023. <a href="https://arxiv.org/abs/2302.01318">arXiv:2302.01318</a></li>
+<li>T. Cai et al. Medusa. 2024. <a href="https://arxiv.org/abs/2401.10774">arXiv:2401.10774</a></li>
+<li>Y. Li et al. EAGLE. 2024. <a href="https://arxiv.org/abs/2401.15077">arXiv:2401.15077</a>; EAGLE-3, 2025. <a href="https://arxiv.org/abs/2503.01840">arXiv:2503.01840</a></li>
+</ol>
+</div>
+</body>
+</html>

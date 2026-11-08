@@ -1,0 +1,639 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 4 · Decoding: From Logits to Text — Introduction to LLM Engineering</title>
+<meta name="description" content="Chapter 4 of Introduction to LLM Engineering: greedy and beam search, temperature, top-k/top-p/min-p, logit processors, GPU sampling, grammar-constrained decoding, determinism and streaming.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script defer src="/library/assets/book-shim.js" data-library="/library/" data-field="/library/AI_Engineering/" data-field-title="AI Engineering"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-chapter="ch04" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Part I · Foundations — Chapter 4</div>
+<h1 id="top">Decoding: From Logits to Text</h1>
+<p class="lede">The model gives us a probability distribution over 128,000 tokens. Choosing one token from it, a few hundred times a second for hundreds of users, is a modelling decision, a systems problem and a correctness problem all at once.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Chapter 3 treated one line of the generation loop as a black box: <code>sample(logits)</code>. Each decode step ends with a vector of logits \(z\in\mathbb R^{|\mathcal V|}\), one score per vocabulary entry, and something must turn that vector into a single token before the next step can begin. It is tempting to think this is trivial: take a softmax and draw a sample, or simply pick the largest entry. In practice, the choice of <em>decoding strategy</em> changes the quality of generated text more than many architectural improvements do. A model decoded greedily may loop endlessly. The same model sampled at temperature 1 may drift into gibberish. Sampled with a well-chosen truncation, it writes fluently.</p>
+<p>Decoding is also where most of the user-facing <em>controls</em> of an LLM API live: temperature, top-p, stop sequences, penalties, log-probabilities, JSON mode, tool-call grammars, seeds. Each of these must be implemented efficiently for a batch of hundreds of sequences with different settings, on a GPU, every few milliseconds. And decoding is where several subtle correctness problems surface. Why does "temperature 0" not always give the same answer twice? How can a server guarantee that output parses as valid JSON without distorting what the model wanted to say? How do you stream text when a single character can be split across two tokens?</p>
+<p>This chapter answers those questions. We begin with the decision problem itself, search versus sampling, and follow its evolution from beam search through temperature and the truncation samplers (top-\(k\), nucleus, min-\(p\)). We then turn to the systems side: how sampling is implemented on a GPU without sorting 128,000 numbers per sequence, and how structured-output engines enforce grammars with automata. We close with determinism and streaming. By the end, the generation loop of Chapter 3 will have no black boxes left except the hardware itself, which Part II opens.</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Explain why maximising probability (greedy or beam search) produces degenerate text in open-ended generation, and where search is still the right tool.</li>
+<li>Analyse temperature as the inverse temperature of a Gibbs distribution, including its effect on entropy and its limits as \(\tau\to0\) and \(\tau\to\infty\).</li>
+<li>Define and compare top-\(k\), top-\(p\) (nucleus), min-\(p\), typical and \(\eta\) sampling, and say which failure each addresses.</li>
+<li>Describe the logit-processing pipeline (penalties, biases, masks) and the order in which operations are applied.</li>
+<li>Explain how batched sampling is implemented on GPUs without sorting, including the Gumbel-max trick and rejection-based top-\(p\).</li>
+<li>Explain grammar-constrained decoding with finite and pushdown automata, its per-step cost, and why it can distort the model's distribution.</li>
+<li>Explain why greedy decoding is not deterministic on real servers, and what batch-invariant kernels do about it.</li>
+</ol>
+<p class="small muted">Uses: Chapter 1 (§1.1 probability), Chapter 2 (§2.2 tokenisation, §2.3 the LM head) and Chapter 3 (§3.1 the generation loop, §3.4 overhead). Symbols: <a href="../notation.html">notation page</a>.</p>
+</div>
+
+<h2 id="s4-1">4.1 The decision problem</h2>
+<p>At the end of a decode step the model has produced logits \(z\in\mathbb R^{|\mathcal V|}\), and the softmax turns them into a distribution \(p(v)=e^{z_v}/\sum_{u}e^{z_u}\) over tokens \(v\in\mathcal V\). This is the model's estimate of \(p(x_{t+1}=v\mid x_{\le t})\). The question is what to do with it, and the answer depends on what we want the output to be.</p>
+<p>Two goals pull in different directions. Sometimes we want the <strong>single best output</strong>: the most likely translation of a sentence, the correct answer to an arithmetic question, the one SQL query that answers a request. That is a <em>search</em> problem. We want \(\arg\max_{y} p(y\mid x)\) over whole output sequences \(y\), which is a maximisation over an exponentially large set. Other times we want a <strong>representative output</strong>: a story, a poem or a conversational reply that reads like something a person might plausibly write. That is a <em>sampling</em> problem. We want \(y\sim p(\cdot\mid x)\), or something close to it. These are genuinely different goals, and a surprising fact about language models is that for open-ended text the first goal produces worse output than the second. To see why, we start with the search methods that dominated until about 2019.</p>
+
+<h2 id="s4-2">4.2 Search: greedy decoding and beam search</h2>
+<p>The simplest decoder is <strong>greedy decoding</strong>: at each step, emit \(\arg\max_v p(v)\). It is cheap (one maximum over \(|\mathcal V|\) numbers per sequence) and deterministic in exact arithmetic. But it is myopic. A token that looks best now may lead to a continuation that is worse overall, and greedy decoding never reconsiders.</p>
+<p><strong>Beam search</strong> addresses myopia by keeping several hypotheses alive. With beam width \(n_{\text{beam}}\), it maintains the \(n_{\text{beam}}\) partial sequences with the highest log-probability. At each step it extends every hypothesis by every possible token, scores the \(n_{\text{beam}}|\mathcal V|\) candidates by cumulative log-probability \(\sum_t\log p(y_t\mid y_{&lt;t},x)\), and keeps the best \(n_{\text{beam}}\). When hypotheses end, their scores are usually divided by a power of their length, because otherwise the search systematically prefers short outputs: every extra token multiplies the probability by a number less than one.</p>
+
+<figure class="diagram" id="fig-4-1">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Beam search with beam width 2 keeps the two best partial sequences at each step">
+<defs><marker id="a41" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="20" y="112" width="90" height="34" rx="8" class="bx"/><text x="65" y="134" text-anchor="middle" class="t-sm">"The cat"</text>
+<line x1="110" y1="122" x2="200" y2="60" class="ln" marker-end="url(#a41)"/><line x1="110" y1="129" x2="200" y2="130" class="ln" marker-end="url(#a41)"/><line x1="110" y1="136" x2="200" y2="200" class="ln dash" marker-end="url(#a41)"/>
+<rect x="200" y="42" width="120" height="34" rx="8" class="bx3"/><text x="260" y="64" text-anchor="middle" class="t-sm">sat  −0.4</text>
+<rect x="200" y="112" width="120" height="34" rx="8" class="bx3"/><text x="260" y="134" text-anchor="middle" class="t-sm">was  −0.9</text>
+<rect x="200" y="182" width="120" height="34" rx="8" class="fill-muted"/><text x="260" y="204" text-anchor="middle" class="t-sm">jumped  −2.3</text>
+<text x="260" y="234" text-anchor="middle" class="t-xs">pruned (not in top 2)</text>
+<line x1="320" y1="55" x2="430" y2="30" class="ln" marker-end="url(#a41)"/><line x1="320" y1="62" x2="430" y2="90" class="ln" marker-end="url(#a41)"/>
+<line x1="320" y1="125" x2="430" y2="150" class="ln" marker-end="url(#a41)"/><line x1="320" y1="133" x2="430" y2="210" class="ln dash" marker-end="url(#a41)"/>
+<rect x="430" y="14" width="150" height="32" rx="8" class="bx3"/><text x="505" y="35" text-anchor="middle" class="t-sm">sat on  −0.7</text>
+<rect x="430" y="74" width="150" height="32" rx="8" class="fill-muted"/><text x="505" y="95" text-anchor="middle" class="t-sm">sat down  −1.6</text>
+<rect x="430" y="134" width="150" height="32" rx="8" class="bx3"/><text x="505" y="155" text-anchor="middle" class="t-sm">was sleeping  −1.2</text>
+<rect x="430" y="194" width="150" height="32" rx="8" class="fill-muted"/><text x="505" y="215" text-anchor="middle" class="t-sm">was a  −2.0</text>
+<text x="650" y="40" text-anchor="middle" class="t-xs">kept</text><text x="650" y="160" text-anchor="middle" class="t-xs">kept</text>
+<text x="650" y="100" text-anchor="middle" class="t-xs">pruned</text><text x="650" y="220" text-anchor="middle" class="t-xs">pruned</text>
+</svg>
+<figcaption><b>Figure 4.1 — Beam search with \(n_{\text{beam}}=2\).</b> Numbers are cumulative log-probabilities. At each depth every surviving hypothesis is extended, and only the two highest-scoring partial sequences are kept (green). Note that "sat down" is pruned even though it was the second-best extension of the best hypothesis.</figcaption></figure>
+
+<p>Figure 4.1 shows two steps of beam search with width 2. From "The cat", the extensions "sat" and "was" survive and "jumped" is pruned. At the next depth there are four candidates. The two best overall, "sat on" (−0.7) and "was sleeping" (−1.2), are kept, even though "sat down" was a direct extension of the leading hypothesis. Beam search spends \(n_{\text{beam}}\) times the compute of greedy decoding and holds \(n_{\text{beam}}\) KV caches, although these can share their common prefix (Chapter 10 shows how).</p>
+<p>For a decade beam search was the default decoder for machine translation, summarisation and speech recognition, and it is still used where outputs are short and tightly determined by the input. But when GPT-2-scale models were asked to write open-ended text, both greedy decoding and beam search produced strikingly bad output: bland, generic and above all <em>repetitive</em>, often getting stuck in loops that repeat a phrase forever. Holtzman et al. named this <strong>neural text degeneration</strong><span class="cite"><a href="#r-holtzman">[1]</a></span>.</p>
+<p>Why does maximising probability produce bad text? Two explanations reinforce each other. First, human text is <em>not</em> high-probability text. Holtzman et al. showed that the per-token probability that a model assigns to human-written text fluctuates wildly, while beam-search text sits at uniformly high probability. People routinely choose words that are informative precisely because they are not the most predictable. Second, repetition is self-reinforcing. Once a phrase has appeared, a Transformer can copy it with high confidence through its induction heads (§2.4), so the probability of repeating it rises with each repetition, and a maximiser locks into the loop. Even in translation, exact search for the most probable output often returns something worse than beam search's approximate answer, frequently the empty string. Stahlberg and Byrne called this the "beam search curse"<span class="cite"><a href="#r-stahlberg">[2]</a></span>. The mode of a language model's distribution is simply not where good text lives.</p>
+
+<div class="box interview">
+<div class="box-title">When search is still right</div>
+<p>Greedy decoding remains the default for tasks with one correct answer, such as arithmetic, code completion with tests, classification, extraction and tool-call arguments, and for evaluation, where variance is unwelcome. Beam search survives in speech recognition and some translation systems. In reasoning models, "search" has re-emerged at a much coarser grain, over whole candidate solutions rather than tokens (best-of-\(N\), tree search; Chapter 26).</p>
+</div>
+
+<h2 id="s4-3">4.3 Sampling and temperature</h2>
+<p>If the mode is bad, the obvious alternative is to sample: draw \(v\sim p\). Pure sampling at the model's own distribution, called ancestral sampling, produces varied and often human-like text. But it suffers from the opposite failure. Occasionally it draws a very unlikely token, and once a bizarre token is in the context, the model conditions on it and the text derails. We need a dial between "always the most likely" and "exactly the model's distribution". The oldest such dial is <strong>temperature</strong>.</p>
+<p>Temperature \(\tau&gt;0\) divides the logits before the softmax:</p>
+\[ p_\tau(v) = \frac{\exp(z_v/\tau)}{\sum_{u\in\mathcal V}\exp(z_u/\tau)} . \]
+<p>A physicist will recognise a Gibbs (Boltzmann) distribution, with energies \(-z_v\) and inverse temperature \(1/\tau\). The limits are clean. As \(\tau\to0\), all mass concentrates on \(\arg\max_v z_v\), and sampling becomes greedy decoding. At \(\tau=1\) we recover the model's distribution. As \(\tau\to\infty\), the distribution tends to uniform over \(\mathcal V\). In between, the order of tokens never changes, but the ratio of any two probabilities is raised to the power \(1/\tau\): \(p_\tau(v)/p_\tau(u)=(p(v)/p(u))^{1/\tau}\).</p>
+
+<div class="box thm">
+<div class="box-title">Proposition — entropy increases with temperature</div>
+<p>Let \(\kappa=1/\tau\) and \(H(\kappa)\) be the entropy of \(p_\kappa(v)\propto e^{\kappa z_v}\). A short calculation gives
+\[ \frac{dH}{d\kappa} = -\kappa\operatorname{Var}_{p_\kappa}(z) \le 0 , \]
+so entropy decreases in \(\kappa\), that is, increases in \(\tau\), strictly unless all logits are equal. (<em>Proof sketch:</em> \(H=\log Z(\kappa)-\kappa\,\mathbb E_{p_\kappa}[z]\), with \(\frac{d}{d\kappa}\log Z=\mathbb E[z]\) and \(\frac{d}{d\kappa}\mathbb E[z]=\operatorname{Var}(z)\), the standard exponential-family identities.) Temperature is therefore a monotone knob on the randomness of each step.</p>
+</div>
+
+<figure class="chart" id="fig-4-2">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Effect of temperature on a Zipf-like next-token distribution","height":340,
+ "x":{"label":"Token rank (log)","log":true,"min":1,"max":1000},
+ "y":{"label":"Probability (log)","log":true,"min":1e-7,"max":1},
+ "series":[
+  {"name":"τ = 0.5","color":"s1","points":[[1,0.671],[2,0.146],[5,0.0195],[10,0.00423],[20,0.000921],[50,0.000123],[100,2.67e-05],[200,5.81e-06],[500,7.74e-07],[1000,1.69e-07]]},
+  {"name":"τ = 1.0","color":"s2","points":[[1,0.179],[2,0.0837],[5,0.0306],[10,0.0143],[20,0.00665],[50,0.00243],[100,0.00113],[200,0.000528],[500,0.000193],[1000,8.99e-05]]},
+  {"name":"τ = 1.5","color":"s3","points":[[1,0.0488],[2,0.0294],[5,0.015],[10,0.00903],[20,0.00543],[50,0.00277],[100,0.00167],[200,0.001],[500,0.000512],[1000,0.000308]]}
+ ]}
+</script>
+<figcaption><b>Figure 4.2 — Temperature reshapes, but never reorders, the distribution.</b> A toy distribution over 1,000 tokens with logits \(z_r=-1.1\ln r\) for rank \(r\). Lower temperature steepens the slope; higher temperature flattens it. Entropy: 1.9 bits at \(\tau=0.5\), 6.8 bits at \(\tau=1\), 8.9 bits at \(\tau=1.5\) (the maximum is \(\log_2 1000\approx 10\)).</figcaption></figure>
+
+<p>Figure 4.2 shows temperature acting on a toy distribution whose probabilities fall off as a power of the rank. This is roughly the shape of real next-token distributions in open-ended text. On log–log axes each temperature gives a straight line, and temperature changes its slope. At \(\tau=0.5\) the top token holds two-thirds of the mass. At \(\tau=1.5\) it holds under 5%, and the tail is so heavy that tokens of rank 100–1000 are drawn regularly. The figure also shows temperature's limitation. It acts on the <em>whole</em> distribution at once. Lowering \(\tau\) far enough to suppress the tail also makes the head more deterministic, reducing diversity even where the model was legitimately uncertain between several good words. What we want is to remove the unreliable tail <em>without</em> flattening the head. That is the job of truncation.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — why the tail matters</div>
+<p>In the toy distribution at \(\tau=1\), the 900 tokens ranked below 100 together carry 23% of the probability. Each is individually unlikely, but collectively they are drawn almost one step in four. The probability that a 50-token reply avoids the tail entirely is \(0.77^{50}\approx 2\times10^{-6}\). So pure sampling from such a distribution almost certainly inserts several low-ranked tokens per sentence. Real model distributions are more peaked than this toy, but the arithmetic of long outputs is the same: small per-step tail probabilities compound over hundreds of steps.</p>
+</div>
+
+<h2 id="s4-4">4.4 Truncation: cutting off the unreliable tail</h2>
+<p>A model's probability estimates are least reliable for unlikely tokens. They are learned from few examples and squeezed by the softmax, and individually tiny tail probabilities add up to a substantial total. Truncation samplers keep a set \(\mathcal K\subseteq\mathcal V\) of "plausible" tokens, set the probability of everything else to zero, renormalise, and sample from what remains. They differ in how they choose \(\mathcal K\), and the history of the methods is a sequence of fixes for each predecessor's failure mode.</p>
+<p><strong>Top-\(k\)</strong> (Fan et al., 2018<span class="cite"><a href="#r-fan">[3]</a></span>; popularised by GPT-2) keeps the \(n_{\text{top}}\) most likely tokens, for a fixed \(n_{\text{top}}\) such as 40. It is simple, but a fixed count is wrong in both directions. When the model is confident, say 75% on one token, keeping 40 candidates admits 39 poor ones. When it is uncertain, say a flat distribution over hundreds of reasonable words, 40 is too few.</p>
+<p><strong>Top-\(p\)</strong>, or <strong>nucleus sampling</strong> (Holtzman et al., 2019<span class="cite"><a href="#r-holtzman">[1]</a></span>), fixes this by fixing the <em>mass</em> instead of the count. It keeps the smallest set of most-likely tokens whose total probability reaches \(p_{\text{top}}\), for example 0.9:</p>
+\[ \mathcal K_{\text{top-}p} = \{v_{(1)},\dots,v_{(k^{*})}\},\qquad k^{*}=\min\Big\{k : \textstyle\sum_{r=1}^{k}p(v_{(r)})\ge p_{\text{top}}\Big\}, \]
+<p>where \(v_{(r)}\) is the token of rank \(r\). The nucleus adapts: it is small when the model is confident and large when it is not.</p>
+<p><strong>Min-\(p\)</strong> (Nguyen et al., 2024<span class="cite"><a href="#r-minp">[4]</a></span>) addresses a weakness of top-\(p\) at high temperature or in very flat distributions. There the nucleus must include hundreds of tokens to reach 90% of the mass, and many of them are junk. Min-\(p\) keeps every token whose probability is at least a fraction \(p_{\min}\) of the most likely token's:</p>
+\[ \mathcal K_{\min\text{-}p} = \{ v : p(v) \ge p_{\min}\cdot \max_u p(u) \} . \]
+<p>The threshold scales with the model's confidence. It is high when the top token is dominant and low when the distribution is flat, which keeps output coherent even at temperatures well above 1, where top-\(p\) breaks down.</p>
+<p>Two further samplers come from information-theoretic arguments. <strong>Typical sampling</strong> (Meister et al., 2023<span class="cite"><a href="#r-typical">[5]</a></span>) keeps tokens whose surprisal \(-\log p(v)\) is close to the distribution's entropy, so it can exclude the <em>top</em> token when it is unusually predictable. This echoes the observation that human text has roughly constant information per word. <strong>\(\eta\)-sampling</strong> (Hewitt et al., 2022<span class="cite"><a href="#r-eta">[6]</a></span>) uses an entropy-dependent absolute threshold. Neither has displaced top-\(p\) and min-\(p\) in production APIs.</p>
+
+<div class="table-wrap">
+<table>
+<caption>Two toy distributions over 1,000 tokens: "peaked" (top token 74.5%) and "flat" (top token 2.7%). Number of tokens each truncation rule keeps.</caption>
+<thead><tr><th>Rule</th><th class="num">Peaked</th><th class="num">Flat</th><th>Comment</th></tr></thead>
+<tbody>
+<tr><td>top-\(k\), \(n_{\text{top}}=40\)</td><td class="num">40</td><td class="num">40</td><td>blind to the shape</td></tr>
+<tr><td>top-\(p\), \(p_{\text{top}}=0.9\)</td><td class="num">3</td><td class="num">779</td><td>adapts, but admits a long tail when flat</td></tr>
+<tr><td>min-\(p\), \(p_{\min}=0.1\)</td><td class="num">2</td><td class="num">46</td><td>adapts, and stays selective when flat</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The table makes the differences concrete. On the peaked distribution, top-\(k\) keeps 37 more tokens than are reasonable, while top-\(p\) and min-\(p\) both keep two or three. On the flat distribution, where many continuations are legitimately plausible, top-\(k\) is far too restrictive. Top-\(p\) swings to the other extreme and keeps 779 tokens to accumulate 90% of the mass. Min-\(p\) keeps the 46 tokens that are at least a tenth as likely as the best one. In practice APIs expose several of these together, and engines apply them in a fixed order, which brings us to the full pipeline.</p>
+
+<figure class="chart" id="fig-4-3">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Entropy of the toy distribution as a function of temperature","height":300,
+ "x":{"label":"Temperature τ","min":0,"max":3,"ticks":[0,0.5,1,1.5,2,2.5,3]},
+ "y":{"label":"Entropy (bits)","min":0,"max":10,"ticks":[0,2,4,6,8,10]},
+ "hlines":[{"y":9.97,"text":"maximum log₂ 1000 ≈ 9.97 bits (uniform)"}],
+ "series":[{"name":"Entropy","color":"s1","points":[[0.1,0.01],[0.25,0.37],[0.5,1.92],[0.75,4.39],[1.0,6.8],[1.25,8.23],[1.5,8.94],[2.0,9.52],[3.0,9.81]]}]}
+</script>
+<figcaption><b>Figure 4.3 — Entropy rises monotonically with temperature</b>, from zero (greedy) towards the uniform maximum, as the proposition in §4.3 guarantees. The steepest change happens between \(\tau=0.5\) and \(\tau=1.25\), the range where most applications operate.</figcaption></figure>
+
+<p>Figure 4.3 completes the picture of temperature by plotting the entropy of the toy distribution against \(\tau\). The curve rises monotonically, as proved in §4.3, and is steepest in the middle. Below \(\tau\approx0.3\) the output is essentially greedy, and above \(\tau\approx2\) it is close to uniform noise. This is why APIs typically recommend temperatures between 0 and about 1.2, and why truncation is needed if one wants high-temperature diversity without noise.</p>
+
+<details class="drill">
+<summary>Drill 4.1 — Temperature and nucleus by hand</summary>
+<p>A model's logits over four tokens are \(z=(3,2,1,0)\). Compute the sampling distribution at \(\tau=1\) and \(\tau=0.5\), and the set kept by top-\(p\) with \(p_{\text{top}}=0.9\) in each case. What does min-\(p\) with \(p_{\min}=0.1\) keep at \(\tau=1\)?</p>
+<p><em>Solution.</em> At \(\tau=1\), softmax gives \((0.644,0.237,0.087,0.032)\). Sorted cumulative mass is 0.644, 0.881, 0.968, so top-\(p\) at 0.9 keeps the first three tokens and renormalises them to \((0.665,0.245,0.090)\). At \(\tau=0.5\) the logits double, giving \((0.865,0.117,0.016,0.002)\); the cumulative mass passes 0.9 at the second token (0.982), so only two tokens survive. Lowering the temperature therefore also shrinks the nucleus. Min-\(p\) at \(\tau=1\) keeps tokens with probability at least \(0.1\times0.644=0.064\): the first three, the same set as top-\(p\) here, but its threshold scales with the model's confidence rather than with cumulative mass.</p>
+</details>
+
+<h2 id="s4-5">4.5 Penalties, biases and the logit-processing pipeline</h2>
+<p>Temperature and truncation reshape the model's distribution in content-blind ways. Several other controls depend on the <em>history</em> of the sequence or on the application. They are implemented as <strong>logit processors</strong>: functions that modify \(z\) before sampling.</p>
+<p>A <strong>repetition penalty</strong> (introduced with the CTRL model, Keskar et al. 2019<span class="cite"><a href="#r-ctrl">[7]</a></span>) discourages tokens already present in the context by dividing their logit by \(\rho&gt;1\) when it is positive and multiplying it by \(\rho\) when negative. OpenAI-style APIs instead offer additive penalties. A <strong>presence penalty</strong> subtracts a constant from the logit of every token that has appeared at least once. A <strong>frequency penalty</strong> subtracts a constant times the number of times it has appeared. These are blunt instruments. They counter the repetition loops of §4.2, but they also penalise legitimate repetition, such as the variable name in a piece of code or the subject of an essay. A <strong>logit bias</strong> adds a user-specified constant to chosen tokens: \(-\infty\) bans a token, and a large positive value forces it. Finally, <strong>masks</strong> set disallowed tokens to \(-\infty\), the mechanism behind structured outputs in §4.7.</p>
+
+<figure class="diagram" id="fig-4-4">
+<svg class="dg" viewBox="0 0 720 170" role="img" aria-label="The logit processing pipeline from logits to a sampled token">
+<defs><marker id="a44" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="10" y="50" width="74" height="50" rx="8" class="bx4"/><text x="47" y="72" text-anchor="middle" class="t-sm">logits z</text><text x="47" y="88" text-anchor="middle" class="t-xs">(B, |V|)</text>
+<rect x="100" y="50" width="88" height="50" rx="8" class="bx"/><text x="144" y="72" text-anchor="middle" class="t-sm">penalties</text><text x="144" y="88" text-anchor="middle" class="t-xs">repetition, freq.</text>
+<rect x="204" y="50" width="80" height="50" rx="8" class="bx"/><text x="244" y="72" text-anchor="middle" class="t-sm">bias, mask</text><text x="244" y="88" text-anchor="middle" class="t-xs">grammar, bans</text>
+<rect x="300" y="50" width="84" height="50" rx="8" class="bx2"/><text x="342" y="72" text-anchor="middle" class="t-sm">÷ τ</text><text x="342" y="88" text-anchor="middle" class="t-xs">temperature</text>
+<rect x="400" y="50" width="100" height="50" rx="8" class="bx2"/><text x="450" y="72" text-anchor="middle" class="t-sm">truncate</text><text x="450" y="88" text-anchor="middle" class="t-xs">top-k, top-p, min-p</text>
+<rect x="516" y="50" width="86" height="50" rx="8" class="bx3"/><text x="559" y="72" text-anchor="middle" class="t-sm">sample</text><text x="559" y="88" text-anchor="middle" class="t-xs">or argmax</text>
+<rect x="618" y="50" width="92" height="50" rx="8" class="bx5"/><text x="664" y="72" text-anchor="middle" class="t-sm">token ids</text><text x="664" y="88" text-anchor="middle" class="t-xs">(B,) + logprobs</text>
+<line x1="84" y1="75" x2="98" y2="75" class="ln" marker-end="url(#a44)"/><line x1="188" y1="75" x2="202" y2="75" class="ln" marker-end="url(#a44)"/><line x1="284" y1="75" x2="298" y2="75" class="ln" marker-end="url(#a44)"/><line x1="384" y1="75" x2="398" y2="75" class="ln" marker-end="url(#a44)"/><line x1="500" y1="75" x2="514" y2="75" class="ln" marker-end="url(#a44)"/><line x1="602" y1="75" x2="616" y2="75" class="ln" marker-end="url(#a44)"/>
+<text x="242" y="128" text-anchor="middle" class="t-xs">depend on history and on the request</text>
+<text x="400" y="128" text-anchor="middle" class="t-xs">reshape the distribution</text>
+<text x="360" y="150" text-anchor="middle" class="t-xs">every stage runs for the whole batch, with per-sequence parameters</text>
+</svg>
+<figcaption><b>Figure 4.4 — The logit-processing pipeline</b>, in the order most engines apply it (vLLM, Hugging Face). Penalties and masks act on raw logits; temperature then rescales; truncation operates on the resulting probabilities.</figcaption></figure>
+
+<p>Figure 4.4 lays the stages out in order. The order matters because the stages do not commute. Applying temperature before top-\(p\) means the nucleus is computed on the tempered distribution, so a high temperature widens the nucleus. Applying top-\(p\) first would cut the tail at the model's own probabilities and then flatten what remains. Engines and APIs document their order, and reproducing another system's sampling exactly requires matching it. The last box also returns <em>log-probabilities</em>. APIs offer the log-probability of the chosen token and of the top few alternatives, which evaluation harnesses and confidence estimates depend on. Whether these are reported before or after processing is another detail that differs between systems.</p>
+
+<h2 id="s4-6">4.6 Sampling on a GPU</h2>
+<p>So far we have discussed what to compute. How fast can it be computed? A decode step for a batch of \(B\) sequences produces a \(B\times|\mathcal V|\) matrix of logits. For \(B=256\) and \(|\mathcal V|=128{,}256\) that is 33 million numbers per step, 131 MB in FP32. The pipeline of Figure 4.4 must process them in a small fraction of the step time, which Chapter 3 put at 5–25 ms. Each stage is a pass over the logits, so a naive implementation is memory-bound and launch-overhead-bound. The interesting stage is truncation, because top-\(k\) and top-\(p\) as defined seem to require <em>sorting</em> each row.</p>
+<p>A full sort of 128k elements per sequence per step is expensive relative to everything else in the step. Production engines avoid it with three ideas. The first is the <strong>Gumbel-max trick</strong>. If \(\xi_v\) are independent standard Gumbel random variables, then \(\arg\max_v (z_v+\xi_v)\) is distributed exactly as \(\operatorname{softmax}(z)\). Sampling becomes a single maximum reduction, with no normalisation, no cumulative sum and no sort, and it parallelises perfectly across the vocabulary. (Equivalently, \(\arg\max_v p(v)/E_v\) with \(E_v\) exponential, a form some engines use.)</p>
+<div class="box thm">
+<div class="box-title">Proposition — the Gumbel-max trick</div>
+<p>Let \(\xi_v=-\log(-\log U_v)\) with \(U_v\) i.i.d. uniform on \((0,1)\). Then \(\Pr[\arg\max_u(z_u+\xi_u)=v]=e^{z_v}/\sum_u e^{z_u}\). <em>Proof sketch:</em> the Gumbel CDF is \(F(x)=\exp(-e^{-x})\). Conditioning on \(z_v+\xi_v=s\), the probability that every other \(z_u+\xi_u&lt;s\) is \(\prod_{u\ne v}\exp(-e^{z_u-s})\). Integrating against the density of \(z_v+\xi_v\) gives \(e^{z_v}/\sum_ue^{z_u}\). ∎</p>
+</div>
+<p>The second idea is <strong>rejection-based truncation</strong>, as in FlashInfer's samplers<span class="cite"><a href="#r-flashinfer">[8]</a></span>. To sample from the top-\(p\) nucleus without sorting, draw a candidate from the full distribution and test whether it lies in the nucleus. The test only requires the total mass of tokens more probable than the candidate, which is a single parallel reduction. If the candidate is rejected, the next draw is restricted to tokens more probable than it, which shrinks the candidate set geometrically. The result is exactly distributed as top-\(p\) sampling, typically after a handful of rounds, all fused into one kernel. The third idea is <strong>fusion and batching</strong>. Per-sequence parameters (\(\tau\), \(p_{\text{top}}\), seeds, penalties) are passed as vectors so the whole batch is processed by one kernel per stage, or one fused kernel overall, rather than looping over sequences in Python. That loop is exactly the overhead regime of §3.4.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — random numbers on a GPU</div>
+<p>GPU samplers use <em>counter-based</em> pseudo-random generators (such as Philox): the \(n\)-th random number of a stream is a deterministic function of a key (the seed) and the counter \(n\). Thousands of threads can therefore draw independent numbers without sharing state. To make a request with a user-supplied seed reproducible, the engine derives the key from that seed and the counter from the step number, so the request's random draws do not depend on which other requests share its batch.</p>
+</div>
+
+<div class="box example">
+<div class="box-title">Worked example — what sampling costs on a GPU</div>
+<p><strong>Setup.</strong> Llama 3 8B has a vocabulary of \(V=128{,}256\). At a batch of 64, one decode step produces \(64\times128{,}256\approx8.2\) million logits, 32.8 MB in FP32. For comparison, the LM-head weight that produced them is \(128{,}256\times4096\times2\) B ≈ 1.05 GB, read once per step in about 0.39 ms at 80% of the H100\'s bandwidth.</p>
+<p><strong>Full sort for top-\(p\).</strong> A radix sort of 32-bit keys makes four passes of 8 bits each, and each pass reads and writes a key and an index (8 bytes) per element: \(4\times2\times8\times8.2\times10^6\approx525\) MB of traffic, about 0.2 ms. Against the 13 ms decode step of §3.8 that is 1.5%, which looks harmless; but at batch 256 and with a vocabulary of 256k it grows to several per cent of every step, for work that changes nothing about the model.</p>
+<p><strong>Without sorting.</strong> Top-\(k\) with \(k=50\) needs only a selection, one or two passes over the logits, about 25–50 µs. Sorting-free top-\(p\) (searching for the probability threshold by bisection or rejection, as FlashInfer does) needs a handful of reads, under 0.1 ms.</p>
+<p><strong>The real danger.</strong> Copying the logits to the CPU to sample there moves 32.8 MB over PCIe at about 25 GB/s of achieved bandwidth: 1.3 ms, 10% of the step, during which the GPU waits. This is why §4.6 insists that the whole logit-processing pipeline stays on the GPU and avoids full sorts.</p>
+</div>
+
+<h2 id="s4-7">4.7 Structured outputs: constrained decoding</h2>
+<p>Many applications need output in a precise format: a JSON object matching a schema, a function call with typed arguments, a date, a SQL query. Asking nicely in the prompt usually works, but "usually" is not good enough for software that parses the result. If one response in a thousand is malformed, an agent that makes fifty calls per task fails about one task in twenty. <strong>Constrained decoding</strong> guarantees validity by construction. At each step, it masks out every token that would make the output impossible to complete into a valid string, and samples only among the rest.</p>
+<p>The mathematical tool is the automaton. A regular expression, and hence any format describable by one (dates, enumerations, simple JSON fields), compiles to a <strong>deterministic finite automaton (DFA)</strong>: a finite set of states with transitions labelled by characters. A prefix is valid exactly when the DFA can read it without getting stuck, and the current state summarises everything about the prefix that matters. The complication is that the model emits <em>tokens</em>, multi-character strings from a 128k vocabulary, not characters. A token is allowed in state \(s\) if reading its characters from \(s\) never leaves the automaton. Willard and Louf's insight (the Outlines library, 2023)<span class="cite"><a href="#r-outlines">[9]</a></span> was to precompute, for every DFA state, the set of allowed tokens. Decoding then reduces to a table lookup per step: fetch the mask for the current state, apply it to the logits, sample, and advance the state by the sampled token's characters.</p>
+
+<figure class="diagram" id="fig-4-5">
+<svg class="dg" viewBox="0 0 720 240" role="img" aria-label="A small automaton for a JSON boolean field and the token mask it induces">
+<defs><marker id="a45" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<text x="20" y="22" class="t-b">Format: {"ok": true} or {"ok": false}</text>
+<circle cx="60" cy="90" r="24" class="bx"/><text x="60" y="95" text-anchor="middle" class="t-sm">s₀</text>
+<circle cx="230" cy="90" r="24" class="bx5"/><text x="230" y="95" text-anchor="middle" class="t-sm">s₁</text>
+<circle cx="400" cy="50" r="24" class="bx"/><text x="400" y="55" text-anchor="middle" class="t-sm">s₂</text>
+<circle cx="400" cy="140" r="24" class="bx"/><text x="400" y="145" text-anchor="middle" class="t-sm">s₃</text>
+<circle cx="560" cy="90" r="24" class="bx3"/><circle cx="560" cy="90" r="19" class="ln"/><text x="560" y="95" text-anchor="middle" class="t-sm">acc</text>
+<line x1="84" y1="90" x2="204" y2="90" class="ln" marker-end="url(#a45)"/><text x="144" y="80" text-anchor="middle" class="t-xs">{"ok": </text>
+<line x1="252" y1="80" x2="377" y2="56" class="ln" marker-end="url(#a45)"/><text x="310" y="58" text-anchor="middle" class="t-xs">t</text>
+<line x1="252" y1="100" x2="377" y2="134" class="ln" marker-end="url(#a45)"/><text x="310" y="132" text-anchor="middle" class="t-xs">f</text>
+<line x1="424" y1="56" x2="537" y2="82" class="ln" marker-end="url(#a45)"/><text x="486" y="58" text-anchor="middle" class="t-xs">rue}</text>
+<line x1="424" y1="134" x2="537" y2="98" class="ln" marker-end="url(#a45)"/><text x="486" y="132" text-anchor="middle" class="t-xs">alse}</text>
+<rect x="150" y="178" width="470" height="50" rx="8" class="fill-muted"/>
+<text x="385" y="198" text-anchor="middle" class="t-sm">Mask in state s₁: allowed tokens = those whose text fits a path from s₁,</text>
+<text x="385" y="216" text-anchor="middle" class="t-sm">e.g. "t", "true", "true}", "f", "false"  ·  banned: "yes", " maybe", "1", …</text>
+<line x1="230" y1="114" x2="230" y2="176" class="ln dash"/>
+</svg>
+<figcaption><b>Figure 4.5 — Constrained decoding as an automaton.</b> Each state of the format's automaton determines which vocabulary tokens may come next. A token is allowed if its characters trace a valid path from the current state; all others are masked to \(-\infty\) before sampling.</figcaption></figure>
+
+<p>Figure 4.5 shows a tiny example, an automaton for the two strings <code>{"ok": true}</code> and <code>{"ok": false}</code>. After the fixed prefix the automaton is in state \(s_1\), and the allowed tokens are those whose characters spell a path from \(s_1\): "t", "true", "true}", "f", "false" and so on. A token such as "yes" is masked. Notice that multi-character tokens may skip several states at once. Notice also that when only one continuation is possible, as at the very start (where the whole prefix <code>{"ok": </code> is forced) or after "tr" (where only "ue}" can follow), there is no need to run the model at all. The engine can append the forced characters directly. This is <strong>jump-forward decoding</strong>, introduced in SGLang, and it saves whole forward passes on boilerplate such as JSON keys.</p>
+<p>Real formats such as JSON with nested objects are not regular: matching brackets needs a stack. They are described by context-free grammars and recognised by <strong>pushdown automata</strong>, whose state includes an unbounded stack. Masks can then no longer be fully precomputed per state. XGrammar (Dong et al., 2024)<span class="cite"><a href="#r-xgrammar">[10]</a></span> made this fast with an observation. For most tokens, whether they are allowed depends only on the current automaton position, not on the stack below it; the authors report that usually more than 99% of tokens are such <em>context-independent</em> tokens. Their masks are precomputed and cached, and only the small remainder is checked against the stack at run time, overlapped with the GPU's forward pass. XGrammar is now integrated in vLLM, SGLang and TensorRT-LLM, and grammar enforcement costs a small fraction of a decode step.</p>
+
+<div class="box interview">
+<div class="box-title">The hidden cost: constraints can distort the distribution</div>
+<p>Masking is a <em>local</em> intervention. It renormalises the model's distribution over allowed tokens at each step, which is not the same as conditioning the distribution over whole outputs on validity. If the model would naturally have written <code>{"answer": "The capital is Paris"}</code> but the schema demands an integer, the mask forces a number the model never "intended", and the probability mass it had placed on the forbidden path is spread over allowed continuations in ways that can be arbitrarily poor. Tokenisation adds a subtler effect. If the grammar allows a string but the model's preferred tokenisation of that string passes through a masked intermediate token, the model is forced into an unusual tokenisation that it rarely saw in training. Practical advice: describe the format in the prompt as well, keep schemas permissive where possible (a free-text "reasoning" field before the answer), and evaluate quality, not just validity.</p>
+</div>
+
+<details class="drill">
+<summary>Drill 4.2 — Why grammar masks must be precomputed</summary>
+<p>A naive constrained decoder checks every token of a 128,256-entry vocabulary against the grammar state at each step, at about 50 ns per token. What does this cost per step for one sequence and for a batch of 64, against a 10 ms decode step? How do engines avoid it?</p>
+<p><em>Solution.</em> One sequence: \(128{,}256\times50\) ns ≈ 6.4 ms per step, two thirds of the decode step. A batch of 64 on one CPU core: about 410 ms per step, forty times the GPU's work, so structured output would make the engine CPU-bound. Engines precompute, for each automaton state, which tokens are always allowed or always forbidden (context-independent tokens), cache the resulting bitmasks (16 KB each), check only the small set of context-dependent tokens at run time, and overlap mask computation with the GPU's forward pass, as XGrammar does (§4.7).</p>
+</details>
+
+<h2 id="s4-8">4.8 Determinism: why temperature 0 is not reproducible</h2>
+<p>A common surprise: send the same prompt with temperature 0 to an API twice, and occasionally the answers differ. Greedy decoding is a deterministic function of the logits, so the logits themselves must differ between the two runs. How can the same model on the same input produce different numbers?</p>
+<p>The root cause is that floating-point addition is not associative. In exact arithmetic \((a+b)+c=a+(b+c)\). In floating point, each addition rounds, and the rounding depends on the order. In BF16, \((2^{8}+1)-2^{8}\) evaluates to 0, because 257 is not representable and rounds back to 256, whereas \(2^{8}-2^{8}+1\) evaluates to 1. Every matrix product and reduction in a Transformer sums thousands of terms, and GPU kernels choose how to split those sums across threads, tiles and thread blocks. Different splits give results that differ in the last bits. Usually that changes nothing. But when two tokens have nearly equal logits, a last-bit difference can flip the argmax, and after one different token the two generations diverge completely.</p>
+<p>The folklore explanation was that the nondeterminism comes from concurrency, threads racing to add numbers in an unpredictable order. In 2025, He and colleagues at Thinking Machines Lab showed that this is mostly <em>not</em> the cause<span class="cite"><a href="#r-tml">[11]</a></span>. The kernels used in inference are deterministic for a given input shape: run the same batch twice and you get bit-identical results. What varies is the <em>batch</em>. A server batches your request with whatever other requests are in flight, so your sequence is processed as part of a different batch shape each time. Kernels choose different tiling and reduction strategies for different shapes, for example splitting a reduction across more thread blocks when the batch is small, to keep the GPU busy. In their terminology, the kernels are not <strong>batch-invariant</strong>. The fix is to write batch-invariant versions of the operations whose reduction order depends on batch shape. They identified RMSNorm, matrix multiplication and attention, and with such kernels demonstrated bit-reproducible generation in vLLM, at a throughput cost.</p>
+
+<figure class="diagram" id="fig-4-6">
+<svg class="dg" viewBox="0 0 720 200" role="img" aria-label="The same request in two different batches is reduced in a different order and can produce different logits">
+<text x="180" y="22" text-anchor="middle" class="t-b">Run 1: batch of 3</text>
+<text x="540" y="22" text-anchor="middle" class="t-b">Run 2: batch of 40</text>
+<line x1="360" y1="10" x2="360" y2="190" class="grid"/>
+<rect x="40" y="40" width="80" height="22" rx="4" class="bx2"/><text x="80" y="56" text-anchor="middle" class="t-xs">your request</text>
+<rect x="125" y="40" width="70" height="22" rx="4" class="fill-muted"/><rect x="200" y="40" width="70" height="22" rx="4" class="fill-muted"/>
+<text x="180" y="92" text-anchor="middle" class="t-sm">kernel picks split-K = 4</text>
+<text x="180" y="112" text-anchor="middle" class="t-xs">((a₁+…+a₂₅₆) + … ) + (… + a₁₀₂₄)</text>
+<rect x="80" y="130" width="200" height="26" rx="5" class="bx5"/><text x="180" y="148" text-anchor="middle" class="t-sm">logit("Paris") − logit("paris") = +2⁻⁹</text>
+<text x="180" y="180" text-anchor="middle" class="t-xs t-b">greedy → "Paris"</text>
+<rect x="400" y="40" width="80" height="22" rx="4" class="bx2"/><text x="440" y="56" text-anchor="middle" class="t-xs">your request</text>
+<rect x="485" y="40" width="200" height="22" rx="4" class="fill-muted"/><text x="585" y="56" text-anchor="middle" class="t-xs">39 other requests</text>
+<text x="540" y="92" text-anchor="middle" class="t-sm">kernel picks split-K = 1</text>
+<text x="540" y="112" text-anchor="middle" class="t-xs">(((a₁+a₂)+a₃)+ … +a₁₀₂₄)</text>
+<rect x="440" y="130" width="200" height="26" rx="5" class="bx5"/><text x="540" y="148" text-anchor="middle" class="t-sm">logit("Paris") − logit("paris") = −2⁻⁹</text>
+<text x="540" y="180" text-anchor="middle" class="t-xs t-b">greedy → "paris" … and the texts diverge</text>
+</svg>
+<figcaption><b>Figure 4.6 — Batch dependence, illustrated.</b> The same request processed in two batches of different sizes. The kernel chooses a different reduction strategy for each shape, the rounding differs in the last bits, and a near-tie between two tokens flips. (Numbers are illustrative.)</figcaption></figure>
+
+<p>Figure 4.6 illustrates the mechanism. In the first run your request shares a small batch, and the matrix-multiplication kernel splits each long dot product into four partial sums to keep the GPU busy. In the second run the batch is large enough that no split is needed, and the same dot product is summed in a different order. The two logits for "Paris" and "paris" were nearly tied, and the last-bit difference changes which one wins. For inference engineers the lessons are practical. Reproducibility at temperature 0 requires either batch-invariant kernels or running each request alone, at a throughput cost. Evaluations should be robust to small numerical noise. And when comparing two systems, such as an optimised kernel against a reference, compare distributions of outputs and logit errors, not exact strings.</p>
+
+<h2 id="s4-9">4.9 Stopping and streaming</h2>
+<p>The generation loop needs a termination rule. Every request stops on the model's end-of-sequence token, which chat templates map to an end-of-turn marker, and on a maximum length. Most APIs also accept <strong>stop strings</strong>, sequences of characters that end generation when produced. Stop strings are tricky because they are defined in characters, while generation proceeds in tokens. A stop string can be split across several tokens, or end in the middle of a token. The engine must therefore check the decoded <em>text</em>, not the token ids, after each step, and must hold back any trailing text that could be the beginning of a stop string until it is resolved, so that a partial stop string is never streamed to the user.</p>
+<p><strong>Streaming</strong> sends text to the client as it is generated, typically over server-sent events (an HTTP response that stays open and delivers a message per chunk). As Chapter 2 noted, converting tokens to text incrementally is itself subtle. A byte-level token may end mid-way through a multi-byte UTF-8 character, and whether a token renders with a leading space can depend on its neighbours. Engines keep a small window of recent tokens, decode the window, and emit only the newly stable suffix. With stop strings and incremental detokenisation, the text a client receives in each chunk can lag the tokens generated by one or two steps. Those few milliseconds are invisible to people but matter to latency measurements.</p>
+
+<h2 id="s4-10">4.10 Sampling meets the rest of the system</h2>
+<p>Decoding choices ripple into the serving system in three ways worth previewing. First, <strong>parallel sampling</strong>: an API request for \(n\) samples (or best-of-\(N\) reranking, or beam search) creates \(n\) sequences that share the same prompt. Their prefill need only be computed once, and their KV caches for the prompt can be shared, with copy-on-write when they diverge (Chapter 10). Second, <strong>speculative decoding</strong> (Chapter 20) verifies tokens proposed by a cheap draft model, and its guarantee of producing exactly the target distribution requires the sampling rule to be applied consistently to both models' probabilities. Truncation and penalties must be part of that calculation. Third, everything in this chapter runs <em>between</em> forward passes. Unless it is overlapped with the next step's GPU work, sampling, grammar mask computation, stop-string checks and detokenisation are pure overhead in the sense of §3.4. This is a major reason modern engines run their schedulers and samplers asynchronously (Chapter 12).</p>
+
+<h2 id="looking-ahead" class="unnumbered">Looking ahead</h2>
+<p>Part I is complete. We have followed the history that produced the decoder-only Transformer (Chapter 1), taken its computation apart (Chapter 2), costed the generation loop (Chapter 3) and filled in the last step of that loop (this chapter). Throughout, one object was treated as a given: the GPU, summarised by three numbers, peak compute \(\pi\), bandwidth \(\beta\) and capacity \(M_{\text{HBM}}\), plus an unexplained "overhead". Every optimisation in the rest of the book works by exploiting how the hardware actually behaves: tiling attention into on-chip memory, fusing kernels, overlapping communication. To understand them, we must open the machine. Chapter 5 begins Part II by explaining, from first principles, what is inside a GPU, why arithmetic is cheap and data movement expensive, and how that balance has shifted from Volta to Blackwell.</p>
+
+<h2 id="summary">Chapter summary</h2>
+<ul>
+<li>Decoding chooses a token from \(p=\operatorname{softmax}(z)\). Search (greedy, beam) seeks the most probable output; sampling seeks a representative one.</li>
+<li>For open-ended text, maximising probability causes degeneration (bland, repetitive output): human text is not high-probability text, and repetition is self-reinforcing. Search remains right for tasks with one correct answer.</li>
+<li>Temperature gives a Gibbs distribution \(p_\tau\propto e^{z/\tau}\). Entropy increases monotonically with \(\tau\) (\(dH/d\kappa=-\kappa\operatorname{Var}(z)\) with \(\kappa=1/\tau\)); \(\tau\to0\) is greedy and \(\tau\to\infty\) is uniform.</li>
+<li>Truncation removes the unreliable tail. Top-\(k\) fixes a count, top-\(p\) fixes a mass, min-\(p\) fixes a ratio to the top probability; typical and \(\eta\) sampling use entropy.</li>
+<li>Logit processors (penalties, biases, masks) run before temperature and truncation; their order matters.</li>
+<li>GPU sampling avoids sorting: the Gumbel-max trick turns sampling into an argmax; rejection-based kernels sample top-\(p\) exactly; batches are processed with per-sequence parameter vectors in fused kernels.</li>
+<li>Constrained decoding masks tokens using automata: precomputed DFA masks for regular formats, pushdown automata with cached context-independent masks (XGrammar) for grammars, plus jump-forward for forced text. It guarantees validity but can distort the distribution.</li>
+<li>Temperature-0 outputs vary because kernels are not batch-invariant: different batch shapes give different reduction orders and last-bit differences flip near-ties. Batch-invariant kernels restore reproducibility at a throughput cost.</li>
+<li>Stop strings and incremental detokenisation must be handled on text, with a small hold-back window, before streaming.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+<div class="mcq" data-id="ch04-mcq-01" data-topic="§4.1 Decision problem">
+<p class="q">Which decoding goal corresponds to a <em>search</em> problem?</p>
+<ol class="opts"><li>Producing a varied, human-like story</li><li data-correct>Finding \(\arg\max_y p(y\mid x)\), the single most probable output sequence</li><li>Drawing \(y\sim p(\cdot\mid x)\)</li><li>Producing \(n\) diverse samples</li></ol>
+<div class="explain">Search maximises over an exponentially large set of sequences; sampling draws from the distribution.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-02" data-topic="§4.2 Greedy">
+<p class="q">Greedy decoding is equivalent to sampling with temperature:</p>
+<ol class="opts"><li>\(\tau=1\)</li><li data-correct>\(\tau\to0\)</li><li>\(\tau\to\infty\)</li><li>\(\tau=0.5\)</li></ol>
+<div class="explain">As \(\tau\to0\), \(p_\tau\) concentrates all mass on \(\arg\max_v z_v\).</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-03" data-topic="§4.2 Beam search">
+<p class="q">Why does beam search usually normalise hypothesis scores by length?</p>
+<ol class="opts"><li>To make scores positive</li><li data-correct>Each extra token multiplies probability by a number &lt; 1, so unnormalised scores systematically favour short outputs</li><li>To reduce memory</li><li>To enable sampling</li></ol>
+<div class="explain">Cumulative log-probability only decreases with length; dividing by (a power of) length removes the bias towards stopping early.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-04" data-topic="§4.2 Beam search">
+<p class="q">Beam search with width \(n_{\text{beam}}\) costs, relative to greedy decoding, about:</p>
+<ol class="opts"><li>The same compute</li><li data-correct>\(n_{\text{beam}}\) times the decode compute and \(n_{\text{beam}}\) live sequences, with a shareable common prefix</li><li>\(n_{\text{beam}}^2\) times the compute</li><li>\(|\mathcal V|\) times the compute</li></ol>
+<div class="explain">Each hypothesis needs its own forward pass per step and its own cache beyond the shared prefix (copy-on-write, Chapter 10).</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-05" data-topic="§4.2 Degeneration">
+<p class="q">Which are reasons maximisation-based decoding degenerates in open-ended generation? (select all that apply)</p>
+<ol class="opts"><li data-correct>Human-written text is not uniformly high-probability under the model</li><li data-correct>Repetition is self-reinforcing: once a phrase appears, copying it becomes more probable</li><li>Beam search uses too little memory</li><li data-correct>The mode of the sequence distribution is often bland or degenerate (even empty in translation)</li></ol>
+<div class="explain">Holtzman et al. (2019) and the "beam search curse" (Stahlberg &amp; Byrne 2019). Memory is irrelevant.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-06" data-topic="§4.3 Temperature">
+<p class="q">Under temperature \(\tau\), the ratio \(p_\tau(v)/p_\tau(u)\) equals:</p>
+<ol class="opts"><li>\(p(v)/p(u)\)</li><li data-correct>\((p(v)/p(u))^{1/\tau}\)</li><li>\(\tau\,p(v)/p(u)\)</li><li>\((p(v)/p(u))^{\tau}\)</li></ol>
+<div class="explain">\(\exp((z_v-z_u)/\tau)=(e^{z_v-z_u})^{1/\tau}\). Ranking is preserved; contrasts are sharpened (\(\tau&lt;1\)) or softened (\(\tau&gt;1\)).</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-07" data-topic="§4.3 Temperature">
+<p class="q">With \(\kappa=1/\tau\), the derivative of the entropy of \(p_\kappa\propto e^{\kappa z}\) is:</p>
+<ol class="opts"><li>\(+\kappa\operatorname{Var}(z)\)</li><li data-correct>\(-\kappa\operatorname{Var}_{p_\kappa}(z)\)</li><li>\(-\mathbb E[z]\)</li><li>0</li></ol>
+<div class="explain">From \(H=\log Z-\kappa\mathbb E[z]\) and the exponential-family identities. Entropy falls as \(\kappa\) rises, i.e. rises with \(\tau\).</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-08" data-topic="§4.3 Temperature">
+<p class="q">Why is lowering temperature alone an unsatisfactory fix for occasional bizarre tokens?</p>
+<ol class="opts"><li>It changes the ranking of tokens</li><li data-correct>It acts on the whole distribution, so suppressing the tail also makes the head more deterministic and reduces diversity where the model was legitimately uncertain</li><li>It is expensive to compute</li><li>It only works for greedy decoding</li></ol>
+<div class="explain">Truncation removes the tail while leaving the head's relative probabilities intact.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-09" data-topic="§4.3 Tail risk">
+<p class="q">If each step has a 2% chance of drawing a "tail" token, the probability that a 200-token answer contains none is about:</p>
+<ol class="opts"><li>98%</li><li>50%</li><li data-correct>1.8%</li><li>0.02%</li></ol>
+<div class="explain">\(0.98^{200}=e^{200\ln0.98}\approx e^{-4.04}\approx0.018\). Small per-step risks compound over long outputs.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-10" data-topic="§4.4 Top-k">
+<p class="q">The main weakness of top-\(k\) sampling is that:</p>
+<ol class="opts"><li>It requires a full sort</li><li data-correct>A fixed count is too large when the model is confident and too small when it is uncertain</li><li>It is not a valid distribution</li><li>It cannot be combined with temperature</li></ol>
+<div class="explain">Top-\(p\) and min-\(p\) adapt the kept set to the shape of the distribution.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-11" data-topic="§4.4 Top-p">
+<p class="q">Nucleus (top-\(p\)) sampling with \(p_{\text{top}}=0.9\) keeps:</p>
+<ol class="opts"><li>All tokens with probability ≥ 0.9</li><li data-correct>The smallest set of most-likely tokens whose cumulative probability reaches 0.9</li><li>90% of the vocabulary</li><li>The top 90 tokens</li></ol>
+<div class="explain">Sort by probability, accumulate until the total reaches \(p_{\text{top}}\), renormalise over that nucleus.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-12" data-topic="§4.4 Min-p">
+<p class="q">Min-\(p\) with \(p_{\min}=0.1\) keeps a token \(v\) if:</p>
+<ol class="opts"><li>\(p(v)\ge0.1\)</li><li data-correct>\(p(v)\ge 0.1\cdot\max_u p(u)\)</li><li>It is among the top 10%</li><li>Its surprisal is below 0.1</li></ol>
+<div class="explain">The threshold scales with the model's confidence, which keeps sampling coherent at high temperatures.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-13" data-topic="§4.4 Truncation">
+<p class="q">On a very flat distribution (top token 2.7%), which rule tends to admit the longest tail?</p>
+<ol class="opts"><li>top-\(k\) with \(n_{\text{top}}=40\)</li><li data-correct>top-\(p\) with \(p_{\text{top}}=0.9\)</li><li>min-\(p\) with \(p_{\min}=0.1\)</li><li>greedy</li></ol>
+<div class="explain">In the chapter's example top-\(p\) keeps 779 tokens to reach 90% of mass, versus 46 for min-\(p\).</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-14" data-topic="§4.4 Typical">
+<p class="q">Typical sampling differs from top-\(p\) in that it can:</p>
+<ol class="opts"><li>Never exclude any token</li><li data-correct>Exclude the single most likely token if its surprisal is far below the distribution's entropy</li><li>Only be used with beam search</li><li>Change the logits</li></ol>
+<div class="explain">It keeps tokens whose \(-\log p(v)\) is close to \(H(p)\), motivated by the roughly constant information rate of human text.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-15" data-topic="§4.5 Penalties">
+<p class="q">A frequency penalty differs from a presence penalty because it:</p>
+<ol class="opts"><li>Applies only to the prompt</li><li data-correct>Scales with the number of times a token has already appeared, rather than applying once if it appeared at all</li><li>Multiplies logits instead of adding</li><li>Only affects stop tokens</li></ol>
+<div class="explain">Presence: subtract a constant if count ≥ 1. Frequency: subtract a constant × count.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-16" data-topic="§4.5 Logit bias">
+<p class="q">Setting a token's logit bias to \(-\infty\):</p>
+<ol class="opts"><li>Makes it the most likely token</li><li data-correct>Bans it: its probability becomes exactly 0 after the softmax</li><li>Has no effect at temperature 0</li><li>Only affects log-prob reporting</li></ol>
+<div class="explain">\(e^{-\infty}=0\). This is the same mechanism used for grammar masks.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-17" data-topic="§4.5 Pipeline order">
+<p class="q">Why does the order "temperature, then top-\(p\)" give different results from "top-\(p\), then temperature"?</p>
+<ol class="opts"><li>It doesn't; they commute</li><li data-correct>Top-\(p\) depends on the shape of the distribution, which temperature changes; a higher temperature applied first widens the nucleus</li><li>Temperature changes the ranking</li><li>Only for greedy decoding</li></ol>
+<div class="explain">Temperature preserves order but not cumulative masses, so the nucleus boundary moves.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-18" data-topic="§4.6 GPU sampling">
+<p class="q">The Gumbel-max trick samples from \(\operatorname{softmax}(z)\) by computing:</p>
+<ol class="opts"><li>A cumulative sum and a binary search</li><li data-correct>\(\arg\max_v(z_v+\xi_v)\) with i.i.d. standard Gumbel noise \(\xi_v\)</li><li>A full sort of the logits</li><li>The mean of \(z\)</li></ol>
+<div class="explain">It turns sampling into a single parallel max-reduction, with no normalisation or prefix sum.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-19" data-topic="§4.6 GPU sampling">
+<p class="q">Rejection-based top-\(p\) samplers (e.g. FlashInfer) avoid sorting by:</p>
+<ol class="opts"><li>Approximating the nucleus with top-\(k\)</li><li data-correct>Drawing a candidate, checking with a parallel reduction whether it lies in the nucleus, and if not redrawing among tokens more probable than it</li><li>Using the CPU</li><li>Caching last step's nucleus</li></ol>
+<div class="explain">Each round shrinks the candidate set; the output is exactly distributed as top-\(p\) sampling, typically within a few rounds fused in one kernel.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-20" data-topic="§4.6 GPU sampling">
+<p class="q">For \(B=256\) and \(|\mathcal V|=128{,}256\), one step's FP32 logits occupy about:</p>
+<ol class="opts"><li>1.3 MB</li><li>13 MB</li><li data-correct>131 MB</li><li>1.3 GB</li></ol>
+<div class="explain">\(256\times128{,}256\times4\) B ≈ 131 MB, processed several times per step by the pipeline, so it must be fused and batched.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-21" data-topic="§4.6 Random numbers">
+<p class="q">Why do GPU samplers use counter-based PRNGs (e.g. Philox) keyed by seed and step?</p>
+<ol class="opts"><li>They are cryptographically secure</li><li data-correct>Thousands of threads can generate independent numbers without shared state, and a request's draws can be made independent of its batch neighbours</li><li>They are faster than reading memory</li><li>They avoid floating-point error</li></ol>
+<div class="explain">The \(n\)-th number is a pure function of (key, counter), so it is reproducible and parallel.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-22" data-topic="§4.7 Constrained decoding">
+<p class="q">For a format given by a regular expression, constrained decoding precomputes:</p>
+<ol class="opts"><li>All valid output strings</li><li data-correct>For each state of the compiled DFA, the set of vocabulary tokens whose characters can be read from that state</li><li>A fine-tuned model</li><li>The probability of each valid output</li></ol>
+<div class="explain">This is the Outlines index: decoding then needs only a per-step lookup and mask.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-23" data-topic="§4.7 Grammars">
+<p class="q">Why do JSON schemas with nested objects need pushdown automata rather than DFAs?</p>
+<ol class="opts"><li>JSON uses Unicode</li><li data-correct>Matching arbitrarily nested brackets requires unbounded memory (a stack); such languages are context-free, not regular</li><li>DFAs cannot handle numbers</li><li>Pushdown automata are faster</li></ol>
+<div class="explain">Balanced brackets are the classic non-regular language.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-24" data-topic="§4.7 XGrammar">
+<p class="q">XGrammar's key optimisation is that:</p>
+<ol class="opts"><li>It runs the grammar on the GPU</li><li data-correct>Most tokens' validity depends only on the current automaton position (context-independent), so their masks can be precomputed; only a small remainder is checked against the stack at run time</li><li>It removes the need for masking</li><li>It uses a smaller vocabulary</li></ol>
+<div class="explain">The authors report usually over 99% of tokens are context-independent; run-time checks are overlapped with the forward pass.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-25" data-topic="§4.7 Jump-forward">
+<p class="q">Jump-forward decoding speeds up structured generation by:</p>
+<ol class="opts"><li>Skipping the LM head</li><li data-correct>Appending text that the grammar forces (only one continuation possible) without running the model to generate it token by token</li><li>Sampling several tokens per step at random</li><li>Using a draft model</li></ol>
+<div class="explain">Boilerplate such as JSON keys and punctuation can be inserted directly, saving forward passes.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-26" data-topic="§4.7 Distortion">
+<p class="q">Per-step masking for a grammar produces outputs distributed as:</p>
+<ol class="opts"><li>Exactly \(p(y\mid x, y\text{ valid})\)</li><li data-correct>A locally renormalised distribution that generally differs from conditioning the sequence distribution on validity</li><li>The unconstrained distribution</li><li>Uniform over valid outputs</li></ol>
+<div class="explain">Masking renormalises step by step; mass on paths that later become invalid is redistributed locally, which can distort the output.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-27" data-topic="§4.8 Determinism">
+<p class="q">In BF16, \((256+1)-256\) evaluates to:</p>
+<ol class="opts"><li>1</li><li data-correct>0</li><li>257</li><li>NaN</li></ol>
+<div class="explain">BF16 has 8 significant bits; 257 is not representable and rounds to 256. Order of operations changes results.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-28" data-topic="§4.8 Determinism">
+<p class="q">According to Thinking Machines Lab (2025), the main reason temperature-0 API outputs vary between identical requests is:</p>
+<ol class="opts"><li>Random seeds</li><li>Threads racing in atomic additions</li><li data-correct>Kernels are not batch-invariant: the request is batched with different other requests, changing kernel reduction strategies and hence the last bits of the logits</li><li>Hardware faults</li></ol>
+<div class="explain">Kernels are deterministic for a fixed shape; it is the varying batch shape that changes the arithmetic.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-29" data-topic="§4.8 Determinism">
+<p class="q">Which operations did the batch-invariance work identify as needing batch-invariant implementations? (select all that apply)</p>
+<ol class="opts"><li data-correct>RMSNorm</li><li data-correct>Matrix multiplication</li><li data-correct>Attention</li><li>Embedding lookup</li></ol>
+<div class="explain">All three contain reductions whose split strategy can depend on batch shape. A lookup has no reduction.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-30" data-topic="§4.9 Stop strings">
+<p class="q">Why must stop strings be checked on decoded text with a hold-back buffer?</p>
+<ol class="opts"><li>Tokenisation is random</li><li data-correct>A stop string can span several tokens or end mid-token, so the engine must avoid streaming text that might turn out to be the start of a stop string</li><li>Stop strings are case-insensitive</li><li>The model cannot see stop strings</li></ol>
+<div class="explain">Text that could still match must be held until it is resolved, then either emitted or dropped.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-31" data-topic="§4.10 Parallel sampling">
+<p class="q">An API request asks for \(n=4\) samples of a 3,000-token prompt. A good engine:</p>
+<ol class="opts"><li>Prefills the prompt 4 times</li><li data-correct>Prefills once and shares the prompt's KV cache among the 4 sequences, copying only blocks that diverge</li><li>Runs the 4 samples on 4 GPUs</li><li>Uses beam search</li></ol>
+<div class="explain">Prefix sharing with copy-on-write (Chapter 10) saves 3 prefills and 3× the prompt's cache memory.</div>
+</div>
+
+<div class="mcq" data-id="ch04-mcq-32" data-topic="§4.10 Overhead">
+<p class="q">Why do modern engines run sampling, grammar-mask computation and detokenisation asynchronously with the GPU forward pass?</p>
+<ol class="opts"><li>To improve accuracy</li><li data-correct>Otherwise this CPU-side work sits between forward passes as pure overhead, idling the GPU</li><li>Because the GPU cannot sample</li><li>To reduce memory</li></ol>
+<div class="explain">Overlap hides per-step CPU costs, which at small batch can rival the step's memory time (§3.4).</div>
+</div>
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+<details class="qa" data-id="ch04-qa-01">
+<summary><span class="lvl warm">Warm-up</span> What does temperature do, and what happens at \(\tau\to0\) and \(\tau\to\infty\)?</summary>
+<div class="answer">
+<p>Temperature divides the logits before the softmax: \(p_\tau(v)\propto e^{z_v/\tau}\), a Gibbs distribution with inverse temperature \(1/\tau\). It preserves the ranking of tokens but raises probability ratios to the power \(1/\tau\). As \(\tau\to0\) the distribution concentrates on the argmax (greedy decoding). At \(\tau=1\) it is the model's distribution. As \(\tau\to\infty\) it tends to uniform. Entropy increases monotonically with \(\tau\) (\(dH/d\kappa=-\kappa\operatorname{Var}(z)\), \(\kappa=1/\tau\)). Practical ranges are roughly 0 to 1.2; above that, truncation such as min-\(p\) is needed to avoid noise.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch04-qa-02">
+<summary><span class="lvl warm">Warm-up</span> Compare top-\(k\), top-\(p\) and min-\(p\). When would you use each?</summary>
+<div class="answer">
+<p><strong>Top-\(k\)</strong> keeps a fixed number of tokens: simple and cheap to bound, but blind to how peaked the distribution is. <strong>Top-\(p\)</strong> keeps the smallest set reaching cumulative mass \(p_{\text{top}}\): it adapts to confidence and is the most common default (often 0.9–0.95), but on flat distributions or at high temperature it admits a long tail. <strong>Min-\(p\)</strong> keeps tokens with \(p(v)\ge p_{\min}\max_u p(u)\): it adapts to confidence and stays selective when flat, so it is a good choice for creative generation at higher temperature. Engines commonly allow combining them, e.g. top-\(k\) as a cheap pre-filter, then top-\(p\) or min-\(p\).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch04-qa-03">
+<summary><span class="lvl core">Core</span> Why does beam search, which finds higher-probability outputs, produce worse open-ended text than sampling?</summary>
+<div class="answer">
+<p>(1) Human text is not maximum-probability text: people choose informative, less predictable words, and the per-token probability of human text under a model fluctuates, while beam output is uniformly high-probability and therefore bland. (2) Repetition is self-reinforcing in Transformers (induction/copying heads): once a phrase appears, repeating it becomes likelier, and a maximiser locks into loops. (3) The mode of the sequence distribution can be degenerate. In translation, exact search often returns the empty string (the "beam search curse"), and beam search works partly because it searches badly. Hence open-ended generation uses sampling with truncation, and search is kept for tasks with one correct answer or short constrained outputs.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch04-qa-04">
+<summary><span class="lvl core">Core</span> Implement top-\(p\) sampling for a batch of logits in PyTorch. What is its cost, and how do production kernels avoid it?</summary>
+<div class="answer">
+<pre><code>def top_p_sample(logits, top_p, temperature):      # logits: (B, V); top_p, temperature: (B,)
+    probs = torch.softmax(logits / temperature[:, None], dim=-1)
+    sorted_p, idx = probs.sort(dim=-1, descending=True)
+    cum = sorted_p.cumsum(dim=-1)
+    remove = cum - sorted_p &gt; top_p[:, None]          # keep tokens until mass reaches top_p
+    sorted_p = sorted_p.masked_fill(remove, 0.0)
+    choice = torch.multinomial(sorted_p / sorted_p.sum(-1, keepdim=True), 1)
+    return idx.gather(-1, choice).squeeze(-1)</code></pre>
+<p>Cost: a sort of \(|\mathcal V|\) elements per row (\(O(|\mathcal V|\log|\mathcal V|)\) work, several passes over memory) plus a cumulative sum, which is heavy when \(|\mathcal V|=128\)k and \(B\) is in the hundreds. Production kernels avoid the sort with rejection sampling (draw a candidate, check membership in the nucleus with a parallel reduction of the mass of more-probable tokens, retry among more-probable tokens) or with Gumbel-max sampling over a pre-filtered set, fused into one kernel with per-sequence parameters.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch04-qa-05">
+<summary><span class="lvl core">Core</span> Prove the Gumbel-max trick and explain why it suits GPUs.</summary>
+<div class="answer">
+<p>Let \(\xi_v\) be i.i.d. Gumbel(0,1), with CDF \(F(x)=\exp(-e^{-x})\) and density \(f(x)=e^{-x}F(x)\). The probability that \(v\) wins is \(\int f(s-z_v)\prod_{u\ne v}F(s-z_u)\,ds=\int e^{-(s-z_v)}\exp\!\big(-e^{-s}\sum_u e^{z_u}\big)ds\). Substituting \(w=e^{-s}\) gives \(e^{z_v}\int_0^\infty e^{-w\sum_ue^{z_u}}dw=e^{z_v}/\sum_ue^{z_u}\). ∎ GPU suitability: noise generation is embarrassingly parallel (counter-based PRNG), and the rest is a single argmax reduction, with no normalisation, prefix sum or sort. It composes with masking (add \(-\infty\)) and with top-\(k\) pre-filters.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch04-qa-06">
+<summary><span class="lvl core">Core</span> Explain how constrained (grammar-based) decoding works end to end for a JSON schema.</summary>
+<div class="answer">
+<p>(1) Compile the schema to a grammar: regular parts (strings, numbers, enums) become DFAs; nesting requires a context-free grammar and a pushdown automaton (PDA). (2) Precompute token masks. For DFA states, the set of tokens whose characters can be consumed from that state (Outlines index). For PDAs, XGrammar precomputes masks for context-independent tokens (validity depends only on the current position, usually more than 99%) and checks the rest against the stack at run time. (3) At each decode step, compute the mask for the current state (on the CPU, overlapped with the GPU forward pass), set disallowed logits to \(-\infty\), apply sampling, then advance the automaton by the chosen token's characters. (4) Jump-forward: when the automaton forces a unique continuation, append it without decoding. (5) Handle tokenisation boundaries, rollback for speculative decoding, and end-of-sequence only in accepting states. Caveat: local masking can distort the distribution, so describe the format in the prompt too.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch04-qa-07">
+<summary><span class="lvl deep">Deep-dive</span> Why is "temperature 0" not deterministic in production, and how would you make it deterministic?</summary>
+<div class="answer">
+<p>Greedy decoding is deterministic given the logits, so the logits must vary. Floating-point addition is non-associative; kernels for matmul, attention and normalisation choose reduction strategies (split-K, number of thread blocks, tile sizes) that depend on the input shape, chiefly the batch size, which depends on server load. A request batched with different neighbours is therefore reduced in a different order, and last-bit differences flip near-ties, after which the generations diverge. (Thinking Machines Lab showed this, rather than atomics, is the dominant cause.) Fixes: (a) batch-invariant kernels with a fixed reduction order regardless of batch size (they named RMSNorm, matmul and attention), at a throughput cost; (b) process each request alone or in fixed-shape batches; (c) fixed seeds and counter-based PRNGs for sampled decoding; (d) pin kernel versions and hardware. Also make evaluations robust: compare distributions or use multiple seeds.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch04-qa-08">
+<summary><span class="lvl core">Core</span> What are repetition, presence and frequency penalties, and what are their failure modes?</summary>
+<div class="answer">
+<p>Repetition penalty (CTRL): for tokens already in the context, divide positive logits by \(\rho&gt;1\) (multiply negative ones by \(\rho\)). Presence penalty: subtract a constant from tokens that have appeared at least once. Frequency penalty: subtract a constant times the occurrence count. They counter degenerate loops but are content-blind: they penalise legitimate repetition (variable names in code, the subject of an essay, required JSON keys) and, at high values, push the model towards rare synonyms or off-topic tokens. They also interact with structured output (penalising required tokens) and need per-sequence token-count state on the GPU. Prefer moderate truncation sampling first; use penalties sparingly.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch04-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Does grammar-constrained decoding sample from \(p(y\mid x, y\in\mathcal G)\)? If not, what does it sample from?</summary>
+<div class="answer">
+<p>No. Masked decoding samples \(y_t\) from \(p(y_t\mid y_{&lt;t},x)\) restricted to tokens that keep the prefix completable, renormalised at each step: \(q(y)=\prod_t p(y_t\mid y_{&lt;t})\mathbb 1[y_{\le t}\text{ viable}]/Z_t(y_{&lt;t})\). The true conditional is \(p(y)\mathbb 1[y\in\mathcal G]/Z\), with one global normaliser. These differ whenever the probability of eventually completing validly varies across viable prefixes. Masking ignores that the model may assign most of its mass to prefixes that become awkward later. Exact conditional sampling would require weighting each step by the probability of eventually completing validly (as in sequential Monte Carlo or importance sampling approaches), which is far more expensive. In practice, prompting the format, permissive schemas, and allowing free-text reasoning fields before constrained fields reduce the distortion.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch04-qa-10">
+<summary><span class="lvl core">Core</span> How do stop sequences and streaming interact? Describe a correct implementation.</summary>
+<div class="answer">
+<p>Generation is in tokens, stop sequences are in characters. After each step: append the token, incrementally detokenise (decode a small window of recent tokens and take the new stable suffix, which handles split UTF-8 and leading-space rules), append to a pending text buffer, and scan the buffer for any stop string. If found, truncate at it, finish the request and free its cache. Otherwise, emit everything except the longest suffix that is a prefix of some stop string (hold back possibly-partial matches). Also stop on end-of-sequence and max tokens. Stream emitted text via server-sent events. Edge cases: stop strings inside a single token, multiple stop strings, and reporting finish_reason and token counts correctly.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch04-qa-11">
+<summary><span class="lvl design">Design</span> Design the sampling stage of an inference engine serving 256 concurrent sequences with heterogeneous parameters (temperature, top-p, penalties, seeds, JSON schemas).</summary>
+<div class="answer">
+<ul>
+<li><strong>Data layout:</strong> logits \((B,|\mathcal V|)\) in FP32; per-sequence parameter tensors (τ, top-p, top-k, min-p, penalty values, seeds, step counters) on the GPU; per-sequence token-count state for penalties (sparse, or a dense \(B\times|\mathcal V|\) count matrix if memory allows).</li>
+<li><strong>Kernels:</strong> one fused kernel for penalties, bias and mask application, then temperature; a sort-free sampler (rejection top-p/top-k, Gumbel-max) with per-row parameters; greedy rows take a fast argmax path.</li>
+<li><strong>Grammars:</strong> compile schemas once and cache them (XGrammar); compute next-step bitmasks on CPU threads while the GPU runs the forward pass; apply as a bitmask \((B, |\mathcal V|/32)\); support jump-forward and rollback.</li>
+<li><strong>Randomness:</strong> counter-based PRNG keyed by (seed, request id, step) for batch-independent reproducibility.</li>
+<li><strong>Outputs:</strong> token ids plus optional top-\(n\) logprobs; asynchronous detokenisation and stop-string handling in a separate process.</li>
+<li><strong>Interactions:</strong> speculative decoding needs processed probabilities for draft and target; parallel sampling shares prompt KV.</li>
+<li><strong>Budget:</strong> sampling should take well under 5% of a decode step; measure with a profiler at small and large batch.</li>
+</ul>
+</div>
+</details>
+
+<details class="qa" data-id="ch04-qa-12">
+<summary><span class="lvl core">Core</span> A product team wants "creative but coherent" outputs. What settings do you recommend, and how would you validate them?</summary>
+<div class="answer">
+<p>Start with temperature 0.8–1.0 with top-\(p\) 0.9–0.95, or a higher temperature (1.0–1.5) with min-\(p\) 0.05–0.1, which keeps coherence at higher diversity. Avoid strong repetition penalties; use a mild frequency penalty only if loops appear. Validate with a held-out prompt set: human or LLM-judge preference ratings, diversity metrics (distinct-n, self-BLEU across samples), degeneration rates (repetition, off-topic), and task-specific checks. Run A/B tests, since sampling choices can matter as much as model changes. Also check the interaction with any system prompt and with structured parts of the output.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch04-qa-13">
+<summary><span class="lvl deep">Deep-dive</span> What does jump-forward decoding save, and when can it backfire?</summary>
+<div class="answer">
+<p>When the grammar admits only one continuation (JSON keys, punctuation, fixed field names), the engine appends those characters without running the model, saving one forward pass per forced token and reducing latency for schema-heavy outputs. Pitfalls: (1) tokenisation. The forced text must be re-tokenised and appended to the KV cache (a short prefill), and the tokenisation chosen may differ from what the model would have produced, which slightly shifts later predictions. Engines may retokenise the boundary region. (2) Interaction with speculative decoding and with logprob reporting (no logprobs for jumped tokens). (3) If the forced string is long, the "prefill" of jumped tokens is cheap but not free. Overall a large win for verbose schemas.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch04-qa-14">
+<summary><span class="lvl warm">Warm-up</span> What are logprobs in an LLM API, and why might two engines report different values for the same model?</summary>
+<div class="answer">
+<p>Logprobs are the log-probabilities the model assigns to the chosen token (and optionally the top-\(n\) alternatives) at each step, used for evaluation, confidence estimation and calibration. Differences across engines come from: reporting before or after logit processing (temperature, penalties, masks); numerical differences from kernels and precision (BF16 versus FP32 logits; non-batch-invariant reductions); quantisation of weights or KV cache; and different chat templates or tokenisation, which change the context itself.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch04-qa-15">
+<summary><span class="lvl design">Design</span> An agent makes 50 tool calls per task and fails about 5% of tasks because a call's JSON arguments do not parse. What do you do?</summary>
+<div class="answer">
+<p>Per-call failure \(f\) gives task failure \(1-(1-f)^{50}\approx5\%\), so \(f\approx0.1\%\). Fix validity by construction: enable grammar-constrained decoding from the tool's JSON schema (XGrammar or Outlines through the engine's structured-output API), which drives parse failures to zero. Then guard against quality distortion: keep schemas permissive where possible, put a free-text reasoning or "thought" field before the arguments if allowed, include the schema in the prompt, and measure argument correctness, not just validity. Use greedy or low-temperature decoding for tool calls. Make sure the grammar overhead is hidden (mask computation overlapped with the forward pass) and that jump-forward is enabled for keys. Monitor parse rates and argument errors in production.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-holtzman">A. Holtzman, J. Buys, L. Du, M. Forbes, Y. Choi. The Curious Case of Neural Text Degeneration. <em>ICLR</em>, 2020. <a href="https://arxiv.org/abs/1904.09751">arXiv:1904.09751</a>.</li>
+<li id="r-stahlberg">F. Stahlberg and B. Byrne. On NMT Search Errors and Model Errors: Cat Got Your Tongue? <em>EMNLP</em>, 2019. <a href="https://arxiv.org/abs/1908.10090">arXiv:1908.10090</a>.</li>
+<li id="r-fan">A. Fan, M. Lewis, Y. Dauphin. Hierarchical Neural Story Generation. <em>ACL</em>, 2018. <a href="https://arxiv.org/abs/1805.04833">arXiv:1805.04833</a>.</li>
+<li id="r-minp">M. N. Nguyen et al. Turning Up the Heat: Min-p Sampling for Creative and Coherent LLM Outputs. 2024. <a href="https://arxiv.org/abs/2407.01082">arXiv:2407.01082</a>.</li>
+<li id="r-typical">C. Meister, T. Pimentel, G. Wiher, R. Cotterell. Locally Typical Sampling. <em>TACL</em>, 2023. <a href="https://arxiv.org/abs/2202.00666">arXiv:2202.00666</a>.</li>
+<li id="r-eta">J. Hewitt, C. D. Manning, P. Liang. Truncation Sampling as Language Model Desmoothing. <em>Findings of EMNLP</em>, 2022. <a href="https://arxiv.org/abs/2210.15191">arXiv:2210.15191</a>.</li>
+<li id="r-ctrl">N. S. Keskar et al. CTRL: A Conditional Transformer Language Model for Controllable Generation. 2019. <a href="https://arxiv.org/abs/1909.05858">arXiv:1909.05858</a>.</li>
+<li id="r-flashinfer">FlashInfer sampling API documentation (sorting-free rejection sampling for top-k/top-p). <a href="https://docs.flashinfer.ai/api/sampling.html">docs.flashinfer.ai</a>; Z. Ye et al. FlashInfer: Efficient and Customizable Attention Engine for LLM Inference Serving. 2025. <a href="https://arxiv.org/abs/2501.01005">arXiv:2501.01005</a>.</li>
+<li id="r-outlines">B. T. Willard and R. Louf. Efficient Guided Generation for Large Language Models. 2023. <a href="https://arxiv.org/abs/2307.09702">arXiv:2307.09702</a>.</li>
+<li id="r-xgrammar">Y. Dong et al. XGrammar: Flexible and Efficient Structured Generation Engine for Large Language Models. 2024. <a href="https://arxiv.org/abs/2411.15100">arXiv:2411.15100</a>; MLC blog post, <a href="https://blog.mlc.ai/2024/11/22/achieving-efficient-flexible-portable-structured-generation-with-xgrammar">blog.mlc.ai</a>.</li>
+<li id="r-tml">H. He and Thinking Machines Lab. Defeating Nondeterminism in LLM Inference. Thinking Machines Lab: Connectionism, September 2025.</li>
+<li>E. J. Gumbel. Statistical Theory of Extreme Values and Some Practical Applications. 1954; C. J. Maddison, D. Tarlow, T. Minka. A* Sampling. <em>NeurIPS</em>, 2014 (Gumbel-max in machine learning).</li>
+<li>L. Zheng et al. SGLang: Efficient Execution of Structured Language Model Programs (jump-forward decoding). 2024. <a href="https://arxiv.org/abs/2312.07104">arXiv:2312.07104</a>.</li>
+<li>J. K. Salmon, M. A. Moraes, R. O. Dror, D. E. Shaw. Parallel Random Numbers: As Easy as 1, 2, 3. <em>SC</em>, 2011.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

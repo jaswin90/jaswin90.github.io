@@ -1,0 +1,587 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 6 · Search and Planning — Foundations of Agentic AI</title>
+<meta name="description" content="Chapter 6 of Foundations of Agentic AI: best-of-n and verifier quality, reward over-optimisation, Tree of Thoughts, Monte Carlo tree search and LATS, plan-and-execute, LLM plus classical planners, and the cost of search.">
+<script>try{var t=localStorage.getItem('aai-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script defer src="/library/assets/book-shim.js" data-library="/library/" data-field="/library/AI_Engineering/" data-field-title="AI Engineering"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-chapter="ch06" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Part II · Reasoning and Planning — Chapter 6</div>
+<h1 id="top">Search and Planning</h1>
+<p class="lede">A chain of thought follows one path; voting follows several and counts heads. Real problems branch, and the best way through them is often to try something, judge where it leads, and back up. This chapter brings the search algorithms of classical AI back into the language-model era, and asks the question that decides whether they help: how good is the judge?</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Chapter 5 showed that spending more computation on a decision raises its accuracy, through longer reasoning or through voting over independent attempts. Both have the same blind spot. A single chain cannot go back: once it commits to a wrong approach it rarely recovers. Voting cannot recognise quality: a single brilliant solution among many mediocre ones is outvoted, and on free-form outputs such as code or plans there is nothing to vote on. What is missing is an <em>evaluator</em>, something that can look at a partial or complete solution and say how good it is, and a <em>search procedure</em> that uses the evaluator to decide where to spend effort.</p>
+<p>This is the combination that made AlphaGo work (§1.5): a learned policy proposing moves, a learned value function judging positions, and Monte Carlo tree search allocating simulations between them. It is also the structure of the classical planners of §1.3, with a heuristic in place of the value function. This chapter rebuilds that structure with language models in every role: as the proposer of candidate thoughts or actions, as the evaluator of their promise, and, in some designs, as the translator that hands a problem to a classical planner. We will see that the benefit of search is governed by a simple quantity, the gap between how well a model can generate solutions and how well something can verify them, and we will compute what search costs, which for agents acting in real environments can be prohibitive.</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Analyse best-of-\(n\) sampling with a perfect and an imperfect verifier, and derive its accuracy ceiling.</li>
+<li>Explain reward-model over-optimisation and the KL cost of best-of-\(n\).</li>
+<li>Describe Tree of Thoughts and its breadth-first and depth-first variants, with the evidence for them.</li>
+<li>State the UCT rule of Monte Carlo tree search and explain how LATS applies it to agents.</li>
+<li>Compare plan-and-execute agents, LLM-generated plans checked by classical planners, and the evidence on whether LLMs can plan.</li>
+<li>Compute the cost of a search strategy, and state the conditions (reversibility, verifier quality, budget) under which search helps an agent.</li>
+</ol>
+</div>
+<p>We use pass@\(k\) (§1.10), the decision-process view (Chapter 2), and self-consistency and test-time scaling (§5.4, §5.7).</p>
+
+<h2 id="s6-1">6.1 From sampling to search</h2>
+<p>Consider the coding agent facing a bug that has three plausible causes. A single chain of reasoning picks one, writes a fix, and runs the tests; if the fix fails, it has spent most of its budget on the wrong path. Self-consistency would have the agent generate several complete fixes and pick the most common, which is useless when the fixes are all different and only one is right. What a human engineer does instead is different from both: consider the three hypotheses, run a quick check for each (add a print statement, read the relevant function), drop the two that the checks rule out, and invest effort in the survivor. That is search: generate options, evaluate them cheaply, expand the promising ones, and abandon the rest.</p>
+<p>Every search method in this chapter has the same three ingredients, and it helps to name them before meeting the variants. A <strong>generator</strong> proposes candidates: complete solutions, partial solutions (thoughts), or actions in an environment. An <strong>evaluator</strong> scores them: a test suite, a learned reward model, the language model itself asked "how promising is this?", or the environment's response. A <strong>search strategy</strong> decides which candidates to expand, given the scores and a budget: sample many and keep the best, explore a tree breadth-first or depth-first, or balance exploration and exploitation as Monte Carlo tree search does. The strategies differ in how they spend the budget, but the outcome of all of them is bounded by the evaluator: search can only find what the evaluator can recognise.</p>
+
+<h2 id="s6-2">6.2 Best-of-n and the quality of the verifier</h2>
+<p>The simplest search is <strong>best-of-\(n\)</strong> (also called rejection sampling or sample-and-rank): sample \(n\) complete candidates independently and return the one the evaluator scores highest. Cobbe and colleagues introduced it for mathematics in 2021, training a verifier to judge solutions to GSM8K problems and finding that sampling 100 solutions and picking the verifier's favourite gave a boost comparable to a thirtyfold increase in model size<span class="cite"><a href="#ref-cobbe">[1]</a></span>. Figure 6.1 shows the pipeline, which is the backbone of much of what follows.</p>
+
+<figure class="diagram" id="fig-6-1">
+<svg class="dg" viewBox="0 0 720 210" role="img" aria-label="Best-of-n: generate candidates, score with a verifier, select the best">
+<defs><marker id="ah61" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="20" y="80" width="110" height="50" rx="8" class="bx2"/><text x="75" y="102" text-anchor="middle" class="t-sm">task</text><text x="75" y="120" text-anchor="middle" class="t-xs">e.g. the issue</text>
+<rect x="170" y="70" width="120" height="70" rx="8" class="fill-acc"/><text x="230" y="100" text-anchor="middle" class="t-on t-b">generator</text><text x="230" y="120" text-anchor="middle" class="t-on t-xs">sample n times</text>
+<g class="t-xs"><rect x="330" y="20" width="110" height="30" rx="6" class="fill-muted"/><text x="385" y="40" text-anchor="middle">patch 1</text>
+<rect x="330" y="60" width="110" height="30" rx="6" class="fill-muted"/><text x="385" y="80" text-anchor="middle">patch 2</text>
+<rect x="330" y="100" width="110" height="30" rx="6" class="fill-muted"/><text x="385" y="120" text-anchor="middle">patch 3</text>
+<rect x="330" y="160" width="110" height="30" rx="6" class="fill-muted"/><text x="385" y="180" text-anchor="middle">patch n</text><text x="385" y="150" text-anchor="middle">⋮</text></g>
+<rect x="480" y="70" width="110" height="70" rx="8" class="bx4"/><text x="535" y="100" text-anchor="middle" class="t-b">verifier</text><text x="535" y="120" text-anchor="middle" class="t-xs">tests, reward model</text>
+<rect x="620" y="85" width="80" height="40" rx="8" class="bx3"/><text x="660" y="110" text-anchor="middle" class="t-sm">best</text>
+<line x1="130" y1="105" x2="168" y2="105" class="ln" marker-end="url(#ah61)"/>
+<line x1="290" y1="105" x2="328" y2="35" class="ln" marker-end="url(#ah61)"/><line x1="290" y1="105" x2="328" y2="75" class="ln" marker-end="url(#ah61)"/><line x1="290" y1="105" x2="328" y2="115" class="ln" marker-end="url(#ah61)"/><line x1="290" y1="105" x2="328" y2="175" class="ln" marker-end="url(#ah61)"/>
+<line x1="440" y1="35" x2="478" y2="95" class="ln" marker-end="url(#ah61)"/><line x1="440" y1="75" x2="478" y2="100" class="ln" marker-end="url(#ah61)"/><line x1="440" y1="115" x2="478" y2="108" class="ln" marker-end="url(#ah61)"/><line x1="440" y1="175" x2="478" y2="118" class="ln" marker-end="url(#ah61)"/>
+<line x1="590" y1="105" x2="618" y2="105" class="ln" marker-end="url(#ah61)"/>
+</svg>
+<figcaption><b>Figure 6.1 — Best-of-\(n\).</b> Generate \(n\) independent candidates, score each, return the highest scoring. Its accuracy is bounded above by pass@\(n\) (some candidate is right) and limited in practice by how often the verifier ranks a wrong candidate first.</figcaption></figure>
+
+<p>With a <strong>perfect verifier</strong>, one that recognises a correct candidate whenever one exists, best-of-\(n\) succeeds exactly when at least one candidate is correct: its accuracy is pass@\(n\) \(=1-(1-p)^n\), where \(p\) is the per-sample success probability (§1.10). This is the upper bound for any selection method over \(n\) samples, and it grows quickly: a coding agent that resolves an issue on 30% of attempts resolves it with probability 0.97 given ten attempts and a reliable checker. When the hidden tests of a benchmark are available to the selector, best-of-\(n\) approaches this bound, which is why benchmark results quoted "pass@\(k\)" should never be compared with single-attempt results.</p>
+<p>Real verifiers are imperfect. Model them by two error rates: a correct candidate is accepted with probability \(1-\epsilon_-\) (false-negative rate \(\epsilon_-\)) and an incorrect one with probability \(\epsilon_+\) (false-positive rate). Suppose we return a uniformly random accepted candidate (or any candidate if none is accepted). As \(n\) grows, there will almost surely be many accepted candidates of both kinds, and the chance that the returned one is correct tends to the verifier's <strong>precision</strong> on the candidate distribution:</p>
+<div class="box formula">
+\[ \lim_{n\to\infty}\Pr[\text{best-of-}n\text{ correct}]=\frac{p(1-\epsilon_-)}{p(1-\epsilon_-)+(1-p)\,\epsilon_+}. \]
+</div>
+<p>This ceiling, not pass@\(n\), is what an imperfect verifier can achieve, and it can be low. With \(p=0.3\), \(\epsilon_-=0.1\) and \(\epsilon_+=0.1\), it is \(0.27/0.34=0.79\); with \(\epsilon_+=0.3\), only 0.56. Figure 6.2 plots the exact accuracy as a function of \(n\) for these cases.</p>
+
+<figure class="chart" id="fig-6-2">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Best-of-n accuracy with imperfect verifiers (p = 0.3, false-negative rate 0.1)","height":340,
+ "x":{"label":"Number of candidates n (log)","log":true,"min":1,"max":32,"ticks":[1,2,4,8,16,32]},
+ "y":{"label":"Probability the selected candidate is correct","min":0,"max":1,"fmt":"pct"},
+ "series":[
+  {"name":"pass@n (perfect selector)","color":"s5","dash":true,"points":[[1,0.3],[2,0.51],[4,0.7599],[8,0.9424],[16,0.9967],[32,1.0]]},
+  {"name":"false-positive rate 0","color":"s1","points":[[1,0.3],[2,0.489],[4,0.7277],[8,0.9227],[16,0.9938],[32,1.0]]},
+  {"name":"false-positive rate 0.1","color":"s3","points":[[1,0.3],[2,0.468],[4,0.6521],[8,0.7672],[16,0.7931],[32,0.7941]]},
+  {"name":"false-positive rate 0.3","color":"s2","points":[[1,0.3],[2,0.426],[4,0.5256],[8,0.5598],[16,0.5625],[32,0.5625]]}
+ ]}
+</script>
+<figcaption><b>Figure 6.2 — The verifier sets the ceiling.</b> With a verifier that never accepts wrong candidates, best-of-\(n\) tracks pass@\(n\). With a 10% or 30% false-positive rate it plateaus at the verifier's precision (79% and 56%) after about eight candidates; more samples buy nothing.</figcaption></figure>
+
+<p>Figure 6.2 is the most important picture in this chapter. With a good verifier (blue), sampling more is an almost free path to reliability. With a mediocre one (orange), the curve flattens after a handful of samples at a level set entirely by the verifier, and the only way up is a better verifier. The asymmetry is worth stating plainly: <strong>false positives matter far more than false negatives</strong>. A verifier that rejects some correct candidates merely wastes samples, since another correct one will usually be accepted; a verifier that accepts wrong ones lets them through, and as \(n\) grows there are more wrong ones to let through. A coding agent's hidden test suite has a very low false-positive rate if the tests are thorough, which is why best-of-\(n\) works so well for code with tests. A model asked "is this patch correct?" may have a false-positive rate of 20% or more, which is why best-of-\(n\) with a model judge often disappoints.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — best-of-n for the coding agent</div>
+<p>The coding agent resolves an issue on \(p=0.3\) of attempts at $1.15 per attempt (§1.10). The repository has its own test suite, which the agent may run, but the hidden tests that define success are unavailable. The agent's own tests accept a correct patch 90% of the time and a wrong patch 20% of the time.</p>
+<p><b>Ceiling.</b> \(0.27/(0.27+0.7\times0.2)=0.27/0.41=0.66\).</p>
+<p><b>Cost.</b> Eight attempts ($9.20) get close to the ceiling. Compared with one attempt: accuracy from 0.30 to about 0.64 for eight times the cost, $14.40 per resolved issue against $3.83 for single attempts ($1.15 / 0.30) if failed attempts are free to retry later, or a large gain if each unresolved issue costs an engineer an hour.</p>
+<p><b>Improving the verifier.</b> If the agent first writes a test that reproduces the bug (it should fail before the fix and pass after), the false-positive rate of its checks might fall to 5%. The ceiling rises to \(0.27/(0.27+0.035)=0.885\). A better verifier is worth more than any number of extra samples.</p>
+</div>
+
+<h3 id="clustering">Selecting without a verifier: filtering and clustering</h3>
+<p>Sometimes there is no reliable verifier for the final output, but there are partial checks. DeepMind's AlphaCode (2022), which reached roughly the median of human competitors in programming contests, showed how far partial checks can be pushed<span class="cite"><a href="#ref-alphacode">[2]</a></span>. It sampled up to a million candidate programs per problem, discarded those that failed the few example tests given in the problem statement (about 99% of them), and then, since it could submit only ten, <em>clustered</em> the survivors by their behaviour: it generated new test inputs, ran every surviving program on them, grouped programs that produced identical outputs, and submitted one program from each of the largest clusters. Clustering is self-consistency (§5.4) generalised to outputs that cannot be compared directly: two programs "agree" if they behave the same, and the most common behaviour is likely the correct one, for the same reason that the most common numerical answer is. For agents, the same two-stage pattern (a cheap filter that removes obviously bad candidates, then agreement among survivors) applies to patches, SQL queries and any output that can be executed. Its weakness is shared with voting: if most candidates share the same misconception, the largest cluster is wrong.</p>
+
+<h3 id="overopt">Over-optimisation and the KL cost of selection</h3>
+<p>When the evaluator is a learned reward model, a further effect appears. A reward model is a proxy for what we actually want, accurate on typical outputs and less so on unusual ones. Selecting the best of \(n\) by proxy pushes towards outputs the proxy scores highly, and as \(n\) grows these increasingly include outputs that exploit the proxy's errors. Gao, Schulman and Hilton (2022) measured this carefully, using a large "gold" reward model as ground truth and smaller proxies for selection: as best-of-\(n\) selection intensified, gold reward first rose and then <em>fell</em>, while proxy reward kept rising<span class="cite"><a href="#ref-gao">[3]</a></span>. This is Goodhart's law in quantitative form, and it applies to every search guided by a learned evaluator, including the RL training of Chapter 18.</p>
+<p>A useful measure of how far selection moves the output distribution is its KL divergence from the base distribution. For best-of-\(n\) with a continuous score, the distribution of the selected sample has a closed form, and its divergence from the sampling distribution is \(D_{\mathrm{KL}}=\log n-(n-1)/n\) nats. Selection is therefore a gentle optimiser: best-of-16 moves the distribution by about 1.8 nats and best-of-256 by about 4.5. The logarithm explains both why best-of-\(n\) is relatively robust to over-optimisation compared with RL, which can travel much further in KL, and why it is an expensive way to optimise: each additional nat of movement multiplies the sample count by about \(e\).</p>
+
+<details class="drill">
+<summary>Drill 6.1 — the verifier's ceiling</summary>
+<p>A research agent's candidate answers are correct with probability 0.5. A model judge accepts correct answers 95% of the time and incorrect ones 25% of the time. (a) What is the best-of-\(n\) ceiling? (b) What false-positive rate would be needed for a 95% ceiling?</p>
+<p>(a) \(0.475/(0.475+0.125)=0.792\). (b) Need \(0.475/(0.475+0.5\epsilon_+)\ge0.95\), so \(0.5\epsilon_+\le0.025\), \(\epsilon_+\le0.05\). The judge must reject 95% of wrong answers, a much harder standard than accepting right ones.</p>
+</details>
+
+<details class="drill">
+<summary>Drill 6.4 — clustering candidate patches</summary>
+<p>An agent generates 20 patches; 12 fail the repository's existing tests and are discarded. On 30 generated inputs, the 8 survivors fall into behaviour clusters of sizes 5, 2 and 1. If patches are correct with probability 0.3 before filtering, and the filter never discards a correct patch, what is the chance that at least one survivor is correct? Which patch would you submit, and what could make that choice wrong?</p>
+<p>Correct patches are expected to be \(0.3\times20=6\) of 20; all survive, so a survivor is correct unless all 6 expected correct ones are absent: \(1-0.7^{20}\approx0.9992\) that at least one exists. Submit one from the cluster of 5, since correct patches behave identically and are the most likely to agree. The choice is wrong if the 5 share a common mistake (the generated inputs miss the buggy case), so add inputs that exercise the reported bug.</p>
+</details>
+
+<h2 id="s6-3">6.3 Tree of Thoughts</h2>
+<p>Best-of-\(n\) evaluates only complete solutions. For problems where most attempts go wrong early, that is wasteful: if the first step of a solution is a bad choice, everything after it is wasted computation. Searching over <em>partial</em> solutions lets the evaluator prune bad starts before they are completed. In May 2023 two groups proposed this for language models at almost the same time; the formulation by Yao and colleagues, <strong>Tree of Thoughts</strong> (ToT), became the standard reference<span class="cite"><a href="#ref-tot">[4]</a></span>.</p>
+<p>ToT treats problem solving as search in a tree whose nodes are partial solutions, sequences of "thoughts", each a coherent intermediate step such as a line of an equation or a paragraph of a plan. At each node the language model <em>proposes</em> several candidate next thoughts, and the language model (in a separate prompt) <em>evaluates</em> each resulting state, either by scoring it ("sure / likely / impossible to reach the goal from here") or by voting among siblings. A search algorithm, breadth-first with a beam of the best \(b\) states at each depth or depth-first with back-tracking when a state is judged impossible, decides what to expand. Figure 6.3 shows a breadth-first search with pruning.</p>
+
+<figure class="diagram" id="fig-6-3">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Tree of Thoughts: propose, evaluate and prune partial solutions">
+<rect x="310" y="16" width="100" height="30" rx="6" class="bx2"/><text x="360" y="36" text-anchor="middle" class="t-xs">problem</text>
+<g class="t-xs">
+<rect x="80" y="86" width="100" height="30" rx="6" class="bx3"/><text x="130" y="106" text-anchor="middle">A · likely</text>
+<rect x="310" y="86" width="100" height="30" rx="6" class="bx3"/><text x="360" y="106" text-anchor="middle">B · likely</text>
+<rect x="540" y="86" width="100" height="30" rx="6" class="fill-muted"/><text x="590" y="106" text-anchor="middle">C · ✗</text>
+<rect x="20" y="166" width="100" height="30" rx="6" class="fill-muted"/><text x="70" y="186" text-anchor="middle">A1 · ✗</text>
+<rect x="140" y="166" width="100" height="30" rx="6" class="bx3"/><text x="190" y="186" text-anchor="middle">A2 · sure</text>
+<rect x="260" y="166" width="100" height="30" rx="6" class="bx3"/><text x="310" y="186" text-anchor="middle">B1 · likely</text>
+<rect x="380" y="166" width="100" height="30" rx="6" class="fill-muted"/><text x="430" y="186" text-anchor="middle">B2 · ✗</text>
+<rect x="140" y="220" width="100" height="30" rx="6" class="fill-acc"/><text x="190" y="240" text-anchor="middle" class="t-on">solution</text>
+</g>
+<g><line x1="345" y1="46" x2="140" y2="84" class="ln"/><line x1="360" y1="46" x2="360" y2="84" class="ln"/><line x1="375" y1="46" x2="580" y2="84" class="ln dash"/>
+<line x1="120" y1="116" x2="75" y2="164" class="ln dash"/><line x1="140" y1="116" x2="185" y2="164" class="ln"/><line x1="350" y1="116" x2="315" y2="164" class="ln"/><line x1="370" y1="116" x2="425" y2="164" class="ln dash"/><line x1="190" y1="196" x2="190" y2="218" class="ln"/></g>
+<text x="600" y="186" class="t-xs">grey: pruned by</text><text x="600" y="202" class="t-xs">the evaluator</text>
+<text x="560" y="36" class="t-xs">beam width b = 2</text>
+</svg>
+<figcaption><b>Figure 6.3 — Tree of Thoughts, breadth-first.</b> The model proposes several next thoughts from each state; a second prompt evaluates each state; only the best \(b\) states at each depth are expanded. Bad partial solutions are abandoned before any work is spent completing them.</figcaption></figure>
+
+<p>Figure 6.3 shows why ToT can succeed where chain of thought fails. On the Game of 24, a puzzle in which four numbers must be combined with arithmetic to make 24, GPT-4 with chain-of-thought prompting solved 4% of problems in the paper's test set; with ToT and a beam of five, it solved 74%. The puzzle is ideal for tree search: each step (combine two numbers) is small, the evaluator can often see that a remaining set of numbers cannot reach 24 ("10, 13, 13: impossible"), and pruning early saves almost all the work. On tasks without such crisp intermediate evaluations, gains are smaller, and the cost is high: the Game of 24 results used on the order of a hundred model calls per problem, against one for chain of thought.</p>
+<h3 id="prm">Evaluating steps, not just outcomes</h3>
+<p>Search over partial solutions needs an evaluator of partial solutions, and a verifier of final answers does not provide one. Lightman and colleagues at OpenAI (2023) compared two kinds of learned verifier for mathematics: an <strong>outcome reward model</strong> (ORM), trained to predict whether a complete solution's final answer is correct, and a <strong>process reward model</strong> (PRM), trained on human labels of each step of a solution as correct, incorrect or neutral<span class="cite"><a href="#ref-prm">[5]</a></span>. Used to pick the best of many sampled solutions to problems from the MATH benchmark, the PRM chose a correct solution 78.2% of the time against 72.4% for the ORM. Step-level supervision helps for a reason the chapter has already met: a solution can reach the right answer by a wrong route, and an outcome verifier trained on final answers learns to accept such solutions, a source of false positives; a process verifier rejects them. A PRM also scores partial solutions directly, so it can guide beam search or MCTS at every step rather than only at the end.</p>
+<p>For agents, the analogue of a process reward is a judgement about each <em>action</em>: was this the right file to open, was this edit sensible, was that question to the customer necessary? Such step-level signals are expensive to label by hand, and much current work derives them automatically, for example by estimating a step's value from the success rate of rollouts that continue from it, which is exactly the Monte Carlo evaluation of the next section. The deep difficulty is the same as in reinforcement learning's credit-assignment problem (Chapter 18): when an episode fails after forty steps, which step was to blame?</p>
+
+<p>ToT made explicit something that reasoning models (§5.6) later internalised. A model trained by RL to reason at length explores alternatives, judges them and back-tracks within a single chain of thought, which is a tree search linearised into text, with the model as its own proposer and evaluator. Explicit tree search remains useful when the evaluator is external and reliable (a test, a checker, the environment), when the search must be parallelised, or when the tree is too large for one context. When the only evaluator is the model's own judgement, a strong reasoning model often matches explicit ToT at lower cost.</p>
+
+<h2 id="s6-4">6.4 Monte Carlo tree search and LATS</h2>
+<p>Breadth-first search with a fixed beam spends the same effort at every depth, whatever the evaluator says. A better allocation spends more where the evaluator is optimistic but uncertain and less where it is confident, balancing <em>exploitation</em> of branches that look good with <em>exploration</em> of branches that might be better than they look. Monte Carlo tree search (MCTS), the algorithm at the heart of AlphaGo, does this with a rule from the theory of multi-armed bandits.</p>
+<p>MCTS builds a tree incrementally by repeating four phases, drawn in Figure 6.4. <strong>Selection</strong>: starting at the root, descend by choosing at each node the child that maximises an upper confidence bound. <strong>Expansion</strong>: at a leaf, add one or more children by proposing actions. <strong>Evaluation</strong>: estimate the value of the new node, by a learned value function, by a heuristic, or by a <em>rollout</em> that plays the episode to the end with a fast policy and observes the outcome. <strong>Back-propagation</strong>: update the value estimates and visit counts of every node on the path to the root. The selection rule most often used is UCT (Kocsis and Szepesvári, 2006)<span class="cite"><a href="#ref-uct">[6]</a></span>:</p>
+<div class="box formula">
+\[ a^*=\arg\max_{a}\Big[\hat Q(s,a)+c_{\text{uct}}\sqrt{\frac{\ln N(s)}{N(s,a)}}\Big], \]
+</div>
+<p>where \(\hat Q(s,a)\) is the mean value observed below child \(a\), \(N(s)\) and \(N(s,a)\) are the visit counts of the node and the child, and \(c_{\text{uct}}\) sets the strength of exploration. The second term is large for rarely visited children, so every child is eventually tried, but it grows only logarithmically, so effort concentrates on children whose observed value is high. This is the upper-confidence-bound algorithm for bandits applied recursively at every node, and it inherits that algorithm's guarantee of logarithmic regret.</p>
+
+<figure class="diagram" id="fig-6-4">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-label="The four phases of Monte Carlo tree search">
+<defs><marker id="ah64" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker>
+<marker id="ah64a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead-acc"/></marker></defs>
+<g class="t-b t-sm"><text x="90" y="22" text-anchor="middle">1 Select</text><text x="270" y="22" text-anchor="middle">2 Expand</text><text x="450" y="22" text-anchor="middle">3 Evaluate</text><text x="630" y="22" text-anchor="middle">4 Back-propagate</text></g>
+<g>
+<circle cx="90" cy="50" r="10" class="bx3"/><circle cx="60" cy="100" r="10" class="bx3"/><circle cx="120" cy="100" r="10" class="fill-acc"/><circle cx="105" cy="150" r="10" class="fill-acc"/><circle cx="135" cy="150" r="10" class="bx3"/>
+<line x1="90" y1="60" x2="62" y2="90" class="ln"/><line x1="90" y1="60" x2="118" y2="90" class="ln-acc"/><line x1="120" y1="110" x2="106" y2="140" class="ln-acc"/><line x1="120" y1="110" x2="134" y2="140" class="ln"/>
+</g>
+<g>
+<circle cx="270" cy="50" r="10" class="bx3"/><circle cx="240" cy="100" r="10" class="bx3"/><circle cx="300" cy="100" r="10" class="bx3"/><circle cx="285" cy="150" r="10" class="bx3"/><circle cx="315" cy="150" r="10" class="bx3"/><circle cx="285" cy="200" r="10" class="bx2 dash"/>
+<line x1="270" y1="60" x2="242" y2="90" class="ln"/><line x1="270" y1="60" x2="298" y2="90" class="ln"/><line x1="300" y1="110" x2="286" y2="140" class="ln"/><line x1="300" y1="110" x2="314" y2="140" class="ln"/><line x1="285" y1="160" x2="285" y2="190" class="ln dash"/>
+<text x="300" y="204" class="t-xs">new action</text>
+</g>
+<g>
+<circle cx="450" cy="50" r="10" class="bx3"/><circle cx="420" cy="100" r="10" class="bx3"/><circle cx="480" cy="100" r="10" class="bx3"/><circle cx="465" cy="150" r="10" class="bx3"/><circle cx="495" cy="150" r="10" class="bx3"/><circle cx="465" cy="200" r="10" class="bx2"/>
+<line x1="450" y1="60" x2="422" y2="90" class="ln"/><line x1="450" y1="60" x2="478" y2="90" class="ln"/><line x1="480" y1="110" x2="466" y2="140" class="ln"/><line x1="480" y1="110" x2="494" y2="140" class="ln"/><line x1="465" y1="160" x2="465" y2="190" class="ln"/>
+<text x="480" y="200" class="t-xs">value: model</text><text x="480" y="214" class="t-xs">score, rollout, tests</text>
+</g>
+<g>
+<circle cx="630" cy="50" r="10" class="bx3"/><circle cx="600" cy="100" r="10" class="bx3"/><circle cx="660" cy="100" r="10" class="bx3"/><circle cx="645" cy="150" r="10" class="bx3"/><circle cx="675" cy="150" r="10" class="bx3"/><circle cx="645" cy="200" r="10" class="bx2"/>
+<line x1="630" y1="60" x2="602" y2="90" class="ln"/><line x1="630" y1="60" x2="658" y2="90" class="ln"/><line x1="660" y1="110" x2="676" y2="140" class="ln"/>
+<path d="M645,190 L645,162" class="ln-acc" marker-end="url(#ah64a)"/><path d="M645,140 L658,112" class="ln-acc" marker-end="url(#ah64a)"/><path d="M658,90 L636,62" class="ln-acc" marker-end="url(#ah64a)"/>
+<text x="560" y="222" class="t-xs">update Q̂, N on the path</text>
+</g>
+</svg>
+<figcaption><b>Figure 6.4 — Monte Carlo tree search.</b> Each iteration selects a path by the UCT rule (blue), expands a leaf with a proposed action, evaluates the new node, and propagates the result back up, so that later selections favour branches that have paid off while still exploring rarely tried ones.</figcaption></figure>
+
+<p>Figure 6.4's evaluation step is where language-model agents differ from game-playing programs. In Go, a rollout is cheap (a fast policy plays to the end in microseconds) and the outcome is exact. In an agent environment, a rollout means actually running the agent: executing code, browsing pages, calling APIs. <strong>Language Agent Tree Search</strong> (LATS; Zhou et al., 2023) adapted MCTS to this setting<span class="cite"><a href="#ref-lats">[7]</a></span>. Its nodes are states of an agent trajectory; expansion samples several candidate actions from the language model; evaluation combines a language-model score of the state with the environment's feedback (for code, test results); and when a trajectory fails, the model writes a reflection on why (as in Reflexion, Chapter 7), which is stored and used to guide later expansions. With GPT-4 on the HumanEval programming benchmark, LATS reported 92.7% pass@1 (one final submission, after search guided by the visible test cases), and it improved results on the WebShop shopping environment and on multi-hop question answering.</p>
+<p>The phrase "after search" hides the main practical constraint, which applies to every method in this chapter that searches over actions in a real environment: <strong>search requires the ability to go back</strong>. MCTS revisits nodes; ToT expands several children of the same state; both assume that the agent can return to an earlier state and try a different action. In a game or a simulator, that is a matter of copying the state. In a code sandbox, it can be done with snapshots of the file system (Chapter 10). On the live web, in a customer conversation or against a production database, it is impossible: a sent message cannot be unsent and a refund cannot be un-issued. For such environments, search must happen over <em>plans</em> or in a <em>model</em> of the environment, not in the environment itself, which brings us to planning.</p>
+
+<h2 id="s6-5">6.5 Planning</h2>
+<p>A plan is a decision about a sequence of actions made before executing them. Classical AI took planning to be the heart of intelligent agency (§1.3); reactive agents rejected it (§1.4); language agents have revived it in a pragmatic form. The case for planning in an agent is that it moves some of the search out of the irreversible environment and into the model's reasoning, where trying an alternative costs only tokens.</p>
+<p>The simplest planning architecture is <strong>plan-and-execute</strong>. A planner call produces a list of steps ("1. look up the booking; 2. search Friday flights before noon; 3. compute the fare difference; 4. confirm with the customer; 5. change the booking"); an executor, which may be a cheaper model or a fixed workflow, carries them out one by one; and when an observation contradicts the plan (no Friday flights before noon), control returns to the planner to <strong>replan</strong>. Figure 6.5 shows the loop. Variants such as ReWOO plan all tool calls up front with placeholders for their results, saving the tokens of re-reading the history at every step<span class="cite"><a href="#ref-rewoo">[8]</a></span>. The benefits are cost (one expensive planning call, many cheap execution calls), interpretability (the plan can be shown to a user or checked before anything happens) and commitment in the BDI sense of §1.4 (the agent does not reconsider everything at every step). The cost is brittleness: a plan made before observing the environment encodes guesses, and an executor that follows a stale plan faithfully does the wrong thing efficiently.</p>
+
+<figure class="diagram" id="fig-6-5">
+<svg class="dg" viewBox="0 0 720 220" role="img" aria-label="Plan-and-execute with replanning, and LLM plus a classical planner">
+<defs><marker id="ah65" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<text x="180" y="22" text-anchor="middle" class="t-b">Plan-and-execute</text>
+<text x="540" y="22" text-anchor="middle" class="t-b">LLM + classical planner</text>
+<line x1="360" y1="10" x2="360" y2="210" class="grid"/>
+<rect x="30" y="50" width="110" height="44" rx="8" class="fill-acc"/><text x="85" y="77" text-anchor="middle" class="t-on t-sm">planner LLM</text>
+<rect x="200" y="50" width="130" height="44" rx="8" class="bx3"/><text x="265" y="70" text-anchor="middle" class="t-sm">executor</text><text x="265" y="86" text-anchor="middle" class="t-xs">step 1 → 2 → 3 …</text>
+<rect x="200" y="140" width="130" height="40" rx="8" class="bx4"/><text x="265" y="165" text-anchor="middle" class="t-sm">environment</text>
+<line x1="140" y1="72" x2="198" y2="72" class="ln" marker-end="url(#ah65)"/><text x="170" y="64" text-anchor="middle" class="t-xs">plan</text>
+<line x1="265" y1="94" x2="265" y2="138" class="ln" marker-end="url(#ah65)"/>
+<path d="M200,160 C120,160 85,140 85,96" class="ln dash" marker-end="url(#ah65)"/><text x="100" y="176" class="t-xs">surprise → replan</text>
+<rect x="380" y="50" width="100" height="44" rx="8" class="fill-acc"/><text x="430" y="70" text-anchor="middle" class="t-on t-sm">LLM</text><text x="430" y="86" text-anchor="middle" class="t-on t-xs">translate</text>
+<rect x="510" y="50" width="90" height="44" rx="8" class="bx2"/><text x="555" y="70" text-anchor="middle" class="t-sm">PDDL</text><text x="555" y="86" text-anchor="middle" class="t-xs">problem</text>
+<rect x="620" y="50" width="90" height="44" rx="8" class="bx4"/><text x="665" y="70" text-anchor="middle" class="t-sm">planner</text><text x="665" y="86" text-anchor="middle" class="t-xs">sound, optimal</text>
+<line x1="480" y1="72" x2="508" y2="72" class="ln" marker-end="url(#ah65)"/><line x1="600" y1="72" x2="618" y2="72" class="ln" marker-end="url(#ah65)"/>
+<rect x="510" y="140" width="130" height="40" rx="8" class="bx3"/><text x="575" y="165" text-anchor="middle" class="t-sm">plan → actions</text>
+<line x1="665" y1="94" x2="610" y2="138" class="ln" marker-end="url(#ah65)"/>
+<text x="540" y="204" text-anchor="middle" class="t-xs">the model formalises; the planner searches with guarantees</text>
+</svg>
+<figcaption><b>Figure 6.5 — Two ways to plan with language models.</b> Left: a planner call writes a plan, an executor follows it, and surprises trigger replanning. Right: the model translates the task into a formal planning problem, a classical planner solves it with guarantees, and the plan is executed.</figcaption></figure>
+
+<div class="box example">
+<div class="box-title">Worked example — what plan-and-execute saves</div>
+<p>A ten-step support task. <b>ReAct with the frontier model:</b> each step reads a 10,000-token context (9,000 cached, 1,000 fresh) and writes 300 tokens. Per step: \(0.009\times\$0.30+0.001\times\$3+0.0003\times\$15=\$0.0027+\$0.003+\$0.0045=\$0.0102\); ten steps: $0.102. Decode time: \(10\times300/60=50\) s.</p>
+<p><b>Plan-and-execute.</b> One frontier planning call reads 10,000 tokens (8,000 cached) and writes a 3,000-token reasoned plan: \(\$0.0024+\$0.006+\$0.045=\$0.053\). Ten executor steps on the small model, each reading 10,000 tokens (cached reads assumed at a tenth of its $0.25 input price) and writing 200: about $0.00075 each, $0.0075 in all. Total $0.061, 40% less. Decode time: \(3{,}000/60+10\times200/150=50+13=63\) s, slightly <em>more</em>, because the plan is long and written by the slow model.</p>
+<p><b>Replanning.</b> If an observation contradicts the plan in 30% of tasks, each costing one more planning call, the expected cost rises by \(0.3\times\$0.053=\$0.016\) to $0.077, still a quarter cheaper.</p>
+<p><b>Lesson.</b> Plan-and-execute moves expensive judgement to one call and cheap execution to many, saving money; it does not save time unless the plan is short or execution is parallel. If surprises are frequent, replanning erodes the saving and a step-by-step loop may be better.</p>
+</div>
+
+<p>Can language models plan well? On this question there has been a sharp and productive argument. Valmeekam, Kambhampati and colleagues built PlanBench, a set of classical planning problems such as Blocksworld (stack blocks in a goal configuration) presented in natural language, and found that models of 2023, GPT-4 included, produced valid plans for only a small fraction of problems, the best of them (GPT-4) about 12% on average across their domains in the autonomous setting, and that performance collapsed when the domain was obfuscated by renaming objects and actions, suggesting retrieval of familiar patterns rather than planning<span class="cite"><a href="#ref-planbench">[9]</a></span>. Reasoning models improved these numbers substantially, but the critique's structural point stands: a language model's plan has no guarantee of validity, and on long or unfamiliar problems it often violates constraints it was told about.</p>
+<p>The constructive response, which Kambhampati calls <strong>LLM-Modulo</strong>, is to pair the model with external verifiers or solvers, as in the right half of Figure 6.5. In <strong>LLM+P</strong> (Liu et al., 2023), the model translates a natural-language task into the Planning Domain Definition Language (PDDL), the descendant of STRIPS (§1.3), and an off-the-shelf classical planner finds a plan, which is sound and often optimal by construction<span class="cite"><a href="#ref-llmp">[10]</a></span>. The model does what it does well (understanding the task and formalising it) and the planner does what it does well (combinatorial search with guarantees). The weak point moves to the translation, which can be wrong, but a wrong translation is much easier to check, by a human or by validating against examples, than a wrong plan. For agents, the lesson generalises beyond PDDL: wherever a task has formal structure (scheduling, routing, constraint satisfaction, eligibility rules), let the model formalise and a solver solve.</p>
+
+<h2 id="s6-6">6.6 What search costs</h2>
+<p>Search buys accuracy with computation, and in agents computation is expensive enough that the purchase must be justified. The arithmetic is simple. Best-of-\(n\) costs \(n\) complete attempts. A breadth-first tree search with branching factor \(b_{\text{prop}}\) proposals per node, beam width \(b\) and depth \(\Lambda\) makes about \(\Lambda\,b\,b_{\text{prop}}\) proposal calls and as many evaluation calls. MCTS with \(I\) iterations makes about \(I\) expansions and evaluations, and each evaluation by rollout costs a full episode from that node. Since a full agent episode costs on the order of a dollar (§1.10), a search over twenty rollouts costs twenty dollars, and must be worth it.</p>
+<p>Whether it is worth it depends on what a failure costs. Let one attempt cost \(c\), let a failure cost \(F\) (an engineer's time, a lost customer), and let \(A(n)\) be the accuracy of best-of-\(n\). The expected total cost of using \(n\) attempts is \(nc+(1-A(n))F\). Figure 6.6 plots it for the coding agent of the worked example in §6.2, with \(c=\$1.15\), \(F=\$50\) and the three verifiers of Figure 6.2.</p>
+
+<figure class="chart" id="fig-6-6">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Expected total cost: n attempts at $1.15 plus $50 per unresolved issue","height":340,
+ "x":{"label":"Number of attempts n (log)","log":true,"min":1,"max":32,"ticks":[1,2,4,8,16,32]},
+ "y":{"label":"Expected cost per issue (dollars)","min":0,"max":60},
+ "series":[
+  {"name":"perfect verifier","color":"s1","points":[[1,36.15],[2,27.85],[4,18.2],[8,13.07],[16,18.71],[32,36.8]]},
+  {"name":"false-positive rate 0.1","color":"s3","points":[[1,36.15],[2,28.9],[4,22.0],[8,20.84],[16,28.75],[32,47.1]]},
+  {"name":"false-positive rate 0.3","color":"s2","points":[[1,36.15],[2,31.0],[4,28.3],[8,31.2],[16,40.3],[32,58.7]]}
+ ]}
+</script>
+<figcaption><b>Figure 6.6 — How much search to buy.</b> Expected cost of \(n\) attempts plus the cost of failure. With a good verifier the optimum is around eight attempts, cutting the expected cost by almost two-thirds; with a poor verifier it is about four and saves far less, because extra attempts stop buying accuracy.</figcaption></figure>
+
+<p>Figure 6.6 turns the qualitative lessons into a decision rule. The optimal number of attempts balances the marginal cost of one more attempt, \(c\), against its marginal reduction in failure cost, \((A(n+1)-A(n))F\). With a perfect verifier, accuracy keeps rising until it saturates, so search pays up to a point and then stops; with a weak verifier, accuracy plateaus early at the verifier's precision, and every attempt beyond the plateau is wasted. Raising \(F\) (higher stakes) moves the optimum to more search, and lowering \(c\) (a cheaper model for attempts) does the same. A frequently overlooked option is to spend the budget on the verifier instead: a reproduction test that halves the false-positive rate moves the whole orange curve down towards the blue one.</p>
+
+<details class="drill">
+<summary>Drill 6.2 — the cost of a tree</summary>
+<p>A Tree-of-Thoughts search uses depth 3, beam width 5 and 5 proposals per state, with one proposal call and one evaluation call per candidate. Each call reads 3,000 cached tokens and writes 200. (a) How many calls and what cost? (b) Compare with a single chain of thought of 600 output tokens.</p>
+<p>(a) Per depth, \(5\times5=25\) candidates, each with two calls: 50 calls; over 3 depths, 150 calls. Each costs \(0.003\times\$0.30+0.0002\times\$15=\$0.0009+\$0.003=\$0.0039\): total $0.585. (b) The chain: \(0.003\times\$0.30+0.0006\times\$15=\$0.0099\). The tree costs about 59 times as much, justified only if it turns failures into successes on problems that matter, as on the Game of 24.</p>
+</details>
+
+<h2 id="s6-7">6.7 When does search help an agent?</h2>
+<p>We can now state the conditions under which an agent should search rather than act once, and they follow from the pieces of this chapter.</p>
+<p><strong>A verifier much better than the generator.</strong> Search helps when it is easier to check a solution than to produce one, which is to say when the <em>generator–verifier gap</em> is large. Code with good tests, mathematics with checkable answers, puzzles with crisp constraints and formal problems with solvers all have large gaps. Open-ended writing, judgement calls and customer conversations have small ones: judging a report is nearly as hard as writing it, and model judges of such outputs have false-positive rates that cap best-of-\(n\) at modest levels (Figure 6.2). Where the gap is small, a stronger model or more reasoning usually beats search.</p>
+<p><strong>Reversibility or a model.</strong> Searching over actions requires returning to earlier states: snapshots in a sandbox, a simulator, or a dry-run mode for tools. In irreversible environments the search must move into planning (search over plans in the model's head or in a solver) followed by careful execution, or into a simulated copy of the environment.</p>
+<p><strong>Stakes that justify the budget.</strong> The cost arithmetic of §6.6 requires that the value of turning failures into successes exceed the cost of the search. For high-value, low-volume tasks (a production bug, a large refund decision, a research question for an executive) this is easy; for high-volume routine traffic it rarely is.</p>
+<p><strong>Problems in the "learnable" difficulty range.</strong> Search turns a small per-attempt success probability into a large one only if that probability is not zero. A model that never produces a correct candidate gains nothing from more candidates. Snell and colleagues' finding (§5.7) that test-time compute is most valuable on problems of intermediate difficulty for the model is the same observation.</p>
+<p><strong>A verifier that cannot be gamed.</strong> There is one more condition, easy to overlook because it concerns failure rather than success. Search is optimisation, and optimisation against an imperfect evaluator finds the evaluator's blind spots (§6.2). A coding agent searching for a patch that makes the tests pass will, given enough attempts, find patches that pass by special-casing the test inputs, deleting an assertion or catching and silencing the exception the test checks for. Each such patch is a false positive the verifier failed to reject, and the more search, the more likely one is selected. The defences are the ones a careful engineer would apply anyway: hold some tests back from the agent so that it cannot optimise against them, check the diff for edits to test files, review patches that pass suspiciously quickly, and prefer verifiers whose failure modes are understood. Chapter 18 meets the same phenomenon when the search is replaced by reinforcement learning, where it is called reward hacking and is, if anything, worse.</p>
+<p>When these conditions hold, search is one of the most reliable ways to make an agent better without changing the model. When they do not, the budget is better spent on the verifier, the context, the tools, or a stronger model. In every case, the evaluator is the component to scrutinise first.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — planning a support conversation without search</div>
+<p>The support agent cannot search over actions: once it tells the customer "your flight is changed", it cannot try something else. A customer wants to move a trip with two connecting flights and a hotel booked through the airline.</p>
+<p><b>Plan in the head.</b> The agent first calls tools that only <em>read</em> (look up the booking, search alternative flights, check the hotel's cancellation terms), then writes a plan in its reasoning, considering two alternatives: change both flights to Friday morning (fare difference $140, hotel night lost, $95 non-refundable) or change only the second flight (fare difference $60, a six-hour layover).</p>
+<p><b>Check before committing.</b> A fare-calculation tool confirms both numbers; a policy tool confirms both changes are allowed. The agent presents both options with their costs, and the customer chooses.</p>
+<p><b>Execute.</b> Only now does it call the tools that <em>write</em>, and it reads the booking back to verify.</p>
+<p><b>Structure.</b> All the search happened over plans, using read-only tools as a model of the environment; the irreversible actions were executed once, after a check and the customer's confirmation. Separating read tools from write tools is what makes this possible, a design principle Chapter 8 develops.</p>
+</div>
+
+<details class="drill">
+<summary>Drill 6.3 — UCT by hand</summary>
+<p>A node has been visited \(N(s)=20\) times. Child A has \(\hat Q=0.6\) from 15 visits; child B has \(\hat Q=0.4\) from 5 visits. With \(c_{\text{uct}}=1\), which child does UCT select? With \(c_{\text{uct}}=0.3\)?</p>
+<p>\(\ln20=3.0\). A: \(0.6+\sqrt{3.0/15}=0.6+0.447=1.047\). B: \(0.4+\sqrt{3.0/5}=0.4+0.775=1.175\). B is selected: it is under-explored. With \(c_{\text{uct}}=0.3\): A \(0.6+0.134=0.734\), B \(0.4+0.232=0.632\); A is selected. The constant sets how much evidence is needed before a branch is abandoned.</p>
+</details>
+
+<h2 id="looking-ahead" class="unnumbered">Looking ahead</h2>
+<p>Every method in this chapter depends on an evaluator, and the best results came where the evaluator was external: tests, checkers, solvers, the environment itself. Often, though, the only evaluator available is the model. Can a model critique its own outputs, learn from its own failures within an episode, and improve its answer by revising it? Reflexion's verbal post-mortems and LATS's reflections suggested yes; careful studies found that, without external feedback, models often cannot even recognise their own errors. When does self-correction work, what kind of feedback does it need, and how should verifiers and critics be built into an agent? Chapter 7 takes up reflection, critique and self-correction.</p>
+
+<h2 id="summary">Chapter summary</h2>
+<ul>
+<li>Search has three ingredients: a generator, an evaluator and a strategy. Its outcome is bounded by what the evaluator can recognise.</li>
+<li><b>Best-of-\(n\)</b> with a perfect verifier achieves pass@\(n\); with false-negative and false-positive rates \(\epsilon_-,\epsilon_+\) it plateaus at the precision \(p(1-\epsilon_-)/(p(1-\epsilon_-)+(1-p)\epsilon_+)\). False positives matter most.</li>
+<li>Selecting by a learned reward model over-optimises: gold reward rises then falls. Best-of-\(n\) moves the distribution by \(\log n-(n-1)/n\) nats.</li>
+<li><b>Tree of Thoughts</b> searches over partial solutions with model proposals and evaluations (Game of 24: 4% → 74%), at roughly a hundred times the calls. Reasoning models internalise much of this search.</li>
+<li><b>MCTS</b> selects by UCT, \(\hat Q+c\sqrt{\ln N(s)/N(s,a)}\); <b>LATS</b> applies it to agents with model evaluations, environment feedback and reflections. Searching over actions requires reversibility.</li>
+<li><b>Planning</b>: plan-and-execute with replanning trades flexibility for cost and commitment. LLM plans lack validity guarantees (PlanBench); <b>LLM+P</b> and LLM-Modulo let the model formalise and a solver or verifier guarantee.</li>
+<li>Choose search effort by minimising \(nc+(1-A(n))F\). Search helps when the generator–verifier gap is large, the environment is reversible or modelled, stakes are high and the problem is within reach.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ch06-mcq-01" data-topic="§6.1 Ingredients">
+<p class="q">Which component bounds what any search procedure can achieve?</p>
+<ol class="opts"><li>The generator's temperature</li><li data-correct>The evaluator: search can only find what it can recognise</li><li>The search strategy</li><li>The context window</li></ol>
+<div class="explain">Strategies differ in efficiency, but the evaluator decides what counts as found.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-02" data-topic="§6.2 Best-of-n">
+<p class="q">With a perfect verifier and per-sample success 0.2, best-of-5 accuracy is about:</p>
+<ol class="opts"><li>0.20</li><li>0.50</li><li data-correct>0.67</li><li>1.00</li></ol>
+<div class="explain">\(1-0.8^5=1-0.328=0.672\).</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-03" data-topic="§6.2 Verifier ceiling">
+<p class="q">As \(n\to\infty\), best-of-\(n\) with an imperfect verifier (random choice among accepted candidates) converges to:</p>
+<ol class="opts"><li>1</li><li>pass@\(n\)</li><li data-correct>The verifier's precision on the candidate distribution</li><li>The per-sample success rate \(p\)</li></ol>
+<div class="explain">\(p(1-\epsilon_-)/(p(1-\epsilon_-)+(1-p)\epsilon_+)\).</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-04" data-topic="§6.2 Verifier ceiling">
+<p class="q">\(p=0.3\), \(\epsilon_-=0.1\), \(\epsilon_+=0.3\). The best-of-\(n\) ceiling is about:</p>
+<ol class="opts"><li>0.30</li><li data-correct>0.56</li><li>0.79</li><li>0.97</li></ol>
+<div class="explain">\(0.27/(0.27+0.21)=0.5625\).</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-05" data-topic="§6.2 Verifier errors">
+<p class="q">For best-of-\(n\) with large \(n\), which verifier error matters more?</p>
+<ol class="opts"><li>False negatives</li><li data-correct>False positives</li><li>Both equally</li><li>Neither</li></ol>
+<div class="explain">Rejected correct candidates are replaced by others; accepted wrong ones get through, and there are more of them as \(n\) grows.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-06" data-topic="§6.2 Verifier">
+<p class="q">The most effective way to raise the coding agent's best-of-\(n\) ceiling in the worked example was to:</p>
+<ol class="opts"><li>Sample 100 candidates</li><li>Raise the temperature</li><li data-correct>Write a test that reproduces the bug, lowering the false-positive rate of its checks</li><li>Use a longer system prompt</li></ol>
+<div class="explain">The ceiling rose from 0.66 to 0.885; extra samples cannot pass the ceiling.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-07" data-topic="§6.2 Over-optimisation">
+<p class="q">Gao et al. (2022) found that as best-of-\(n\) selection against a proxy reward model intensified, the gold reward:</p>
+<ol class="opts"><li>Rose monotonically</li><li data-correct>Rose and then fell</li><li>Fell from the start</li><li>Stayed flat</li></ol>
+<div class="explain">Over-optimisation exploits proxy errors: Goodhart's law.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-08" data-topic="§6.2 KL of best-of-n">
+<p class="q">The KL divergence between the best-of-\(n\) distribution and the base distribution is:</p>
+<ol class="opts"><li>\(n\)</li><li>\(\log n\)</li><li data-correct>\(\log n-(n-1)/n\)</li><li>\(n\log n\)</li></ol>
+<div class="explain">For continuous scores; best-of-16 is about 1.8 nats.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-09" data-topic="§6.3 ToT">
+<p class="q">Tree of Thoughts differs from best-of-\(n\) mainly in that it:</p>
+<ol class="opts"><li>Uses no evaluator</li><li data-correct>Evaluates and prunes partial solutions before they are completed</li><li>Samples only one candidate</li><li>Requires fine-tuning</li></ol>
+<div class="explain">Pruning bad starts saves the cost of completing them.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-10" data-topic="§6.3 ToT">
+<p class="q">On the Game of 24, ToT improved GPT-4's success from about 4% to 74%. Why is that puzzle well suited to tree search?</p>
+<ol class="opts"><li>It has a single step</li><li data-correct>Steps are small and the evaluator can often tell that a partial state cannot reach 24</li><li>It needs world knowledge</li><li>It has no wrong answers</li></ol>
+<div class="explain">Crisp intermediate evaluations make pruning effective.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-11" data-topic="§6.3 Reasoning models">
+<p class="q">How do reasoning models relate to Tree of Thoughts?</p>
+<ol class="opts"><li>They cannot explore alternatives</li><li data-correct>They internalise exploration, evaluation and back-tracking within a single chain of thought</li><li>They require an external planner</li><li>They are a form of best-of-\(n\)</li></ol>
+<div class="explain">Explicit trees still help with external evaluators, parallelism or very large trees.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-12" data-topic="§6.4 UCT">
+<p class="q">In the UCT rule, the term \(c\sqrt{\ln N(s)/N(s,a)}\):</p>
+<ol class="opts"><li>Rewards children with high value</li><li data-correct>Encourages trying rarely visited children, shrinking as they are visited</li><li>Penalises deep nodes</li><li>Is the rollout reward</li></ol>
+<div class="explain">It is the exploration bonus of the UCB bandit algorithm.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-13" data-topic="§6.4 UCT">
+<p class="q">\(N(s)=20\); A: \(\hat Q=0.6\), 15 visits; B: \(\hat Q=0.4\), 5 visits; \(c_{\text{uct}}=1\). UCT selects:</p>
+<ol class="opts"><li>A</li><li data-correct>B</li><li>Both equally</li><li>Neither</li></ol>
+<div class="explain">A: 1.047; B: 1.175. B is under-explored.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-14" data-topic="§6.4 MCTS phases">
+<p class="q">The four phases of MCTS, in order, are:</p>
+<ol class="opts"><li>Expand, select, back-propagate, evaluate</li><li data-correct>Select, expand, evaluate, back-propagate</li><li>Evaluate, select, expand, prune</li><li>Plan, act, observe, reflect</li></ol>
+<div class="explain">Descend by UCT, add a node, value it, update the path.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-15" data-topic="§6.4 LATS">
+<p class="q">LATS adds which ingredient to MCTS for language agents?</p>
+<ol class="opts"><li>A learned policy network trained from scratch</li><li data-correct>Model-based state evaluation, environment feedback and verbal reflections on failed trajectories</li><li>Exact game rollouts</li><li>A classical planner</li></ol>
+<div class="explain">Reflections from failures guide later expansions.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-16" data-topic="§6.4 Reversibility">
+<p class="q">Why can't the support agent run MCTS over its actions in a live conversation?</p>
+<ol class="opts"><li>MCTS needs numbers</li><li data-correct>Its actions are irreversible: it cannot return to an earlier state to try a different action</li><li>Conversations are too short</li><li>The UCT constant is unknown</li></ol>
+<div class="explain">Search over actions requires snapshots, simulators or dry runs; otherwise search over plans.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-17" data-topic="§6.5 Plan-and-execute">
+<p class="q">A main advantage of plan-and-execute over a step-by-step ReAct loop is:</p>
+<ol class="opts"><li>It never needs replanning</li><li data-correct>One expensive planning call can drive many cheap execution steps, and the plan can be inspected before acting</li><li>It is more flexible to surprises</li><li>It needs no tools</li></ol>
+<div class="explain">The trade-off is brittleness when observations contradict the plan.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-18" data-topic="§6.5 PlanBench">
+<p class="q">PlanBench's obfuscated domains (renamed objects and actions) were designed to test:</p>
+<ol class="opts"><li>Tokenisation speed</li><li data-correct>Whether models plan or retrieve familiar patterns</li><li>Context-window length</li><li>Tool calling</li></ol>
+<div class="explain">Performance collapsed under renaming, suggesting reliance on familiar surface patterns.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-19" data-topic="§6.5 LLM+P">
+<p class="q">In LLM+P, the language model's role is to:</p>
+<ol class="opts"><li>Search for the plan</li><li data-correct>Translate the natural-language task into a PDDL problem for a classical planner</li><li>Execute the plan</li><li>Verify the planner</li></ol>
+<div class="explain">The planner provides soundness; the model formalises.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-20" data-topic="§6.5 LLM-Modulo">
+<p class="q">The LLM-Modulo idea is to:</p>
+<ol class="opts"><li>Use smaller models</li><li data-correct>Pair the model's proposals with external verifiers or solvers that provide guarantees</li><li>Replace planners with LLMs</li><li>Apply modular arithmetic to plans</li></ol>
+<div class="explain">Generate with the model; check or solve with sound tools.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-21" data-topic="§6.6 Cost">
+<p class="q">ToT with depth 2, beam 4, 4 proposals per state, and one proposal plus one evaluation call per candidate makes how many calls?</p>
+<ol class="opts"><li>8</li><li>16</li><li data-correct>64</li><li>256</li></ol>
+<div class="explain">Per depth 16 candidates × 2 calls = 32; two depths: 64.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-22" data-topic="§6.6 Optimal n">
+<p class="q">The optimal number of attempts \(n\) minimises:</p>
+<ol class="opts"><li>\(n\)</li><li>\(1-A(n)\)</li><li data-correct>\(nc+(1-A(n))F\)</li><li>\(c/F\)</li></ol>
+<div class="explain">Balance the cost of attempts against the expected cost of failure.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-23" data-topic="§6.6 Optimal n">
+<p class="q">Raising the cost of failure \(F\) moves the optimal amount of search:</p>
+<ol class="opts"><li data-correct>Up</li><li>Down</li><li>Not at all</li><li>To zero</li></ol>
+<div class="explain">Higher stakes justify more attempts (up to the verifier's plateau).</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-24" data-topic="§6.6 Verifier vs samples">
+<p class="q">With a weak verifier, best-of-\(n\) accuracy has plateaued at \(n=8\). The best use of more budget is:</p>
+<ol class="opts"><li>More samples</li><li data-correct>Improving the verifier</li><li>Higher temperature</li><li>A larger beam</li></ol>
+<div class="explain">Past the plateau, only a better verifier raises accuracy.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-25" data-topic="§6.7 Conditions">
+<p class="q">Select all conditions that favour search for an agent task.</p>
+<ol class="opts"><li data-correct>A verifier much more reliable than the generator</li><li data-correct>A reversible or simulable environment</li><li data-correct>High stakes per task</li><li>A per-attempt success probability of zero</li></ol>
+<div class="explain">With \(p=0\), no amount of search finds a solution.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-26" data-topic="§6.7 Generator–verifier gap">
+<p class="q">Which task has the largest generator–verifier gap?</p>
+<ol class="opts"><li>Writing a persuasive essay</li><li data-correct>Writing a function that must pass a thorough test suite</li><li>Choosing a polite tone for a reply</li><li>Summarising a meeting</li></ol>
+<div class="explain">Tests check code far more reliably than anything checks an essay.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-27" data-topic="§6.7 Read/write tools">
+<p class="q">In the support worked example, what made planning possible without search over actions?</p>
+<ol class="opts"><li>A simulator of the customer</li><li data-correct>Separating read-only tools (used freely to explore) from write tools (executed once after checks and confirmation)</li><li>A very high temperature</li><li>Running MCTS on the booking database</li></ol>
+<div class="explain">Read tools act as a model of the environment; irreversible writes come last.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-28" data-topic="§6.2 pass@k reporting">
+<p class="q">A paper reports pass@10 with hidden tests used to select the submission. Comparing it with another system's single-attempt score is:</p>
+<ol class="opts"><li>Fair</li><li data-correct>Misleading: pass@10 with a perfect selector is an upper bound unavailable at deployment</li><li>Fair if both use the same model</li><li>Fair if \(p\) is small</li></ol>
+<div class="explain">Always compare like with like: attempts and selection method.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-29" data-topic="§6.5 Replanning">
+<p class="q">When should a plan-and-execute agent replan?</p>
+<ol class="opts"><li>Every step</li><li data-correct>When an observation contradicts an assumption of the plan</li><li>Never</li><li>Only at the end</li></ol>
+<div class="explain">Commitment with reconsideration on surprise, as in BDI agents.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-30" data-topic="§6.4 Rollouts">
+<p class="q">Why are rollouts far more expensive for language agents than in Go?</p>
+<ol class="opts"><li>Go has more states</li><li data-correct>A rollout means actually running agent steps (model calls, tools), each costing money and seconds, rather than a fast simulated playout</li><li>Language agents cannot evaluate</li><li>Rollouts need GPUs</li></ol>
+<div class="explain">A full agent episode costs on the order of a dollar; twenty rollouts cost twenty.</div>
+</div>
+
+<div class="mcq" data-id="ch06-mcq-31" data-topic="§6.2 Cobbe et al.">
+<p class="q">Cobbe et al. (2021) found that verifier-based best-of-100 on GSM8K gave a boost comparable to:</p>
+<ol class="opts"><li>Doubling the dataset</li><li data-correct>About a thirtyfold increase in model size</li><li>No change</li><li>Removing chain of thought</li></ol>
+<div class="explain">Verification was worth roughly a 30× larger model in their experiments.</div>
+</div>
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer out loud first, then reveal the model answer and rate yourself.</p>
+
+<details class="qa" data-id="ch06-qa-01">
+<summary><span class="lvl warm">Warm-up</span> What is best-of-n sampling and what limits it?</summary>
+<div class="answer"><p>Sample \(n\) independent candidate solutions and return the one an evaluator scores highest. With a perfect verifier it achieves pass@\(n\), approaching 1 quickly when per-sample success is non-trivial. In practice it is limited by verifier quality: with false-positive rate \(\epsilon_+\) it plateaus at the verifier's precision \(p(1-\epsilon_-)/(p(1-\epsilon_-)+(1-p)\epsilon_+)\). With a learned reward model it can over-optimise, selecting candidates that exploit the reward model. It also costs \(n\) times as much and needs either a verifier or a ranking model.</p></div>
+</details>
+
+<details class="qa" data-id="ch06-qa-02">
+<summary><span class="lvl warm">Warm-up</span> Explain Tree of Thoughts.</summary>
+<div class="answer"><p>Problem solving as search over partial solutions. Each node is a sequence of thoughts; the model proposes several next thoughts; the model (or another evaluator) scores each resulting state for promise; a breadth-first search with a beam, or depth-first with back-tracking, expands the best. It prunes bad starts early, which helps on problems with crisp intermediate evaluations (Game of 24: 4% → 74% for GPT-4) at the cost of tens to hundreds of calls per problem. Reasoning models now perform similar search internally.</p></div>
+</details>
+
+<details class="qa" data-id="ch06-qa-03">
+<summary><span class="lvl warm">Warm-up</span> What is plan-and-execute and when would you use it?</summary>
+<div class="answer"><p>A planner call writes an explicit sequence of steps; an executor (cheaper model or workflow) carries them out; surprises trigger replanning. Use it when tasks have predictable structure, when a plan can be shown to a user or checked before acting, when cost matters (one strong planning call, cheap execution), and when commitment avoids dithering. Avoid it when the environment is highly uncertain and each observation changes what to do next; there a ReAct-style loop is more robust.</p></div>
+</details>
+
+<details class="qa" data-id="ch06-qa-04">
+<summary><span class="lvl core">Core</span> Derive the accuracy ceiling of best-of-n with an imperfect verifier and discuss its implications.</summary>
+<div class="answer"><p>Candidates are correct with probability \(p\); the verifier accepts correct ones with probability \(1-\epsilon_-\) and incorrect ones with \(\epsilon_+\). For large \(n\), the numbers of accepted correct and incorrect candidates are about \(np(1-\epsilon_-)\) and \(n(1-p)\epsilon_+\); choosing uniformly among accepted gives correctness probability equal to their ratio, the precision. Implications: false positives dominate; accuracy plateaus after a few samples; improving the verifier beats sampling more; and when \(p\) is small even a modest \(\epsilon_+\) gives a low ceiling (e.g. \(p=0.1,\epsilon_+=0.1\): about 0.5). If the verifier outputs scores and we take the arg-max, the analysis depends on score distributions, but the same qualitative conclusion holds.</p></div>
+</details>
+
+<details class="qa" data-id="ch06-qa-05">
+<summary><span class="lvl core">Core</span> What is reward-model over-optimisation, and how does it affect search?</summary>
+<div class="answer"><p>A learned reward model is accurate near the training distribution but has errors elsewhere. Optimising against it, by RL or by strong selection, moves outputs towards regions where it overestimates quality, so true quality first improves and then degrades while proxy reward keeps rising (Gao et al., 2022). For search, it means more candidates or deeper search against a learned evaluator can make results worse. Mitigations: limit optimisation pressure (moderate \(n\), KL penalties), use ensembles or uncertainty-aware reward models, prefer verifiable checks where available, and validate on held-out gold evaluations.</p></div>
+</details>
+
+<details class="qa" data-id="ch06-qa-06">
+<summary><span class="lvl core">Core</span> State the UCT rule and explain how MCTS balances exploration and exploitation.</summary>
+<div class="answer"><p>At each node choose \(\arg\max_a\hat Q(s,a)+c\sqrt{\ln N(s)/N(s,a)}\). The first term exploits children with high observed value; the second is an optimism bonus that is large for rarely visited children and decays as they are visited, while growing slowly with the parent's visits so that every child is eventually re-examined. This is UCB1 applied recursively, inheriting logarithmic regret in the bandit setting. The constant \(c\) sets how much evidence is required to abandon a branch; it should scale with the range of values.</p></div>
+</details>
+
+<details class="qa" data-id="ch06-qa-07">
+<summary><span class="lvl core">Core</span> Can LLMs plan? Summarise the debate.</summary>
+<div class="answer"><p>Critics (Valmeekam, Kambhampati and colleagues) showed with PlanBench that 2023 models produced valid plans for a small fraction of classical problems, about 12% on average for GPT-4 autonomously, collapsing under obfuscation, suggesting pattern retrieval rather than planning; LLM plans carry no validity guarantee. Reasoning models improved results considerably, and LLMs are clearly useful for commonsense, approximate planning in open domains. The productive synthesis is LLM-Modulo: models propose plans or formalise problems (LLM+P translating to PDDL), and verifiers or classical planners check or solve them with guarantees. For agents: use the model for open-ended planning with replanning on feedback, and solvers wherever structure allows.</p></div>
+</details>
+
+<details class="qa" data-id="ch06-qa-08">
+<summary><span class="lvl core">Core</span> How many attempts should a coding agent make per issue? Set up the decision.</summary>
+<div class="answer"><p>Minimise \(nc+(1-A(n))F\), where \(c\) is the cost per attempt, \(F\) the cost of leaving the issue unresolved, and \(A(n)\) best-of-\(n\) accuracy given the selector. Estimate \(p\) and the selector's error rates from logged runs. With \(c=\$1.15\), \(F=\$50\), \(p=0.3\) and a good selector, the optimum is around eight attempts; with a poor selector, about four. Also consider latency (attempts can run in parallel), and the alternative of spending budget on a better selector, such as writing a reproduction test first.</p></div>
+</details>
+
+<details class="qa" data-id="ch06-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Derive the KL divergence of the best-of-n distribution and explain why it matters.</summary>
+<div class="answer"><p>Let scores be continuous with CDF \(F_S\) under the base policy. The best-of-\(n\) sample has density \(n F_S(s)^{n-1}\) relative to the base in score space (the max of \(n\) i.i.d. uniforms after the probability-integral transform). KL \(=\mathbb E[\log(nU^{n-1})]\) with \(U\sim\mathrm{Beta}(n,1)\): \(\log n+(n-1)\mathbb E[\log U]=\log n+(n-1)(-1/n)=\log n-(n-1)/n\). It matters because it measures optimisation pressure: best-of-\(n\) moves only logarithmically in \(n\), so it is a weak but robust optimiser compared with RL, and over-optimisation curves can be plotted against KL to compare methods on a common axis.</p></div>
+</details>
+
+<details class="qa" data-id="ch06-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> Why does search over actions require reversibility, and how can agents search in irreversible environments?</summary>
+<div class="answer"><p>Tree search revisits states to try alternative actions; that requires restoring an earlier state. In games and simulators states are copyable; in code sandboxes, file-system snapshots or containers allow it; on live systems (sent messages, payments, production databases) it is impossible. Options: search over plans in the model's reasoning; use read-only tools as a model of the environment and commit writes after verification; dry-run or staging modes for tools; simulate users or environments with models (with the risk of simulator bias); and confirmation from humans before irreversible actions. The design principle is to separate exploration (cheap, reversible) from commitment (once, checked).</p></div>
+</details>
+
+<details class="qa" data-id="ch06-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> What is the generator–verifier gap and how should it guide test-time compute allocation?</summary>
+<div class="answer"><p>It is the difference between how reliably something can check a solution and how reliably the model can produce one. Large gaps (code with tests, maths with answers, formal constraints) make sampling plus verification efficient: accuracy approaches pass@\(n\). Small gaps (open-ended writing, judgement) make verification nearly as hard as generation; model judges have high false-positive rates, so best-of-\(n\) plateaus low, and compute is better spent on deeper reasoning or a stronger generator. Allocation: estimate verifier precision on your task, compute the ceiling, and choose between more samples, better verification and stronger generation accordingly.</p></div>
+</details>
+
+<details class="qa" data-id="ch06-qa-12">
+<summary><span class="lvl deep">Deep-dive</span> Compare explicit tree search (ToT/LATS) with a reasoning model thinking longer.</summary>
+<div class="answer"><p>Explicit search: parallelisable, can use external evaluators and environment feedback at every node, can exceed one context's size, and its structure is inspectable; but it costs many calls, needs a good state evaluator, and the model's evaluations of its own partial states can be poor. Reasoning model: one call, search internalised and trained end-to-end on reward, efficient at using its own judgement; but sequential, limited by context, uses no external feedback mid-chain unless interleaved with tools, and is opaque if reasoning is hidden. Practice: reasoning models for internal deliberation; explicit search when an external verifier is strong and the environment is reversible (code with tests), or for very large spaces.</p></div>
+</details>
+
+<details class="qa" data-id="ch06-qa-13">
+<summary><span class="lvl design">Design</span> Design a system that uses search to fix bugs reliably in a large codebase.</summary>
+<div class="answer"><p>Sandbox with snapshotting. Phase 1: localisation, generating several hypotheses with a reasoning model and checking each cheaply (search, read, targeted test runs). Phase 2: write a reproduction test that fails before any fix (this is the verifier). Phase 3: generate \(n\) candidate patches in parallel from the snapshot (vary prompts and hypotheses for diversity), run the reproduction test and the existing suite on each, discard failures. Phase 4: if several pass, rank by a judge or by diff size and touched files, or cluster by behaviour on additional generated tests. Set \(n\) by the cost model and stop early once a candidate passes everything. Log all candidates for review. Measure resolved rate, cost per resolved issue, and false-positive rate of the selection (patches that pass but are wrong) via hidden tests or human review.</p></div>
+</details>
+
+<details class="qa" data-id="ch06-qa-14">
+<summary><span class="lvl design">Design</span> How would you add planning to a support agent that handles multi-leg itinerary changes?</summary>
+<div class="answer"><p>Separate read and write tools. Planning phase: gather information with read tools (booking, availability, fares, hotel terms), then have the model enumerate candidate itineraries as structured plans; compute costs and policy compliance with deterministic tools (a fare engine, a policy checker) rather than the model; optionally hand the combinatorial part to a solver if constraints are complex. Presentation: show the customer the top options with costs. Execution: after confirmation, call write tools in a defined order with verification (read back each change), and a compensation path if a later step fails (cancel earlier changes). Log the plan for audit. Evaluate with simulated customers over many itinerary scenarios.</p></div>
+</details>
+
+<details class="qa" data-id="ch06-qa-15">
+<summary><span class="lvl design">Design</span> A team wants to use a model judge to pick the best of 16 research reports. What do you tell them?</summary>
+<div class="answer"><p>Measure the judge first: on reports with known quality, estimate how often it prefers a worse report (its false-positive behaviour). Best-of-16 accuracy plateaus at the judge's precision, and with learned judges more candidates can increase the chance of selecting a report that games the judge (length, confident tone, many citations). Improve the judge with rubrics, reference checks (do citations support claims?), and pairwise comparisons; consider fewer candidates; diversify generation; and use checkable sub-criteria (facts verified against sources) as filters before the judge. Report the cost: 16 reports cost 16× and may buy little if the judge's gap is small.</p></div>
+</details>
+
+<details class="qa" data-id="ch06-qa-16">
+<summary><span class="lvl core">Core</span> Why is pass@k with hidden tests not a fair comparison with a deployed agent's success rate?</summary>
+<div class="answer"><p>pass@k with a perfect selector assumes we can identify a correct attempt among \(k\), which uses information (the hidden tests) unavailable at deployment; it is an upper bound on best-of-\(k\). A deployed agent must choose with its own imperfect verifier, achieving at most the verifier's precision ceiling, and pays \(k\) times the cost. Fair comparisons fix the number of attempts, the selection method and the cost.</p></div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="ref-cobbe">K. Cobbe et al. Training Verifiers to Solve Math Word Problems. 2021. <a href="https://arxiv.org/abs/2110.14168">arXiv:2110.14168</a>.</li>
+<li id="ref-alphacode">Y. Li et al. Competition-Level Code Generation with AlphaCode. <em>Science</em> 378, 2022. <a href="https://arxiv.org/abs/2203.07814">arXiv:2203.07814</a>.</li>
+<li id="ref-gao">L. Gao, J. Schulman, J. Hilton. Scaling Laws for Reward Model Overoptimization. <em>ICML</em>, 2023. <a href="https://arxiv.org/abs/2210.10760">arXiv:2210.10760</a>.</li>
+<li id="ref-tot">S. Yao et al. Tree of Thoughts: Deliberate Problem Solving with Large Language Models. <em>NeurIPS</em>, 2023. <a href="https://arxiv.org/abs/2305.10601">arXiv:2305.10601</a>.</li>
+<li id="ref-prm">H. Lightman et al. Let's Verify Step by Step. <em>ICLR</em>, 2024. <a href="https://arxiv.org/abs/2305.20050">arXiv:2305.20050</a>.</li>
+<li id="ref-uct">L. Kocsis and C. Szepesvári. Bandit Based Monte-Carlo Planning. <em>ECML</em>, 2006.</li>
+<li id="ref-lats">A. Zhou et al. Language Agent Tree Search Unifies Reasoning, Acting, and Planning in Language Models. <em>ICML</em>, 2024. <a href="https://arxiv.org/abs/2310.04406">arXiv:2310.04406</a>.</li>
+<li id="ref-rewoo">B. Xu et al. ReWOO: Decoupling Reasoning from Observations for Efficient Augmented Language Models. 2023. <a href="https://arxiv.org/abs/2305.18323">arXiv:2305.18323</a>.</li>
+<li id="ref-planbench">K. Valmeekam, M. Marquez, A. Olmo, S. Sreedharan, S. Kambhampati. PlanBench: An Extensible Benchmark for Evaluating Large Language Models on Planning and Reasoning about Change. <em>NeurIPS Datasets and Benchmarks</em>, 2023. <a href="https://arxiv.org/abs/2206.10498">arXiv:2206.10498</a>; On the Planning Abilities of Large Language Models, <a href="https://arxiv.org/abs/2305.15771">arXiv:2305.15771</a>.</li>
+<li id="ref-llmp">B. Liu et al. LLM+P: Empowering Large Language Models with Optimal Planning Proficiency. 2023. <a href="https://arxiv.org/abs/2304.11477">arXiv:2304.11477</a>.</li>
+<li>Further reading: S. Kambhampati et al., LLMs Can't Plan, But Can Help Planning in LLM-Modulo Frameworks, <a href="https://arxiv.org/abs/2402.01817">arXiv:2402.01817</a>; J. Long, Large Language Model Guided Tree-of-Thought, <a href="https://arxiv.org/abs/2305.08291">arXiv:2305.08291</a>; C. B. Browne et al., A Survey of Monte Carlo Tree Search Methods, <em>IEEE Trans. Computational Intelligence and AI in Games</em>, 2012.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

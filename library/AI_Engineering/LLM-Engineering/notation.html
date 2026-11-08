@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Notation — Introduction to LLM Engineering</title>
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="assets/css/book.css">
+<script defer src="assets/vendor/katex/katex.min.js"></script>
+<script defer src="assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="assets/js/book.js"></script>
+<script defer src="/library/assets/book-shim.js" data-library="/library/" data-field="/library/AI_Engineering/" data-field-title="AI Engineering"></script>
+<script type="module" src="assets/js/auth.js"></script>
+</head>
+<body data-root="./">
+<div class="cover">
+<h1>Notation</h1>
+<p class="sub">One set of symbols is used throughout the book. Every symbol a chapter introduces is listed here, and no symbol has two meanings.</p>
+<p>Every chapter must use these symbols. If a new symbol is needed, add it here first and check it does not collide with an existing one. The same table is rendered on the site at <code>docs/notation.html</code>.</p>
+<h2>Model architecture</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th><th>Llama 3 8B</th><th>Llama 3 70B</th></tr></thead><tbody>
+<tr><td>\(L\)</td><td>number of layers (Transformer blocks)</td><td>32</td><td>80</td></tr>
+<tr><td>\(\ell\)</td><td>layer index, \(\ell = 1,\dots,L\)</td><td></td><td></td></tr>
+<tr><td>\(d\)</td><td>model width (residual-stream dimension, <code>hidden_size</code>)</td><td>4096</td><td>8192</td></tr>
+<tr><td>\(n_h\)</td><td>number of query heads</td><td>32</td><td>64</td></tr>
+<tr><td>\(n_{kv}\)</td><td>number of key/value heads</td><td>8</td><td>8</td></tr>
+<tr><td>\(g\)</td><td>GQA group size \(n_h/n_{kv}\)</td><td>4</td><td>8</td></tr>
+<tr><td>\(d_h\)</td><td>head dimension</td><td>128</td><td>128</td></tr>
+<tr><td>\(d_{ff}\)</td><td>FFN hidden width (<code>intermediate_size</code>)</td><td>14336</td><td>28672</td></tr>
+<tr><td>\(\mathcal V\), \(\lvert\mathcal V\rvert\)</td><td>vocabulary and its size</td><td>128,256</td><td>128,256</td></tr>
+<tr><td>\(N\)</td><td>number of parameters (\(N_{\text{act}}\): active per token, for MoE)</td><td>8.03B</td><td>70.6B</td></tr>
+<tr><td>\(\Theta\)</td><td>RoPE base (<code>rope_theta</code>); frequencies \(\theta_r=\Theta^{-2r/d_h}\), \(r=0,\dots,d_h/2-1\)</td><td>500,000</td><td>500,000</td></tr>
+</tbody></table></div>
+<h2>Sequences, batches, tensors</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(x_t\)</td><td>token at position \(t\); \(x_{&lt;t}=(x_1,\dots,x_{t-1})\)</td></tr>
+<tr><td>\(T\)</td><td>length of a sequence (when the whole sequence is in view)</td></tr>
+<tr><td>\(t\)</td><td>current position / current context length during generation</td></tr>
+<tr><td>\(i, j\)</td><td>query position and key position inside attention</td></tr>
+<tr><td>\(n_{\text{in}}, n_{\text{out}}\)</td><td>prompt length; number of generated tokens</td></tr>
+<tr><td>\(B\)</td><td>batch size: number of sequences processed together</td></tr>
+<tr><td>\(m\)</td><td>number of token vectors in one matrix product (\(m=B\) in decode, \(m=B\,n_{\text{in}}\) in prefill)</td></tr>
+<tr><td>\((m\times k)\cdot(k\times n)\)</td><td>generic matrix-product shapes; costs \(2mkn\) FLOPs</td></tr>
+<tr><td>\(X\)</td><td>input to a sub-layer, \(T\times d\); \(\tilde X=\operatorname{Norm}(X)\)</td></tr>
+<tr><td>\(Q,K,V\)</td><td>queries, keys, values; \(W_Q,W_K,W_V,W_O\) their projections</td></tr>
+<tr><td>\(S, P, O\)</td><td>attention scores, attention probabilities, attention output</td></tr>
+<tr><td>\(M\)</td><td>causal mask (\(0\) or \(-\infty\))</td></tr>
+<tr><td>\(W_1,W_3,W_2\)</td><td>SwiGLU gate, up and down projections</td></tr>
+<tr><td>\(d_c\), \(d_h^R\), \(c_t\)</td><td>MLA latent dimension (512), decoupled RoPE dimension (64), cached latent of token \(t\) (Ch. 8)</td></tr>
+<tr><td>\(W_{DKV}, W_{UK}, W_{UV}\)</td><td>MLA down-projection and key/value up-projections (Ch. 8)</td></tr>
+<tr><td>\(w\), \(\phi\)</td><td>attention window size; fraction of global (full-attention) layers (Ch. 8)</td></tr>
+<tr><td>\(W_E\in\mathbb R^{\lvert\mathcal V\rvert\times d}\), \(W_U\)</td><td>embedding table; unembedding (LM head)</td></tr>
+<tr><td>\(z\), \(\tau\)</td><td>logits; sampling temperature</td></tr>
+<tr><td>\(v\in\mathcal V\), \(p(v)\)</td><td>a vocabulary token; its next-token probability (Ch. 4)</td></tr>
+<tr><td>\(\kappa=1/\tau\)</td><td>inverse temperature (Ch. 4)</td></tr>
+<tr><td>\(n_{\text{top}}, p_{\text{top}}, p_{\min}\)</td><td>top-\(k\) count; top-\(p\) mass; min-\(p\) ratio (Ch. 4)</td></tr>
+<tr><td>\(n_{\text{beam}}\)</td><td>beam width (Ch. 4)</td></tr>
+<tr><td>\(\rho\), \(\xi_v\)</td><td>repetition-penalty factor; Gumbel noise for token \(v\) (Ch. 4)</td></tr>
+<tr><td>\(h_t\); \(h^{(\ell)}_j\)</td><td>recurrent hidden state (RNNs, Ch. 1); residual-stream vector of position \(j\) after layer \(\ell\) (Ch. 3 proofs)</td></tr>
+</tbody></table></div>
+<h2>Training and information</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(\mathcal L\)</td><td>loss (never \(L\), which is layers)</td></tr>
+<tr><td>\(H\), \(\mathrm{PP}\)</td><td>cross-entropy (nats or bits per token); perplexity \(e^H\)</td></tr>
+<tr><td>\(D\), \(D_{\text{inf}}\)</td><td>training tokens; tokens processed at inference over a model's lifetime</td></tr>
+<tr><td>\(C\)</td><td>compute in FLOPs</td></tr>
+<tr><td>\(E, c_N, c_D, \alpha_N, \alpha_D\)</td><td>Chinchilla fit \(\mathcal L(N,D)=E+c_N N^{-\alpha_N}+c_D D^{-\alpha_D}\)</td></tr>
+</tbody></table></div>
+<h2>Hardware and performance</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th><th>H100 SXM (dense BF16)</th></tr></thead><tbody>
+<tr><td>\(\pi\)</td><td>peak compute, FLOP/s</td><td>989 TFLOP/s</td></tr>
+<tr><td>\(\beta\)</td><td>memory (HBM) bandwidth, bytes/s</td><td>3.35 TB/s</td></tr>
+<tr><td>\(M_{\text{HBM}}\)</td><td>memory capacity</td><td>80 GB</td></tr>
+<tr><td>\(I\)</td><td>arithmetic intensity, FLOPs per byte moved</td><td></td></tr>
+<tr><td>\(I^*=\pi/\beta\)</td><td>ridge point</td><td>≈ 295 FLOP/B</td></tr>
+<tr><td>\(b\)</td><td>bytes per element (\(b_w\) weights, \(b_{kv}\) KV cache); BF16 = 2, FP8 = 1</td><td></td></tr>
+<tr><td>\(s_{kv}\)</td><td>KV-cache bytes per token \(=2\,L\,n_{kv}\,d_h\,b_{kv}\)</td><td></td></tr>
+<tr><td>\(t_{\text{step}}\)</td><td>time of one forward pass (decode step)</td><td></td></tr>
+<tr><td>\(f_{\text{clk}}\)</td><td>clock frequency (Ch. 5)</td><td>≈ 1.83 GHz</td></tr>
+<tr><td>\(B^{*}(t)\), \(t_{\text{crit}}\)</td><td>critical batch size for compute-bound decode at context \(t\); critical context length (Ch. 6)</td><td>388 tokens for Llama 3 8B</td></tr>
+<tr><td>MFU, MBU</td><td>model FLOPs utilisation; memory-bandwidth utilisation (Ch. 3, 6)</td><td></td></tr>
+<tr><td>\(\delta_{\text{mem}}\)</td><td>main-memory access latency (Ch. 5)</td><td>≈ 600–800 ns</td></tr>
+</tbody></table></div>
+<h2>Serving</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>TTFT, TPOT, ITL</td><td>time to first token; mean time per output token after the first; inter-token latency</td></tr>
+<tr><td>\(\lambda\), \(W\), \(\bar n\)</td><td>arrival rate; mean time in system; mean number in system (\(\bar n=\lambda W\), Little's law)</td></tr>
+<tr><td>\(t_{\text{gpu}}\), \(t_{\text{cpu}}\)</td><td>GPU time and CPU time of one engine step (Ch. 12)</td></tr>
+<tr><td>\(G\), \(q\)</td><td>goodput: highest arrival rate at which a fraction \(q\) of requests meet both TTFT and TPOT targets (Ch. 13)</td></tr>
+<tr><td>\(\beta_{\text{net}}\)</td><td>network (scale-out) bandwidth available per GPU, bytes/s; 400 Gb/s = 50 GB/s (Ch. 13)</td></tr>
+<tr><td>\(\chi\)</td><td>KV-transfer ratio: time to send a prompt's KV cache divided by the time to prefill it (Ch. 13)</td></tr>
+<tr><td>\(n_P\), \(n_D\)</td><td>numbers of prefill and decode GPUs in a disaggregated deployment (Ch. 13)</td></tr>
+</tbody></table></div>
+<h2>Quantisation (Ch. 14)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(n_b\)</td><td>bits per quantised element</td></tr>
+<tr><td>\(n_g\)</td><td>group (block) size: number of elements sharing one scale</td></tr>
+<tr><td>\(\Delta\), \(\zeta\)</td><td>quantisation step (scale) and zero point; \(\hat x=\Delta\,(q-\zeta)\)</td></tr>
+<tr><td>\(\hat W\), \(\hat x\)</td><td>quantised (dequantised) weight matrix or value</td></tr>
+<tr><td>\(r_c\)</td><td>crest factor \(\max_j\lvert x_j\rvert/\operatorname{rms}(x)\) of a block</td></tr>
+<tr><td>\(\Sigma=XX^\top\)</td><td>second-moment (Gram) matrix of a layer's calibration inputs (GPTQ)</td></tr>
+<tr><td>\(u_j\), \(\alpha_s\)</td><td>SmoothQuant per-channel scales and migration strength</td></tr>
+<tr><td>\(R\)</td><td>orthogonal rotation (QuaRot, SpinQuant); \(\mathcal H_d\) a \(d\times d\) Hadamard matrix</td></tr>
+</tbody></table></div>
+<h2>Pruning and distillation (Ch. 15)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(\eta\)</td><td>sparsity: fraction of weights (or activations) that are zero</td></tr>
+<tr><td>\(p_a\)</td><td>probability that an FFN neuron is active for a given token (contextual sparsity)</td></tr>
+<tr><td>\(p_{\text{te}}\), \(p_{\text{st}}\)</td><td>teacher and student next-token distributions (distillation)</td></tr>
+<tr><td>\(\mathrm{KL}(p\,\Vert\,q)\)</td><td>Kullback–Leibler divergence \(\sum_v p(v)\log\frac{p(v)}{q(v)}\)</td></tr>
+</tbody></table></div>
+<h2>Fine-tuning and parameter-efficient adaptation (Ch. 16)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(\mathcal I\)</td><td>set of response positions that carry loss in supervised fine-tuning</td></tr>
+<tr><td>\(W_0\), \(\Delta W\)</td><td>frozen pre-trained matrix; the update fine-tuning learns</td></tr>
+<tr><td>\(W_{\downarrow}, W_{\uparrow}\), \(r_a\)</td><td>LoRA down- and up-projections and adapter rank (as in Ch. 27)</td></tr>
+<tr><td>\(\alpha_a\), \(s\)</td><td>LoRA scaling constant; effective scale \(s=\alpha_a/r_a\) (\(\alpha_a/\sqrt{r_a}\) in rsLoRA). Not the latency \(\alpha\)</td></tr>
+<tr><td>\(\nabla_W\)</td><td>full-fine-tuning gradient \(X^\top G\) of a matrix (never formed in LoRA)</td></tr>
+<tr><td>\(\eta_{\text{lr}}\)</td><td>learning rate (subscript distinguishes it from the sparsity \(\eta\))</td></tr>
+<tr><td>\(m\), \(\lVert V\rVert_c\)</td><td>DoRA magnitude vector; vector of column norms</td></tr>
+<tr><td>\(l_p\)</td><td>number of learned prefix or soft-prompt positions</td></tr>
+<tr><td>\(n_{\text{DP}}\)</td><td>data-parallel degree (ZeRO/FSDP sharding factor)</td></tr>
+</tbody></table></div>
+<h2>Communication (Ch. 17 onwards)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(n_p\)</td><td>number of GPUs (ranks) taking part in a collective</td></tr>
+<tr><td>\(\nu\)</td><td>bytes in each rank's buffer for a collective (the message size)</td></tr>
+<tr><td>\(\alpha\)</td><td>per-step (per-message) latency of a communication step, seconds</td></tr>
+<tr><td>\(\beta_{\text{link}}\)</td><td>per-GPU, per-direction link bandwidth, bytes/s (NVLink on H100: 450 GB/s)</td></tr>
+<tr><td>\(n_{\text{TP}}, n_{\text{PP}}, n_{\text{DP}}, n_{\text{CP}}, n_{\text{EP}}\)</td><td>degrees of tensor, pipeline, data, context and expert parallelism (Ch. 18–18)</td></tr>
+<tr><td>\(n_\mu\)</td><td>number of micro-batches in flight in a pipeline (Ch. 18)</td></tr>
+<tr><td>\(T_c\)</td><td>tokens of a sequence held by one device under context parallelism (Ch. 18)</td></tr>
+</tbody></table></div>
+<h2>Mixture of experts (Ch. 19)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th><th>DeepSeek-V3</th></tr></thead><tbody>
+<tr><td>\(n_{\text{exp}}\)</td><td>routed experts per MoE layer</td><td>256</td></tr>
+<tr><td>\(k_r\)</td><td>experts selected per token (top-\(k_r\))</td><td>8</td></tr>
+<tr><td>\(d_e\)</td><td>hidden width of one expert's FFN</td><td>2048</td></tr>
+<tr><td>\(W_r\)</td><td>router (gate) matrix, \(d\times n_{\text{exp}}\); affinities \(s_{t,i}\)</td><td></td></tr>
+<tr><td>\(m_e\)</td><td>tokens routed to one expert in a step, \(\approx Bk_r/n_{\text{exp}}\)</td><td></td></tr>
+<tr><td>\(f_i\), \(\bar p_i\)</td><td>fraction of tokens routed to expert \(i\); mean router probability of expert \(i\)</td><td></td></tr>
+<tr><td>\(\omega_i\)</td><td>routing bias of expert \(i\) (auxiliary-loss-free balancing)</td><td></td></tr>
+</tbody></table></div>
+<h2>Speculative decoding (Ch. 20)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(q(v)\)</td><td>draft model's next-token distribution (the target's is \(p(v)\))</td></tr>
+<tr><td>\(\gamma\)</td><td>number of draft tokens proposed per verification step</td></tr>
+<tr><td>\(a\)</td><td>per-token acceptance probability, \(a=\sum_v\min(p(v),q(v))=1-\mathrm{TV}(p,q)\)</td></tr>
+<tr><td>\(n_{\text{acc}}\)</td><td>tokens produced per verification step (accepted drafts plus one)</td></tr>
+<tr><td>\(c_d\)</td><td>cost of one draft step relative to one target decode step</td></tr>
+</tbody></table></div>
+<h2>Long context (Ch. 21)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(T_{\text{train}}\)</td><td>longest context seen in (pre-)training</td></tr>
+<tr><td>\(\mu\)</td><td>context-extension factor, target length \(/\,T_{\text{train}}\)</td></tr>
+<tr><td>\(\Lambda_r=2\pi/\theta_r\)</td><td>wavelength (in tokens) of RoPE frequency pair \(r\)</td></tr>
+<tr><td>\(n_{\text{rot}}(r)=T_{\text{train}}/\Lambda_r\)</td><td>rotations pair \(r\) completes over the training length; \(c_{\text{lo}},c_{\text{hi}}\) YaRN ramp thresholds</td></tr>
+<tr><td>\(k_s\)</td><td>tokens (or blocks) selected per query by sparse attention</td></tr>
+</tbody></table></div>
+<h2>Recurrent and state-space layers (Ch. 22)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(\mathcal S_t\)</td><td>matrix-valued recurrent state of a linear-attention head after token \(t\) (\(d_v\times d_k\))</td></tr>
+<tr><td>\(\psi(\cdot)\)</td><td>feature map of linear attention, \(\psi(q)^\top\psi(k)\approx\) similarity</td></tr>
+<tr><td>\(f_t\), \(\eta_t\)</td><td>forget (decay) gate in \((0,1]\) and write rate of a gated / delta-rule state update</td></tr>
+<tr><td>\(\mathbf A\), \(\mathbf b_t\), \(\mathbf c_t\)</td><td>SSM state matrix (diagonal) and input-dependent input/output vectors (Mamba's \(A,B,C\))</td></tr>
+<tr><td>\(\Delta_t\)</td><td>SSM discretisation step (Ch. 22 only; unrelated to the quantisation step of Ch. 14)</td></tr>
+<tr><td>\(d_s\)</td><td>SSM state size per channel (Mamba's \(N\))</td></tr>
+</tbody></table></div>
+<h2>Reinforcement learning (Ch. 23–25)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(p_\theta\), \(p_{\text{ref}}\), \(p_{\theta_{\text{old}}}\)</td><td>policy (the model's distribution; never \(\pi\), which is peak FLOP/s); frozen reference policy; policy that generated the rollouts</td></tr>
+<tr><td>\(x\), \(y=(y_1,\dots,y_{n_y})\)</td><td>prompt; sampled response of \(n_y\) tokens</td></tr>
+<tr><td>\(s_t=(x,y_{&lt;t})\), \(a_t=y_t\)</td><td>state (prefix) and action (token) of the token-level MDP</td></tr>
+<tr><td>\(\mathcal R(x,y)\), \(\mathcal R_t\)</td><td>sequence reward; per-step reward (zero except at the end, plus KL shaping)</td></tr>
+<tr><td>\(J(\theta)\), \(J_{\text{KL}}\)</td><td>expected reward; KL-regularised objective</td></tr>
+<tr><td>\(V^{p}\), \(Q^{p}\), \(A^{p}\); \(V_\psi\)</td><td>state-value, action-value and advantage functions of policy \(p\); learned critic (not the attention matrices \(V\), \(Q\))</td></tr>
+<tr><td>\(\hat A_t\), \(\delta_t\)</td><td>advantage estimate; TD error \(\mathcal R_t+\gamma_dV(s_{t+1})-V(s_t)\)</td></tr>
+<tr><td>\(\gamma_d\), \(\lambda_{\text{GAE}}\)</td><td>discount factor (usually 1); GAE parameter (not the draft length \(\gamma\) or arrival rate \(\lambda\))</td></tr>
+<tr><td>\(\beta_{\text{KL}}\)</td><td>KL-penalty coefficient (not the bandwidth \(\beta\))</td></tr>
+<tr><td>\(\varrho_t\), \(\epsilon_{\text{clip}}\)</td><td>importance ratio \(p_\theta/p_{\theta_{\text{old}}}\) of token \(t\); PPO clipping range</td></tr>
+<tr><td>\(\varrho^{\text{ref}}_t\), \(k_1,k_2,k_3\)</td><td>ratio \(p_{\text{ref}}/p_\theta\); the three per-token KL estimators</td></tr>
+<tr><td>\(p^*\), \(Z(x)\)</td><td>optimum of the KL-regularised objective, \(p^*\propto p_{\text{ref}}e^{\mathcal R/\beta_{\text{KL}}}\); its normaliser</td></tr>
+<tr><td>\(y_w\succ y_l\)</td><td>preferred ("winning") and rejected responses of a comparison (Ch. 24)</td></tr>
+<tr><td>\(\mathcal R_\phi\)</td><td>learned reward model with parameters \(\phi\)</td></tr>
+<tr><td>\(\sigma(u)\)</td><td>logistic function \(1/(1+e^{-u})\) (as a function; not a singular value)</td></tr>
+<tr><td>\(\hat{\mathcal R}_\theta=\beta_{\text{KL}}\log(p_\theta/p_{\text{ref}})\)</td><td>DPO's implicit reward</td></tr>
+<tr><td>\(h_\theta\)</td><td>log-ratio margin \(\log\frac{p_\theta(y_w)}{p_{\text{ref}}(y_w)}-\log\frac{p_\theta(y_l)}{p_{\text{ref}}(y_l)}\) (IPO)</td></tr>
+<tr><td>\(m_{\text{SimPO}}\)</td><td>SimPO's target reward margin</td></tr>
+<tr><td>\(n_{y,i}\)</td><td>length of response \(i\) of a group (Ch. 25)</td></tr>
+<tr><td>\(P_{\text{info}}(p_s,n_s)\)</td><td>probability that a group of \(n_s\) samples contains both a success and a failure</td></tr>
+<tr><td>\(\epsilon_{\text{low}},\epsilon_{\text{high}}\)</td><td>DAPO's decoupled lower and upper clipping ranges</td></tr>
+<tr><td>\(n_{\text{stale}}\)</td><td>policy updates by which rollouts lag the trained policy in asynchronous RL</td></tr>
+</tbody></table></div>
+<h2>Reasoning and test-time compute (Ch. 26)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(n_s\)</td><td>number of independent samples drawn for one problem (pass@\(n_s\), voting, best-of-\(n_s\))</td></tr>
+<tr><td>\(p_s\)</td><td>probability that a single sample solves the problem</td></tr>
+<tr><td>\(n_{\text{think}}\)</td><td>reasoning ("thinking") tokens generated before the answer</td></tr>
+<tr><td>\(\mathcal R_i\), \(\hat A_i\)</td><td>reward of rollout \(i\); its group-relative advantage (GRPO)</td></tr>
+</tbody></table></div>
+<h2>Serving at scale (Ch. 27)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(n_r\)</td><td>number of replicas behind a router</td></tr>
+<tr><td>\(u\)</td><td>utilisation: offered load divided by capacity</td></tr>
+<tr><td>\(n_c\)</td><td>replicas sampled per routing decision (power of \(n_c\) choices)</td></tr>
+<tr><td>\(W_{\downarrow}, W_{\uparrow}\), \(r_a\)</td><td>LoRA down- and up-projections and adapter rank; \(\Delta W=W_{\downarrow}W_{\uparrow}\)</td></tr>
+<tr><td>\(c_{\text{gpu}}\)</td><td>price of one GPU-hour, in dollars</td></tr>
+<tr><td>\(\Phi\), \(n_g\)</td><td>tokens per second produced by a replica at its operating point; GPUs per replica</td></tr>
+</tbody></table></div>
+<h2>Units</h2>
+<p>• Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.</p>
+<p>• FLOPs = floating-point operations (a count); FLOP/s = rate. A multiply-add counts as 2 FLOPs.</p>
+<p>• "Dense" throughput figures never include the 2× structured-sparsity marketing factor.</p>
+</div>
+</body>
+</html>

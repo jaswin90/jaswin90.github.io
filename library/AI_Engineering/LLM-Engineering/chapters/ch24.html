@@ -1,0 +1,601 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 28 · Benchmarking, Observability and Evaluation — Introduction to LLM Engineering</title>
+<meta name="description" content="Chapter 28 of Introduction to LLM Engineering: precise latency and throughput metrics, open- and closed-loop load and coordinated omission, workloads and percentile statistics, MLPerf Inference, production observability with traces and SLO burn-rate alerts, statistically sound quality evaluation, and reproducibility.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script defer src="/library/assets/book-shim.js" data-library="/library/" data-field="/library/AI_Engineering/" data-field-title="AI Engineering"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-chapter="ch24" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Part IX · Production — Chapter 28</div>
+<h1 id="top">Benchmarking, Observability and Evaluation</h1>
+<p class="lede">Every decision in this book rests on a measurement: of throughput at a latency target, of tail latency under load, of the cost of a token, of whether a quantised or upgraded model still answers as well. This chapter is about making those measurements correctly. It defines the metrics precisely, shows how load generators and percentiles mislead, surveys standard benchmarks, builds the observability a production fleet needs, and treats quality evaluation as a statistical problem with a sample size.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Inference performance numbers are easy to produce and easy to get wrong. A vendor reports tokens per second without saying at what latency; a blog compares engines with a load generator that waits for each response before sending the next request, hiding the queueing that users would see; an A/B test declares a quantised model "lossless" on three hundred questions, a sample too small to detect anything less than a five-point drop; a dashboard averages time per output token over requests when the product cares about the slowest tokens. Each of these errors has led real teams to wrong decisions, and each is avoidable with a little care and a little statistics.</p>
+<p>The chapter is organised around three activities. <em>Benchmarking</em> measures a system under controlled load to compare configurations or engines; its problems are defining metrics, generating load and choosing workloads. <em>Observability</em> measures a live system continuously to operate it; its problems are what to record, how to follow one request across many components, and when to wake someone up. <em>Evaluation</em> measures output quality, especially whether a change has made it worse; its problems are statistical power, the reliability of automatic judges and the subtle ways that serving changes alter outputs. Throughout, we reuse the models of earlier chapters, the roofline and queueing, as the expectations against which measurements are checked.</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Define TTFT, TPOT, inter-token latency, end-to-end latency, throughput and goodput precisely, and avoid common aggregation errors.</li>
+<li>Explain open- and closed-loop load generation and coordinated omission, and design a load sweep.</li>
+<li>Quantify the sampling uncertainty of tail percentiles and choose benchmark durations accordingly.</li>
+<li>Describe MLPerf Inference's scenarios and rules, and the pitfalls of vendor and engine benchmarks.</li>
+<li>Design production observability: metrics, distributed traces, SLOs and burn-rate alerts.</li>
+<li>Design quality evaluation for serving changes: offline suites, numerical checks, canaries and A/B tests with adequate statistical power.</li>
+</ol>
+<p class="small muted">Uses: Chapters 3, 4, 6, 11, 12, 13, 14 and 27. Symbols: <a href="../notation.html">notation page</a>.</p>
+</div>
+
+<h2 id="s24-1">28.1 What to measure</h2>
+<p>Recall the life of a streaming request (§3.7). It is sent at time \(t_0\), its first output token arrives at \(t_1\), and its remaining \(n_{\text{out}}-1\) tokens arrive at times \(t_2,\dots,t_{n_{\text{out}}}\). Four latency metrics are defined from these times. <strong>Time to first token</strong> is \(\text{TTFT}=t_1-t_0\), the sum of queueing, prefill and the first decode step. <strong>Inter-token latency</strong> (ITL) is the sequence of gaps \(t_{k+1}-t_k\), one per token. <strong>Time per output token</strong> for the request is the mean gap, \(\text{TPOT}=(t_{n_{\text{out}}}-t_1)/(n_{\text{out}}-1)\). <strong>End-to-end latency</strong> is \(t_{n_{\text{out}}}-t_0=\text{TTFT}+(n_{\text{out}}-1)\,\text{TPOT}\).</p>
+
+<figure class="diagram" id="fig-24-1">
+<svg class="dg" viewBox="0 0 720 180" role="img" aria-label="Latency metrics on a request timeline">
+<text x="20" y="18" class="t-sm t-b">One streaming request</text>
+<line x1="40" y1="90" x2="690" y2="90" class="ln"/>
+<circle cx="60" cy="90" r="5" class="fill-muted"/><text x="60" y="114" text-anchor="middle" class="t-xs">sent t₀</text>
+<rect x="60" y="70" width="90" height="14" class="fill-s4"/><text x="105" y="64" text-anchor="middle" class="t-xs">queue</text>
+<rect x="150" y="70" width="120" height="14" class="fill-s2"/><text x="210" y="64" text-anchor="middle" class="t-xs">prefill</text>
+<g><circle cx="280" cy="90" r="5" class="fill-acc"/><circle cx="320" cy="90" r="5" class="fill-acc"/><circle cx="355" cy="90" r="5" class="fill-acc"/><circle cx="420" cy="90" r="5" class="fill-acc"/><circle cx="455" cy="90" r="5" class="fill-acc"/><circle cx="490" cy="90" r="5" class="fill-acc"/><circle cx="530" cy="90" r="5" class="fill-acc"/><circle cx="565" cy="90" r="5" class="fill-acc"/><circle cx="660" cy="90" r="5" class="fill-acc"/></g>
+<text x="280" y="114" text-anchor="middle" class="t-xs">t₁</text><text x="660" y="114" text-anchor="middle" class="t-xs">t_n</text>
+<line x1="60" y1="130" x2="280" y2="130" class="ln"/><text x="170" y="146" text-anchor="middle" class="t-xs">TTFT</text>
+<line x1="280" y1="130" x2="660" y2="130" class="ln"/><text x="470" y="146" text-anchor="middle" class="t-xs">(n − 1) × TPOT; individual gaps are ITLs</text>
+<text x="387" y="78" text-anchor="middle" class="t-xs t-s2">stall</text><text x="612" y="78" text-anchor="middle" class="t-xs t-s2">stall</text>
+<line x1="60" y1="166" x2="660" y2="166" class="ln dash"/><text x="360" y="178" text-anchor="middle" class="t-xs">end-to-end latency</text>
+</svg>
+<figcaption><b>Figure 28.1 — Latency metrics.</b> TTFT covers queueing, prefill and the first token; TPOT is the mean gap after it; inter-token latencies are the individual gaps, whose stalls (here two) a mean hides.</figcaption></figure>
+
+<p>Figure 28.1 marks the metrics on a timeline. Two subtleties cause most reporting errors. The first is that <em>TPOT and ITL are different distributions</em>. A request with mostly 20 ms gaps and two 300 ms stalls, caused for instance by a long prefill sharing its steps (§11.5), has a modest mean TPOT, but a user watching the stream sees the stalls. Products that care about smoothness should report percentiles of ITL over all tokens, not only percentiles of per-request TPOT. The second is <em>how averages are taken</em>. The mean of per-request TPOT weights every request equally; the total decode time divided by total decode tokens weights every token equally, and the two differ whenever short and long requests have different speeds. Neither is wrong, but a comparison must use the same one, and percentiles should be computed over the unit the product cares about: requests for TTFT, tokens for ITL.</p>
+<p>On the throughput side, the quantities are <strong>request throughput</strong>, <strong>output tokens per second</strong> and <strong>total tokens per second</strong> (input plus output), all usually normalised per GPU to compare configurations. They are meaningless without a latency condition, because any system can raise throughput by accepting more latency (§6.6). The right summary is therefore <strong>goodput</strong> (§13.2): the highest request rate at which, say, 99% of requests meet both TTFT and TPOT targets, or a full curve of throughput against latency. A single throughput number is an advertisement, not a measurement. The same holds for latency without load: a TTFT measured on an idle server says how fast the system can be, not how fast it will be for users at the busiest hour.</p>
+
+<h2 id="s24-2">28.2 Generating load</h2>
+<p>A benchmark needs a load generator that sends requests to the system and records the times of Figure 28.1. The most consequential design choice is whether the generator is <em>closed-loop</em> or <em>open-loop</em>. A closed-loop generator runs a fixed number of virtual users, each of which sends a request, waits for the complete response, and then sends the next. An open-loop generator sends requests at times drawn from an arrival process, typically Poisson at a chosen rate \(\lambda\), regardless of whether earlier requests have finished.</p>
+
+<figure class="diagram" id="fig-24-2">
+<svg class="dg" viewBox="0 0 720 210" role="img" aria-label="Closed-loop versus open-loop load and coordinated omission">
+<text x="20" y="18" class="t-sm t-b">Closed loop: a slow response delays the next request (the stall is hidden)</text>
+<g><rect x="40" y="34" width="60" height="18" rx="3" class="fill-acc"/><rect x="104" y="34" width="60" height="18" rx="3" class="fill-acc"/><rect x="168" y="34" width="240" height="18" rx="3" class="fill-s2"/><rect x="412" y="34" width="60" height="18" rx="3" class="fill-acc"/><rect x="476" y="34" width="60" height="18" rx="3" class="fill-acc"/></g>
+<text x="288" y="48" text-anchor="middle" class="t-xs t-on">one slow request (server stalled)</text>
+<text x="40" y="72" class="t-xs">only one request experiences the stall; requests that would have arrived meanwhile were never sent</text>
+<text x="20" y="108" class="t-sm t-b">Open loop: requests arrive on schedule; all of them see the stall</text>
+<g><rect x="40" y="124" width="60" height="18" rx="3" class="fill-acc"/><rect x="104" y="124" width="60" height="18" rx="3" class="fill-acc"/><rect x="168" y="124" width="240" height="18" rx="3" class="fill-s2"/>
+<rect x="230" y="146" width="190" height="14" rx="3" class="fill-s2"/><rect x="292" y="164" width="140" height="14" rx="3" class="fill-s2"/><rect x="354" y="182" width="90" height="14" rx="3" class="fill-s2"/></g>
+<line x1="230" y1="120" x2="230" y2="144" class="ln dash"/><line x1="292" y1="120" x2="292" y2="162" class="ln dash"/><line x1="354" y1="120" x2="354" y2="180" class="ln dash"/>
+<text x="470" y="160" class="t-xs">arrivals during the stall wait,</text><text x="470" y="174" class="t-xs">so the tail is measured honestly</text>
+</svg>
+<figcaption><b>Figure 28.2 — Coordinated omission.</b> A closed-loop generator stops sending while the system is slow, so it records one slow request where real users would have produced many. An open-loop generator keeps the arrival schedule, and every request that arrives during a stall records the wait.</figcaption></figure>
+
+<p>Figure 28.2 shows why the difference matters. When the server stalls, a closed-loop generator's users are all waiting, so no new requests are sent; the stall is recorded once, by the request that was in flight, and the requests that real users would have sent during the stall, each of which would have waited, simply do not exist. Gil Tene named this <strong>coordinated omission</strong>: the measuring system coordinates with the system under test to omit exactly the bad samples. Closed-loop benchmarks therefore understate tail latency, often dramatically, and they also cannot measure behaviour at a given arrival rate, since their arrival rate is whatever the system's own speed allows. Real users do not wait for one another, so production-like benchmarks must be open-loop. Closed-loop runs remain useful for one thing: measuring the maximum throughput of a system at a fixed concurrency, as in the "offline" scenario of §28.4.</p>
+<p>An open-loop benchmark is run as a <em>sweep</em> over arrival rates. At each rate the system is warmed up (caches filled, CUDA graphs captured, autoscaling settled), then measured for long enough to collect stable percentiles (§28.3), then drained. The result is a family of curves, TTFT and TPOT percentiles and achieved throughput against offered load, and the goodput is read off where the percentiles cross their targets. Near saturation the curves bend sharply, as queueing theory predicts.</p>
+
+<figure class="chart" id="fig-24-3">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Latency against offered load near saturation (M/M/1 model)","height":320,
+ "x":{"label":"Offered load as a fraction of capacity","min":0,"max":1,"fmt":"pct","ticks":[0,0.2,0.4,0.6,0.8,1]},
+ "y":{"label":"Response time in mean service times (log)","log":true,"min":0.9,"max":120,"ticks":[1,2,5,10,20,50,100]},
+ "series":[
+  {"name":"P99 response time","color":"s2","points":[[0.1,5.1],[0.3,6.6],[0.5,9.2],[0.7,15.3],[0.8,23.0],[0.9,46.0],[0.95,92.0]]},
+  {"name":"Mean response time","color":"s1","points":[[0.1,1.11],[0.3,1.43],[0.5,2.0],[0.7,3.33],[0.8,5.0],[0.9,10.0],[0.95,20.0]]}
+ ]}
+</script>
+<figcaption><b>Figure 28.3 — The knee.</b> For an M/M/1 queue the response time is exponential with mean \(1/(\mu-\lambda)\), so its P99 is \(4.6/(1-u)\) service times. Latency is nearly flat until about 70% load and grows without bound towards saturation; real engines differ in detail but share the shape. A benchmark must report where on this curve it was taken.</figcaption></figure>
+
+<p>Figure 28.3 shows the textbook shape for a single queue: mean and P99 response times are nearly flat at low load, double between 50% and 75%, and diverge as load approaches capacity. Batching engines are more complicated, since their service rate rises with batch size until memory or the latency target binds, but every measured LLM system shows a knee of this kind. Its practical meaning is that a throughput number taken near the knee and one taken well before it describe different systems, and that "maximum throughput", measured at saturation, is a number no production system should operate at.</p>
+
+<h2 id="s24-3">28.3 Workloads and statistics</h2>
+<p>The second determinant of a benchmark is its <strong>workload</strong>: the distributions of input and output lengths, the amount of prefix sharing, the sampling parameters and the content itself. All of them change the result. Output length sets the decode share and, for reasoning models, dominates everything (Chapter 26); input length sets prefill cost and cache size; prefix sharing sets cache hit rates (Chapter 10); sampling settings change speculative acceptance (Chapter 20); and content matters too, because prompts of random tokens have unrealistic tokenisation, defeat prefix caching and produce unnatural outputs whose lengths are whatever the model's end-of-sequence behaviour happens to give. Fixing output lengths by ignoring end-of-sequence tokens is common in benchmarks and acceptable for measuring speed, but it must be stated.</p>
+<p>The best workloads come from the product itself: anonymised traces of real requests, with their arrival times, lengths and prefix structure. When those are unavailable, public datasets of real conversations (ShareGPT, LMSYS-Chat-1M) and published production traces (for example Azure's LLM inference traces released with Splitwise) give realistic distributions. A benchmark should state its workload exactly, because two engines can swap rankings between a short-prompt chat workload and a long-document workload, and a result measured on one says little about the other.</p>
+<p>The third determinant is <strong>duration</strong>, because tail percentiles are noisy. Estimate the P99 of a latency distribution from \(n\) samples and the estimate itself has a sampling error: only about \(0.01n\) samples lie above the true P99, so the estimate rests on a few dozen samples even when \(n\) is several thousand. For an exponential latency distribution, a simulation gives the relative standard error of the sample P99 below.</p>
+
+<figure class="chart" id="fig-24-4">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Relative standard error of an estimated P99 (exponential latencies, simulation)","height":300,
+ "x":{"label":"Number of samples (log)","log":true,"min":80,"max":120000,"ticks":[100,300,1000,3000,10000,100000]},
+ "y":{"label":"Std. error / true P99","log":true,"min":0.005,"max":0.25,"ticks":[0.01,0.02,0.05,0.1,0.2]},
+ "hlines":[{"y":0.05,"text":"±5% (one standard error)"}],
+ "series":[
+  {"name":"Sample P99","color":"s1","points":[[100,0.173],[300,0.118],[1000,0.068],[3000,0.038],[10000,0.02],[100000,0.008]]}
+ ]}
+</script>
+<figcaption><b>Figure 28.4 — Tails need samples.</b> The error of an estimated P99 falls as \(1/\sqrt n\): about 17% with 100 samples, 7% with 1,000, 2% with 10,000. Differences of a few per cent in P99 between two runs with a thousand requests each are noise.</figcaption></figure>
+
+<p>Figure 28.4 shows that a P99 estimated from 100 requests is uncertain by about 17%, from 1,000 by about 7%, and from 10,000 by about 2%. For P99.9 the numbers are worse by about a factor of three. A benchmark that runs for a minute at ten requests per second has 600 samples, enough to see a 20% change in P99 but not a 5% one. The practical rules are to run each measurement long enough for the percentile it reports (thousands of requests for P99), to repeat runs to see run-to-run variation, which includes effects such as GPU clock behaviour and placement that the sampling formula ignores, and to report confidence intervals or at least the number of samples alongside every percentile.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — how many requests for a trustworthy p99?</div>
+<p><strong>Setup.</strong> We estimate the 99th percentile of TPOT from \(n\) independent requests. The number of samples above the true p99 is binomial with parameters \(n\) and \(p=0.01\), with mean \(np\) and standard deviation \(\sqrt{np(1-p)}\).</p>
+<p><strong>With 1,000 requests.</strong> The expected count above the true p99 is 10, with standard deviation \(\sqrt{9.9}\approx3.1\). A 95% interval for the count is roughly \(10\pm6\), so the empirical p99 (the 10th-largest sample) could correspond to any true quantile between about p98.4 and p99.6. On a latency distribution with a heavy tail, that interval can span tens of per cent in milliseconds.</p>
+<p><strong>With 10,000 requests.</strong> The count is \(100\pm20\), so the empirical p99 lies between about p98.8 and p99.2. Precision improves as \(1/\sqrt n\): ten times more requests for about three times less uncertainty in the quantile level.</p>
+<p><strong>Consequence.</strong> A benchmark that reports p99 from a few hundred requests is reporting noise, and comparing two systems at p99 needs thousands of requests per configuration, or bootstrapped confidence intervals shown alongside the numbers (§28.9). For p99.9 the counts must be ten times larger again.</p>
+</div>
+
+<h2 id="s24-4">28.4 Standard benchmarks</h2>
+<p>Comparisons across vendors and systems need agreed rules, and the most established set is <strong>MLPerf Inference</strong>, run by the MLCommons consortium since 2019<span class="cite"><a href="#r-mlperf">[1]</a></span>. MLPerf fixes the model, the dataset, the accuracy that submissions must preserve (for LLMs, typically 99% or 99.9% of a reference implementation's score on the benchmark's metric) and the way load is generated, through a common load generator (LoadGen). Its scenarios correspond to the regimes of this chapter. <em>Offline</em> gives the system all queries at once and measures throughput, the closed-loop maximum. <em>Server</em> sends queries as a Poisson process and measures the highest rate at which latency constraints are met, for LLMs a bound on TTFT and on TPOT at the 99th percentile: goodput in all but name. <em>Single-stream</em> and <em>multi-stream</em> scenarios measure latency for edge systems. LLM benchmarks have included GPT-J, Llama 2 70B, Mixtral 8×7B, Llama 3.1 405B and interactive variants with tighter latency bounds.</p>
+
+<figure class="diagram" id="fig-24-5">
+<svg class="dg" viewBox="0 0 720 200" role="img" aria-label="MLPerf Inference scenarios">
+<text x="20" y="18" class="t-sm t-b">MLPerf Inference scenarios and what they measure</text>
+<rect x="20" y="36" width="160" height="120" rx="8" class="bx2"/><text x="100" y="58" text-anchor="middle" class="t-sm t-b">Offline</text><text x="100" y="80" text-anchor="middle" class="t-xs">all queries at once</text><text x="100" y="96" text-anchor="middle" class="t-xs">metric: throughput</text><text x="100" y="120" text-anchor="middle" class="t-xs">batch jobs; the ceiling</text>
+<rect x="200" y="36" width="160" height="120" rx="8" class="bx5"/><text x="280" y="58" text-anchor="middle" class="t-sm t-b">Server</text><text x="280" y="80" text-anchor="middle" class="t-xs">Poisson arrivals</text><text x="280" y="96" text-anchor="middle" class="t-xs">metric: max rate with P99</text><text x="280" y="112" text-anchor="middle" class="t-xs">TTFT and TPOT within bounds</text><text x="280" y="136" text-anchor="middle" class="t-xs">online serving (goodput)</text>
+<rect x="380" y="36" width="160" height="120" rx="8" class="bx3"/><text x="460" y="58" text-anchor="middle" class="t-sm t-b">Single-stream</text><text x="460" y="80" text-anchor="middle" class="t-xs">one query at a time</text><text x="460" y="96" text-anchor="middle" class="t-xs">metric: latency percentile</text><text x="460" y="120" text-anchor="middle" class="t-xs">edge, interactive</text>
+<rect x="560" y="36" width="140" height="120" rx="8" class="bx4"/><text x="630" y="58" text-anchor="middle" class="t-sm t-b">Rules</text><text x="630" y="80" text-anchor="middle" class="t-xs">fixed model, data</text><text x="630" y="96" text-anchor="middle" class="t-xs">accuracy ≥ 99% or</text><text x="630" y="112" text-anchor="middle" class="t-xs">99.9% of reference</text><text x="630" y="128" text-anchor="middle" class="t-xs">common LoadGen; audits</text>
+<text x="360" y="186" text-anchor="middle" class="t-xs">closed divisions fix the model and method; open divisions allow other models and techniques</text>
+</svg>
+<figcaption><b>Figure 28.5 — MLPerf Inference.</b> The scenarios separate throughput (offline) from latency-constrained throughput (server) and single-query latency, under common accuracy rules and a common load generator.</figcaption></figure>
+
+<p>Figure 28.5 summarises the design. MLPerf's strengths are its rules, its accuracy floors (which prevent quantising a model into uselessness to win a throughput race) and its audited, reproducible submissions; its weaknesses are that results lag the newest models and techniques by months and that submissions are heavily tuned for the benchmark. Continuous benchmarks such as SemiAnalysis's InferenceMAX (2025) complement it by re-running popular open models on current engine releases and hardware every night and publishing throughput-versus-interactivity frontiers rather than single points. Engine projects ship their own tools, such as vLLM's serving benchmark, NVIDIA's GenAI-Perf and GuideLLM, which implement open-loop sweeps with configurable workloads.</p>
+<p>Reading any benchmark, including one's own, calls for a checklist. Which model, precision and engine version? Which hardware, how many GPUs, and which parallel layout? Which workload: input and output length distributions, prefix sharing, whether end-of-sequence was ignored? Open or closed loop, at what rates, for how long, with what warm-up? Which percentiles, computed over requests or tokens? Under what latency targets, and what accuracy check? A result that does not answer these questions cannot be compared with another.</p>
+
+<details class="drill">
+<summary>Drill 28.1 — Spot the flaw</summary>
+<p>A report claims "engine X is 40% faster than engine Y", based on running 64 concurrent clients that each send a 512-token random prompt, wait for a 512-token response with end-of-sequence ignored, and repeat, for two minutes per engine, reporting output tokens per second and mean TPOT. List what is wrong or missing.</p>
+<p><em>Solution.</em> Closed-loop load at fixed concurrency measures throughput at one operating point and hides queueing (coordinated omission), so it says nothing about latency at a given request rate; there is no latency target, so "faster" is undefined; mean TPOT hides stalls (use ITL percentiles); random prompts defeat prefix caching and are unlike real text, and fixed lengths remove the output-length variance that drives scheduling behaviour; two minutes at 64 concurrency gives only a few hundred requests, so tail percentiles would be noisy even if reported; there is no warm-up, no repeat runs, no engine versions, precision or configuration (chunk size, max sequences, CUDA graphs) and no accuracy check, so a configuration difference could explain the gap. A sound comparison sweeps open-loop rates with a realistic workload and reports goodput under stated TTFT and TPOT targets.</p>
+</details>
+
+<h2 id="s24-5">28.5 Checking measurements against models</h2>
+<p>A benchmark result should never be accepted on its own; it should be compared with what the roofline and queueing models predict. The comparison catches errors in both directions: a result much better than the model allows usually means the benchmark is not measuring what it claims (outputs truncated early, caches silently hit, the wrong precision), and a result much worse means a configuration or kernel problem worth finding. Chapter 12's worked example of a slow decode (§12.8) is the template: compute the bytes and FLOPs a step must perform, divide by bandwidth and peak, and compare with the measured step time; the ratio is the achieved MBU or MFU, and values far from the 60–90% that good kernels reach point to the component to investigate.</p>
+<p>The same check works at every level. <em>Microbenchmarks</em> measure single components in isolation: a GEMM of the model's shapes against the tensor-core roofline, an attention kernel's bytes per second against HBM bandwidth at the target context lengths, an all-reduce of the decode message size against the α–β model of Chapter 17, the KV-transfer bandwidth between disaggregated workers against the network's rating. <em>Step-level</em> measurements compare whole forward passes against the sum of their parts, revealing overheads such as kernel launches, synchronisation and CPU scheduling (§12.2). <em>System-level</em> measurements compare end-to-end throughput and latency curves against the queueing behaviour expected from the step times and the arrival process. A discrepancy at one level that is absent at the level below localises the problem.</p>
+<div class="box example">
+<div class="box-title">Worked example — is this benchmark plausible?</div>
+<p>A report claims Llama 3 70B in BF16 on a single 8×H100 server decoding 120,000 output tokens per second at a TPOT of 10 ms. <strong>Check:</strong> at 10 ms per step, 120,000 tokens per second means 1,200 sequences per step. Each step must read the 141 GB of weights once and each sequence's cache; even at a context of only 1,000 tokens, 1,200 sequences hold \(1200\times1000\times320\) KiB ≈ 393 GB of cache, which does not fit in 640 GB of HBM beside the weights and could not be read in 10 ms at \(8\times3.35\) TB/s ≈ 26.8 TB/s, which allows at most 268 GB per step. The claim exceeds the memory roofline by more than a factor of two even before counting compute (1,200 tokens × 141 GFLOPs ≈ 169 TFLOPs per step, 21 ms at 8 × 989 TFLOP/s). Either the precision is not BF16, the contexts are tiny, the batch is counted differently, or the measurement is wrong. Ten seconds of arithmetic saves a week of chasing an impossible target.</p>
+</div>
+
+<h2 id="s24-6">28.6 Observability in production</h2>
+<p>A benchmark measures a system once under controlled load; observability measures it continuously under real load, to keep it healthy and to explain its behaviour. Three kinds of data are collected. <strong>Metrics</strong> are numerical time series, counters and histograms, aggregated cheaply over many requests: request rates and error rates, TTFT, TPOT and ITL histograms, queue lengths, running and waiting sequences, KV-cache usage, prefix-cache hit rate, preemptions, tokens per step, and GPU-level counters such as memory, power and SM activity (§12.8). <strong>Traces</strong> follow individual requests through the system. <strong>Logs</strong> record discrete events, errors and configuration changes. A widely used checklist for services is RED, rate, errors and duration, per endpoint; for resources it is USE, utilisation, saturation and errors, per resource. For LLM serving, tokens must be added to both: rate in tokens per second, duration split into TTFT and TPOT, and saturation in KV usage and queue depth.</p>
+<p><strong>Distributed tracing</strong> is how one answers "why was this request slow?" in a fleet. Each request carries a trace identifier through the gateway, the router, the prefill and decode workers and any KV transfers, and each component records <em>spans</em>, timed intervals with attributes, so that the request's life can be drawn as a waterfall. The OpenTelemetry standard defines the formats, and several engines emit spans for queueing, prefill, decode and transfer.</p>
+
+<figure class="diagram" id="fig-24-6">
+<svg class="dg" viewBox="0 0 720 220" role="img" aria-label="Trace waterfall of one request">
+<text x="20" y="18" class="t-sm t-b">Trace of one slow request (spans, time to the right)</text>
+<text x="20" y="48" class="t-xs">gateway</text><rect x="120" y="38" width="560" height="14" rx="3" class="fill-muted"/>
+<text x="20" y="72" class="t-xs">auth + rate limit</text><rect x="122" y="62" width="20" height="14" rx="3" class="fill-s4"/>
+<text x="20" y="96" class="t-xs">router</text><rect x="144" y="86" width="16" height="14" rx="3" class="fill-s4"/>
+<text x="20" y="120" class="t-xs">prefill queue</text><rect x="162" y="110" width="230" height="14" rx="3" class="fill-s2"/><text x="277" y="121" text-anchor="middle" class="t-xs t-on">waiting: KV pool full</text>
+<text x="20" y="144" class="t-xs">prefill</text><rect x="392" y="134" width="70" height="14" rx="3" class="fill-acc"/>
+<text x="20" y="168" class="t-xs">KV transfer</text><rect x="462" y="158" width="18" height="14" rx="3" class="fill-s3"/>
+<text x="20" y="192" class="t-xs">decode (stream)</text><rect x="480" y="182" width="200" height="14" rx="3" class="fill-acc"/>
+<text x="400" y="212" text-anchor="middle" class="t-xs">the waterfall shows that queueing, not prefill or decode, made this request slow</text>
+</svg>
+<figcaption><b>Figure 28.6 — A trace explains a slow request.</b> Spans from each component, linked by one trace identifier, show where the time went. Here most of the TTFT was spent waiting for KV memory on the prefill worker, pointing to capacity or admission policy rather than kernels.</figcaption></figure>
+
+<p>Figure 28.6 shows such a waterfall. Without it, a high TTFT on a dashboard could be blamed on slow kernels, network, or the model; with it, the cause, a wait for KV memory, is evident, and so is the fix, which lies in capacity or admission policy. Tracing every request is expensive at high rates, so systems sample, keeping all traces of errors and of the slowest requests and a small fraction of the rest ("tail-based sampling"), which preserves exactly the traces that need explaining.</p>
+<p>Observability turns into action through <strong>service-level objectives</strong>. An SLO states a target over a window, for example "99% of requests in each 30-day window have TTFT below 1 s and TPOT below 50 ms". Its complement is an <em>error budget</em>: a 99% objective allows 1% of requests, about 7.2 hours' worth of traffic per month, to miss. Alerting on raw latency spikes wakes people for noise; alerting on the <em>burn rate</em>, the rate at which the budget is being consumed relative to the rate that would exhaust it exactly at the end of the window, catches real problems. A burn rate of 14.4 sustained for an hour consumes 2% of a 30-day budget and deserves a page; a burn rate of 1 sustained for days deserves a ticket. Multi-window burn-rate alerts, combining a short and a long window, are standard practice in site reliability engineering and transfer directly to LLM services.</p>
+
+<details class="drill">
+<summary>Drill 28.2 — An error budget</summary>
+<p>An SLO requires 99.5% of requests per 30 days to meet both latency targets. The service handles 50 requests per second. How many requests may miss per month? An incident causes 20% of requests to miss for 45 minutes; what fraction of the budget does it consume, and what was the burn rate?</p>
+<p><em>Solution.</em> Monthly requests: \(50\times86{,}400\times30\approx1.30\times10^{8}\); budget \(0.5\%\), about 648,000 misses. The incident: \(50\times2{,}700\) s = 135,000 requests, 20% missed, 27,000 misses, about 4.2% of the budget. The burn rate is the miss fraction divided by the allowed fraction: \(0.20/0.005=40\), so at that rate the whole month's budget would be gone in \(30/40\) days, 18 hours. A fast-burn alert (for example burn rate above 14 over 5 minutes and 1 hour) would have fired within minutes.</p>
+</details>
+
+<h2 id="s24-7">28.7 Evaluating quality and catching regressions</h2>
+<p>Performance changes are visible on dashboards; quality changes are not. A new engine version with a subtly wrong kernel, a quantised checkpoint, a changed chat template, a new attention backend or a different batch composition can all change outputs (§12.9), sometimes harmlessly, sometimes by several points on a task that matters. Catching regressions requires deliberate evaluation, at three levels of cost and sensitivity.</p>
+<p>The cheapest and most sensitive level is <strong>numerical</strong>: compare the new system's token log-probabilities with the reference's on fixed sequences (teacher forcing), and greedy outputs on fixed prompts (§12.9). These checks detect implementation errors with a few hundred sequences, because they compare distributions token by token rather than final scores, and they belong in every engine's continuous integration. Their limitation is that they cannot say whether a <em>deliberate</em> change, such as quantisation, matters for users; they only say how large it is.</p>
+<p>The second level is <strong>offline task evaluation</strong>: a suite of benchmarks and product-specific test sets, scored automatically where answers are checkable (exact match, unit tests, numerical answers) and by an LLM judge or humans where they are not. Here the central problem is statistical. A test set of \(n\) items gives an accuracy estimate with standard error \(\sqrt{p(1-p)/n}\), about 2.6 points for \(n=300\) at \(p=0.7\). To detect a drop of \(\Delta_{\text{acc}}\) between two systems with 5% significance and 80% power, each needs about</p>
+\[ n\;\approx\;\frac{(1.96+0.84)^2\,\big(p_1(1-p_1)+p_2(1-p_2)\big)}{\Delta_{\text{acc}}^2} \]
+<p>independent items, the standard two-proportion sample-size formula.</p>
+
+<figure class="chart" id="fig-24-7">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Test items needed per system to detect an accuracy drop (baseline 70%)","height":310,
+ "x":{"label":"Accuracy drop to detect (percentage points, log)","log":true,"min":0.004,"max":0.12,"fmt":"pct","ticks":[0.005,0.01,0.02,0.05,0.1]},
+ "y":{"label":"Items per system (log)","log":true,"min":200,"max":200000,"ticks":[300,1000,3000,10000,30000,100000]},
+ "series":[
+  {"name":"α = 0.05, power 0.8","color":"s1","points":[[0.005,132331],[0.01,33234],[0.02,8381],[0.03,3755],[0.05,1372],[0.1,353]]}
+ ]}
+</script>
+<figcaption><b>Figure 28.7 — Small regressions need large test sets.</b> Detecting a 10-point drop needs about 350 items per system; a 2-point drop about 8,400; a 1-point drop about 33,000. Paired designs (the same items for both systems) and multiple samples per item reduce the requirement, but not by orders of magnitude.</figcaption></figure>
+
+<p>Figure 28.7 is sobering. A 300-question suite, typical of quick checks, can detect only drops of about ten points. Claims that a change is "lossless" on such a suite mean only that the loss is smaller than about ten points. To detect a two-point regression one needs thousands of items, and to detect one point, tens of thousands. Two techniques help. <em>Paired</em> designs, which run both systems on the same items and test the differences item by item (McNemar's test for binary outcomes), remove the variance due to item difficulty and are considerably more powerful than comparing two independent accuracies. And per-task analysis avoids averaging away a large regression on one important task with small gains elsewhere. LLM judges add their own noise and biases (position bias, preference for longer answers, self-preference), so their verdicts must be validated against human labels on a sample and used with order randomisation.</p>
+<p>The third level is <strong>online</strong>: deploy the change to a small fraction of traffic as a canary, compare latency, errors and quality signals (user feedback, task success, downstream metrics) against the control, and expand gradually (§27.8). Online tests measure what matters, but they are slow, noisy and expose some users to the change, which is why the cheaper levels come first: numerical checks to catch bugs, offline suites to bound deliberate changes, and canaries to confirm that users see no difference.</p>
+
+<details class="drill">
+<summary>Drill 28.3 — How big must the eval be?</summary>
+<p>A team will ship an FP8-quantised model if it is no more than one point worse than BF16 on their 70%-accuracy internal task. Their eval has 2,000 items. Can it support the decision? What would a paired analysis need to show?</p>
+<p><em>Solution.</em> With 2,000 items per system, the standard error of the difference of two independent accuracies is about \(\sqrt{2\times0.21/2000}\approx1.45\) points, so a one-point drop is well within noise, and the unpaired test would need about 33,000 items. Run both models on the same 2,000 items and analyse paired outcomes: if the models disagree on, say, 6% of items (120), the standard error of the paired difference is about \(\sqrt{0.06/2000}\approx0.55\) points, so a one-point drop would be detectable at roughly two standard errors; the team should report the paired difference with its confidence interval and check that the upper bound of the loss is below one point. If disagreements are rarer, as is typical for FP8, the paired test is even more powerful, which is one reason paired evaluation is the norm for serving changes.</p>
+</details>
+
+<h2 id="s24-8">28.8 Measuring cost and energy</h2>
+<p>Two further quantities belong in any serious measurement: cost and energy. Cost follows from throughput and price (§27.7), but measured throughput must be taken at the operating point the product will use, at its latency target and realistic utilisation, not at the saturated maximum, or the cost per token will be understated by the same factor as the throughput is overstated. Energy is increasingly a constraint in its own right, because data-centre power, not GPUs, has become the limiting resource for many deployments. A modern GPU draws several hundred watts to over a kilowatt under load; its power can be read from management counters at fine time resolution, and dividing energy by tokens gives <em>joules per token</em>, a metric reported by some benchmarks alongside throughput.</p>
+<p>Energy per token behaves like cost per token. It falls steeply with batch size, because the static and memory power of the GPU is shared by more tokens; it falls with lower precision and with fewer bytes per step; and it rises at low utilisation, because an idle GPU still draws a substantial fraction of its peak power. Prefill tokens cost far less energy than decode tokens for the same reasons that they cost less money. Power capping, which lowers a GPU's maximum power and clock, often reduces energy per token in memory-bound decode at little cost in speed, since decode is limited by bandwidth rather than clock frequency; Splitwise exploited exactly this for its token-generation machines (§13.3). As with every other metric in this chapter, the right comparison is at a stated latency target and workload, with the measurement method recorded.</p>
+
+<details class="drill">
+<summary>Drill 28.4 — Joules per token</summary>
+<p>An H100 decoding Llama 3 8B at batch 64 produces about 6,400 tokens/s while drawing about 600 W, and at batch 1 about 200 tokens/s at about 300 W. Compute joules per output token in each case. What happens to energy per token if the GPU idles at 100 W for half of each hour?</p>
+<p><em>Solution.</em> Batch 64: \(600/6400\approx0.094\) J per token. Batch 1: \(300/200=1.5\) J per token, sixteen times more. If the batch-64 replica is busy half the time and idles at 100 W otherwise, average power is 350 W for an average of 3,200 tokens/s, about 0.11 J per token, 17% worse than when fully busy. Batching and utilisation dominate energy just as they dominate cost, and idle power makes over-provisioned fleets expensive in watts as well as dollars.</p>
+</details>
+
+<h2 id="s24-9">28.9 Reproducibility</h2>
+<p>A measurement that cannot be repeated cannot be trusted, and inference systems have more sources of irreproducibility than most software. Performance depends on the engine version and configuration, the driver and CUDA versions, GPU clocks and thermal state, the placement of processes on GPUs and NUMA nodes, background load and the network. Outputs depend on sampling seeds, but even with fixed seeds, batch composition changes which kernels run and in what order sums are taken, so the same request can produce different tokens depending on what else was in its batch (§4.10). For benchmarks, the remedy is to pin and record everything: versions, flags, hardware and topology, workload files and seeds, and to repeat runs and report their spread. For quality evaluation, the remedy is to compare distributions rather than individual outputs, using the numerical and statistical methods of §28.7, and, where exact reproducibility matters, to use batch-invariant kernels at some cost in speed.</p>
+<p>A useful discipline is to treat every published or internal benchmark as an artefact: a directory containing the exact workload file, the load-generator command and seed, the engine and driver versions, the hardware description, the raw per-request timings and the analysis script that produced the reported percentiles. Raw timings, not only summaries, should be kept, because later questions (what was the P99.9? how did ITL behave for long prompts?) can then be answered without rerunning, and because summaries computed with different aggregation choices can be reconciled. Teams that adopt this habit find that most disagreements about performance dissolve into differences of workload or method, which the artefacts make visible.</p>
+<p>The common thread of the chapter is that measurement is part of engineering, not an afterthought. The roofline and queueing models of earlier chapters say what a system <em>should</em> do; benchmarks say what it does under controlled conditions; observability says what it does for real users; and evaluation says whether it still does the right thing. Each of the four checks the others, and a team that runs all four can change its system quickly without being surprised.</p>
+
+<h2 id="looking-ahead" class="unnumbered">Looking ahead</h2>
+<p>All of Part IX so far has assumed the data centre: racks of GPUs, fast networks, fleets of replicas. A large and growing share of inference happens elsewhere, on laptops, phones, cars and embedded devices, where there is one user, a few gigabytes of memory, a power budget of a few watts and no network round trip to hide. The same principles apply, bytes per token and arithmetic intensity, but the constraints are so different that the techniques change. Chapter 29 takes up on-device and edge inference: llama.cpp and GGUF, Apple's MLX and unified memory, mobile NPUs, aggressive quantisation, and the speculative and sparse tricks that make large models usable on small machines.</p>
+
+<h2 id="summary">Chapter summary</h2>
+<ul>
+<li>Metrics: TTFT (queue + prefill + first token), ITL (each gap), TPOT (mean gap), end-to-end latency; percentiles over the right unit (requests for TTFT, tokens for ITL); mean-of-ratios versus ratio-of-means. Throughput is meaningless without a latency condition; report goodput or full curves.</li>
+<li>Load: closed-loop generators suffer coordinated omission and understate tails; use open-loop Poisson sweeps with warm-up and drain. Latency has a knee (M/M/1: P99 = 4.6/(1−u) service times).</li>
+<li>Workloads determine results: lengths, prefix sharing, sampling settings, content; prefer real traces; state everything. Tail percentiles need samples: P99 error ≈ 17% at 100, 7% at 1,000, 2% at 10,000 samples.</li>
+<li>MLPerf Inference: fixed models and accuracy floors (99%/99.9%), LoadGen, offline (throughput), server (rate under P99 TTFT/TPOT), single-stream; continuous benchmarks (InferenceMAX) and engine tools complement it. Use a reporting checklist.</li>
+<li>Observability: metrics (RED/USE plus tokens, KV usage, hit rates), distributed traces with spans per component (tail-based sampling), logs; SLOs with error budgets and multi-window burn-rate alerts.</li>
+<li>Quality: numerical checks (teacher-forced log-probs, greedy agreement) catch bugs cheaply; offline evals need \(n\approx7.84\,\big(p_1(1-p_1)+p_2(1-p_2)\big)/\Delta_{\text{acc}}^2\) items per system (≈ 33k for one point at 70%), much less with paired designs; validate LLM judges; canary online.</li>
+<li>Validate every result against the roofline and α–β models at component, step and system level; impossible numbers reveal measurement errors. Measure cost and energy (joules per token) at the product's latency target and utilisation; both fall with batching and precision and rise with idle time.</li>
+<li>Reproducibility: pin and record versions, flags, hardware, workloads and seeds; repeat runs; batch composition changes outputs unless kernels are batch-invariant.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+<div class="mcq" data-id="ch24-mcq-01" data-topic="§28.1 Metrics">
+<p class="q">TTFT includes: (select all that apply)</p>
+<ol class="opts"><li data-correct>Queueing time</li><li data-correct>Prefill</li><li data-correct>The first decode step</li><li>All decode steps</li></ol>
+<div class="explain">It ends when the first token arrives.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-02" data-topic="§28.1 Metrics">
+<p class="q">TPOT for one request is:</p>
+<ol class="opts"><li>The longest gap</li><li data-correct>\((t_n-t_1)/(n_{\text{out}}-1)\)</li><li>TTFT divided by tokens</li><li>The first gap</li></ol>
+<div class="explain">The mean gap after the first token.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-03" data-topic="§28.1 Metrics">
+<p class="q">Why report ITL percentiles in addition to TPOT?</p>
+<ol class="opts"><li>They are cheaper</li><li data-correct>A modest mean TPOT can hide stalls that users see in the stream</li><li>ITL includes prefill</li><li>TPOT is undefined</li></ol>
+<div class="explain">E.g. prefill interference stalls.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-04" data-topic="§28.1 Metrics">
+<p class="q">Mean of per-request TPOT and total decode time ÷ total decode tokens differ because:</p>
+<ol class="opts"><li>One is wrong</li><li data-correct>They weight requests and tokens differently</li><li>They measure different models</li><li>They do not differ</li></ol>
+<div class="explain">Comparisons must use the same aggregation.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-05" data-topic="§28.1 Metrics">
+<p class="q">Why is a throughput number without a latency condition meaningless?</p>
+<ol class="opts"><li>Throughput cannot be measured</li><li data-correct>Any system can raise throughput by accepting more latency</li><li>GPUs vary</li><li>It is always correct</li></ol>
+<div class="explain">Report goodput or full curves.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-06" data-topic="§28.2 Load">
+<p class="q">A closed-loop load generator:</p>
+<ol class="opts"><li>Sends requests on a fixed schedule</li><li data-correct>Has each virtual user wait for a response before sending the next</li><li>Uses Poisson arrivals</li><li>Measures goodput directly</li></ol>
+<div class="explain">Its arrival rate depends on the system's speed.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-07" data-topic="§28.2 Load">
+<p class="q">Coordinated omission is:</p>
+<ol class="opts"><li>A network error</li><li data-correct>The load generator sending fewer requests while the system is slow, so the bad samples are never recorded</li><li>Dropping tokens</li><li>A scheduling policy</li></ol>
+<div class="explain">Closed-loop benchmarks understate tails.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-08" data-topic="§28.2 Load">
+<p class="q">To measure latency at a given arrival rate, use:</p>
+<ol class="opts"><li>A closed loop with 1 user</li><li data-correct>An open-loop (e.g. Poisson) generator at that rate</li><li>Offline mode</li><li>A single request</li></ol>
+<div class="explain">Then sweep rates.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-09" data-topic="§28.2 Knee">
+<p class="q">For an M/M/1 queue at utilisation \(u\), P99 response time in mean service times is:</p>
+<ol class="opts"><li>\(4.6u\)</li><li data-correct>\(4.6/(1-u)\)</li><li>\(1/u\)</li><li>Constant</li></ol>
+<div class="explain">Exponential response with rate \(\mu-\lambda\).</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-10" data-topic="§28.2 Sweep">
+<p class="q">A good open-loop sweep includes at each rate: (select all that apply)</p>
+<ol class="opts"><li data-correct>Warm-up</li><li data-correct>A long enough measurement window</li><li data-correct>Draining before the next rate</li><li>Ignoring the first token</li></ol>
+<div class="explain">Then read goodput where percentiles cross targets.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-11" data-topic="§28.3 Workloads">
+<p class="q">Why are random-token prompts a poor benchmark workload?</p>
+<ol class="opts"><li>They are too short</li><li data-correct>Unrealistic tokenisation, no prefix sharing and unnatural output lengths</li><li>They break KaTeX</li><li>They are copyrighted</li></ol>
+<div class="explain">Use traces or real conversation datasets.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-12" data-topic="§28.3 Workloads">
+<p class="q">Two engines may swap rankings between workloads because:</p>
+<ol class="opts"><li>Benchmarks are random</li><li data-correct>Input/output lengths and prefix sharing change which bottleneck dominates</li><li>Engines cheat</li><li>They cannot</li></ol>
+<div class="explain">State the workload exactly.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-13" data-topic="§28.3 Statistics">
+<p class="q">The relative standard error of a P99 estimated from 1,000 exponential samples is about:</p>
+<ol class="opts"><li>0.1%</li><li data-correct>7%</li><li>50%</li><li>100%</li></ol>
+<div class="explain">About 17% at 100, 2% at 10,000.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-14" data-topic="§28.3 Statistics">
+<p class="q">Why are tail percentiles noisy?</p>
+<ol class="opts"><li>GPUs are noisy</li><li data-correct>Only about 1% of samples lie above the P99, so it rests on few observations</li><li>Percentiles are biased</li><li>Rounding</li></ol>
+<div class="explain">Error falls as \(1/\sqrt n\).</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-15" data-topic="§28.4 MLPerf">
+<p class="q">MLPerf's server scenario measures:</p>
+<ol class="opts"><li>Peak throughput with all queries at once</li><li data-correct>The highest Poisson arrival rate meeting P99 TTFT and TPOT bounds</li><li>Single-query latency</li><li>Accuracy only</li></ol>
+<div class="explain">Effectively goodput.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-16" data-topic="§28.4 MLPerf">
+<p class="q">MLPerf requires LLM submissions to preserve accuracy of at least:</p>
+<ol class="opts"><li>50% of reference</li><li>90% of reference</li><li data-correct>99% or 99.9% of reference</li><li>None</li></ol>
+<div class="explain">Prevents quantising into uselessness.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-17" data-topic="§28.4 MLPerf">
+<p class="q">The offline scenario corresponds to:</p>
+<ol class="opts"><li>Interactive serving</li><li data-correct>Maximum throughput with all queries available (batch jobs)</li><li>Edge latency</li><li>Training</li></ol>
+<div class="explain">The throughput ceiling.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-18" data-topic="§28.4 Benchmarks">
+<p class="q">Continuous benchmarks such as InferenceMAX add to MLPerf:</p>
+<ol class="opts"><li>Accuracy rules</li><li data-correct>Frequent re-runs on current engine releases, publishing throughput–interactivity frontiers</li><li>Training benchmarks</li><li>Vendor audits</li></ol>
+<div class="explain">MLPerf lags new models and techniques.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-19" data-topic="§28.6 Observability">
+<p class="q">The RED method monitors:</p>
+<ol class="opts"><li data-correct>Rate, errors, duration</li><li>RAM, energy, disk</li><li>Requests, evictions, drops</li><li>Routing, encoding, decoding</li></ol>
+<div class="explain">USE is utilisation, saturation, errors.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-20" data-topic="§28.6 Observability">
+<p class="q">Distributed tracing lets you:</p>
+<ol class="opts"><li>Compress logs</li><li data-correct>Follow one request across gateway, router, prefill, transfer and decode via spans</li><li>Train models</li><li>Reduce latency directly</li></ol>
+<div class="explain">Explains why a request was slow.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-21" data-topic="§28.6 Observability">
+<p class="q">Tail-based trace sampling keeps:</p>
+<ol class="opts"><li>Random 1% only</li><li data-correct>All error and slowest-request traces plus a small fraction of the rest</li><li>Only fast traces</li><li>Nothing</li></ol>
+<div class="explain">Preserves the traces that need explaining.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-22" data-topic="§28.6 SLO">
+<p class="q">A 99% monthly SLO allows about how much traffic to miss?</p>
+<ol class="opts"><li>7 minutes</li><li data-correct>7.2 hours' worth</li><li>3 days</li><li>None</li></ol>
+<div class="explain">1% of 30 days.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-23" data-topic="§28.6 SLO">
+<p class="q">A burn rate of 14.4 sustained for one hour consumes what fraction of a 30-day error budget?</p>
+<ol class="opts"><li>0.1%</li><li data-correct>2%</li><li>14.4%</li><li>50%</li></ol>
+<div class="explain">14.4 hours of budget-rate consumption out of 720.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-24" data-topic="§28.6 SLO">
+<p class="q">Why alert on burn rate rather than raw latency spikes?</p>
+<ol class="opts"><li>It is cheaper</li><li data-correct>It ties alerts to user impact on the SLO and filters noise</li><li>Latency cannot be measured</li><li>It never fires</li></ol>
+<div class="explain">Multi-window burn-rate alerts are standard.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-25" data-topic="§28.7 Quality">
+<p class="q">Numerical checks (teacher-forced log-probs, greedy agreement) are best for:</p>
+<ol class="opts"><li>Judging helpfulness</li><li data-correct>Catching implementation bugs cheaply</li><li>Measuring user satisfaction</li><li>Pricing</li></ol>
+<div class="explain">They compare distributions token by token.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-26" data-topic="§28.7 Quality">
+<p class="q">With 300 test items at 70% accuracy, the standard error of accuracy is about:</p>
+<ol class="opts"><li>0.3 points</li><li data-correct>2.6 points</li><li>10 points</li><li>26 points</li></ol>
+<div class="explain">\(\sqrt{0.21/300}\).</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-27" data-topic="§28.7 Quality">
+<p class="q">To detect a 1-point drop at 70% (α = 0.05, power 0.8) with independent samples, each system needs about:</p>
+<ol class="opts"><li>300 items</li><li>3,300 items</li><li data-correct>33,000 items</li><li>330,000 items</li></ol>
+<div class="explain">Figure 28.7.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-28" data-topic="§28.7 Quality">
+<p class="q">Paired evaluation (same items for both systems) is more powerful because:</p>
+<ol class="opts"><li>It uses more items</li><li data-correct>It removes variance due to item difficulty; only disagreements matter</li><li>It is unbiased only</li><li>It needs no labels</li></ol>
+<div class="explain">McNemar's test for binary outcomes.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-29" data-topic="§28.7 Judges">
+<p class="q">Known biases of LLM judges include: (select all that apply)</p>
+<ol class="opts"><li data-correct>Position bias</li><li data-correct>Preference for longer answers</li><li data-correct>Self-preference</li><li>Perfect agreement with humans</li></ol>
+<div class="explain">Validate against human labels; randomise order.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-30" data-topic="§28.7 Online">
+<p class="q">Why run numerical and offline checks before canaries?</p>
+<ol class="opts"><li>Canaries are illegal</li><li data-correct>Canaries are slow, noisy and expose users; cheaper checks catch most problems first</li><li>They are redundant</li><li>Canaries need no metrics</li></ol>
+<div class="explain">Layered evaluation.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-31" data-topic="§28.9 Reproducibility">
+<p class="q">Why can the same request with a fixed seed produce different tokens?</p>
+<ol class="opts"><li>Seeds are ignored</li><li data-correct>Batch composition changes kernels and summation order, changing logits slightly</li><li>GPUs are random</li><li>Tokenisers change</li></ol>
+<div class="explain">Use batch-invariant kernels if exactness matters.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-32" data-topic="§28.9 Reproducibility">
+<p class="q">A benchmark report should pin and record: (select all that apply)</p>
+<ol class="opts"><li data-correct>Engine, driver and CUDA versions and flags</li><li data-correct>Hardware and topology</li><li data-correct>Workload files and seeds</li><li>The reviewer's name only</li></ol>
+<div class="explain">And repeat runs to show spread.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-33" data-topic="§28.5 Validation">
+<p class="q">A benchmark result far better than the roofline allows most likely means:</p>
+<ol class="opts"><li>The hardware is faster than specified</li><li data-correct>The benchmark is not measuring what it claims (different precision, truncated outputs, hidden cache hits, miscounted batch)</li><li>The roofline is wrong</li><li>Nothing</li></ol>
+<div class="explain">Check implied bytes and FLOPs per step against bandwidth and peak.</div>
+</div>
+
+<div class="mcq" data-id="ch24-mcq-34" data-topic="§28.8 Energy">
+<p class="q">Why does power capping often reduce energy per token in decode with little loss of speed?</p>
+<ol class="opts"><li>It increases bandwidth</li><li data-correct>Decode is limited by memory bandwidth, not clock frequency, so lower clocks cost little time while saving power</li><li>It disables the KV cache</li><li>It raises batch size</li></ol>
+<div class="explain">Splitwise used power-capped machines for token generation.</div>
+</div>
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+<details class="qa" data-id="ch24-qa-01">
+<summary><span class="lvl warm">Warm-up</span> Define TTFT, TPOT, ITL and end-to-end latency, and say which matter for which products.</summary>
+<div class="answer">
+<p>For a request sent at \(t_0\) whose tokens arrive at \(t_1,\dots,t_n\): TTFT \(=t_1-t_0\) (queueing, prefill, first decode); ITL = each gap \(t_{k+1}-t_k\); TPOT \(=(t_n-t_1)/(n-1)\), the mean gap; end-to-end \(=t_n-t_0=\text{TTFT}+(n-1)\text{TPOT}\). Chat cares about TTFT (responsiveness) and ITL percentiles (smooth streaming); reasoning and agents care about end-to-end latency; batch jobs care about throughput and cost; voice needs very low TTFT and steady ITL. Report percentiles over the right unit (requests for TTFT, tokens for ITL), state the aggregation, and always pair throughput with latency targets (goodput).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch24-qa-02">
+<summary><span class="lvl warm">Warm-up</span> What is coordinated omission, and how do you avoid it?</summary>
+<div class="answer">
+<p>When a closed-loop load generator (each virtual user waits for a response before sending the next request) meets a slow server, it stops sending requests during the slowdown. Only the in-flight requests record the stall; the requests that real users would have sent, each of which would have waited, are never generated. The measurement thus omits the bad samples in coordination with the system's slowness, understating tail latency and making behaviour at a given arrival rate unmeasurable. Avoid it with open-loop generation: send requests on a predetermined schedule (Poisson at rate \(\lambda\)) regardless of responses, record latency from the scheduled send time, and sweep rates. Use closed loops only to measure maximum throughput at fixed concurrency.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch24-qa-03">
+<summary><span class="lvl core">Core</span> How would you benchmark two inference engines fairly?</summary>
+<div class="answer">
+<p>Same model weights and precision, same hardware and parallel layout, each engine tuned reasonably (and the configuration published: batch caps, chunk sizes, CUDA graphs, caching). Workload from real traces or realistic datasets with stated length distributions and prefix sharing; natural end-of-sequence or a stated fixed length. Open-loop Poisson sweeps across arrival rates, with warm-up, measurement windows of thousands of requests per point, drains, and several repetitions. Report TTFT and ITL/TPOT percentiles (P50, P90, P99) and achieved throughput versus offered load, and goodput at stated SLOs. Check output equivalence (teacher-forced log-probs or task accuracy) so that speed is not bought with errors. Pin and publish versions and scripts.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch24-qa-04">
+<summary><span class="lvl core">Core</span> How many requests are needed to estimate a P99 latency to within about 5%?</summary>
+<div class="answer">
+<p>The sample P99 is determined by the ~1% of samples in the tail, so its error is large for small \(n\) and falls as \(1/\sqrt n\). For exponential-like latencies, simulation gives a relative standard error of about 17% at 100 samples, 7% at 1,000, 4% at 3,000 and 2% at 10,000; so for ±5% (one standard error) about 2,000–3,000 samples are needed, and for P99.9 several times more. Heavier tails need more. In addition, run-to-run variation (clocks, placement, background load) adds error not captured by sampling, so repeat runs and report the spread. Rule of thumb: thousands of requests per measurement point for P99.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch24-qa-05">
+<summary><span class="lvl core">Core</span> Explain MLPerf Inference’s scenarios and why its accuracy rules matter.</summary>
+<div class="answer">
+<p>MLPerf fixes the model, dataset and a common load generator (LoadGen). Offline: all queries available at once; metric is throughput (batch ceiling). Server: Poisson arrivals; metric is the maximum rate at which latency constraints hold at the 99th percentile; for LLMs, TTFT and TPOT bounds (an interactive variant uses tighter ones). Single-stream and multi-stream: latency for one or several streams (edge). Accuracy rules require submissions to reach 99% or 99.9% of the reference model's score, which prevents winning throughput races by degrading the model with aggressive quantisation or approximations. Closed divisions fix methods; open divisions allow changes. Results are audited and reproducible but lag the newest models and are heavily tuned.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch24-qa-06">
+<summary><span class="lvl core">Core</span> What metrics and traces would you instrument in an LLM serving fleet?</summary>
+<div class="answer">
+<p>Metrics: per model, tenant and endpoint, request and token rates (input, cached input, output, reasoning), errors and timeouts, TTFT, TPOT and ITL histograms, queue lengths and wait times, running/waiting sequences, KV-cache usage, prefix hit rate, preemptions, tokens per step, batch sizes, speculative acceptance length, adapter page-ins, GPU memory, power, clocks and SM activity; RED and USE coverage. Traces: one trace per request with spans for gateway, auth/rate limiting, routing, prefill queue, prefill, KV transfer, decode and streaming, with attributes (lengths, cache hits, replica, versions), sampled with tail-based sampling. Logs: errors, configuration changes, deployments. SLOs on TTFT/TPOT with burn-rate alerts; dashboards per model and replica pool.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch24-qa-07">
+<summary><span class="lvl core">Core</span> Explain error budgets and burn-rate alerting.</summary>
+<div class="answer">
+<p>An SLO (e.g. 99% of requests meet latency targets over 30 days) implies an error budget: the 1% of requests allowed to miss. The burn rate is the current miss fraction divided by the allowed fraction; at burn rate 1 the budget is exhausted exactly at the end of the window. Alerting on burn rate connects alerts to user impact: fast burns (e.g. above 14.4 over both a 5-minute and a 1-hour window, consuming 2% of the monthly budget per hour) page immediately; slow burns (e.g. above 1 over days) open tickets. Multi-window conditions avoid paging on brief spikes and still catch sustained degradation. Error budgets also govern change velocity: when the budget is spent, risky rollouts pause.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch24-qa-08">
+<summary><span class="lvl deep">Deep-dive</span> How large must an evaluation be to detect a one-point quality regression, and how can you reduce it?</summary>
+<div class="answer">
+<p>For two independent systems at about 70% accuracy, the two-proportion formula with α = 0.05 and 80% power gives \(n\approx7.84(p_1(1-p_1)+p_2(1-p_2))/\Delta^2\approx33{,}000\) items per system for \(\Delta=0.01\); 8,400 for two points; 350 for ten. Reduce it with paired designs: run both systems on the same items and test differences (McNemar); the variance then depends on the disagreement rate \(d\), with standard error about \(\sqrt{d/n}\), so with 6% disagreement 2,000 items give ~0.55-point resolution. Use multiple samples per item to average sampling noise, stratify by task and report per-task results, and combine with numerical checks (teacher-forced KL) that detect implementation changes with far fewer sequences. Always report confidence intervals.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch24-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Why do closed-loop benchmarks understate latency, quantitatively?</summary>
+<div class="answer">
+<p>Consider a server that stalls for time \(S\) once per period. In an open-loop run at rate \(\lambda\), about \(\lambda S\) requests arrive during the stall and each waits on average \(S/2\), contributing \(\lambda S\) high-latency samples per stall. A closed loop with \(c\) concurrent users records at most \(c\) stalled requests per stall, regardless of \(\lambda\), and sends none during it; if \(\lambda S\gg c\), the fraction of slow samples is underestimated by a factor of about \(\lambda S/c\), and P99 or P99.9 can be wrong by orders of magnitude. Closed loops also self-throttle, so their 'throughput at concurrency \(c\)' corresponds to an unknown arrival rate. Hence production-like latency must be measured open-loop.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch24-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> How should LLM-as-judge evaluations be designed to be trustworthy?</summary>
+<div class="answer">
+<p>Use a strong judge distinct from the systems under test (avoid self-preference), with a clear rubric and reference answers where possible. Randomise the order of compared answers and average both orders (position bias); control for length (length bias) by instructing or by length-normalised analysis. Validate the judge against human labels on a stratified sample, report agreement (e.g. Cohen's kappa) and calibrate thresholds. Use pairwise comparisons for small differences (more sensitive than absolute scores) and paired statistics with confidence intervals. Re-validate when the judge model changes. Combine with checkable metrics (exact match, tests) wherever answers can be verified, and keep human review for high-stakes categories.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch24-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> Why can identical requests yield different outputs on the same engine, and how does this affect evaluation?</summary>
+<div class="answer">
+<p>Sampling seeds aside, numerics depend on batch composition: batch size and mix change which kernel variants run, how work is split across blocks, and the order of floating-point reductions, so logits differ in low bits; a different argmax at one position changes the whole continuation (§4.10). Prefix-cache hits versus recomputation, chunked versus whole prefill, and speculative decoding paths can also change numerics slightly. Consequences: comparing individual outputs between runs or systems is unreliable; compare distributions (teacher-forced log-prob differences, greedy agreement statistics) and task accuracy with statistical tests. For tests requiring determinism (regression tests, RL log-prob agreement), use batch-invariant kernels and fixed configurations, accepting some speed cost.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch24-qa-12">
+<summary><span class="lvl design">Design</span> Design a continuous performance-regression system for an inference engine project.</summary>
+<div class="answer">
+<p>On every merge (and nightly at larger scale), run a fixed matrix: models (dense, MoE, long-context), precisions, parallel layouts, hardware types. For each, run microbenchmarks (key kernels' MBU/MFU, all-reduce latency) and end-to-end open-loop sweeps with fixed trace-based workloads, recording TTFT/ITL percentiles and goodput at stated SLOs with enough requests per point and repeated runs. Compare against a rolling baseline with statistical thresholds (e.g. detect changes beyond run-to-run spread), flag regressions automatically with bisection to the offending commit. Include correctness gates: teacher-forced log-prob comparison against reference, greedy agreement and small task evals. Pin environments (drivers, CUDA) and record them; publish dashboards. Periodically refresh workloads from real traffic patterns.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch24-qa-13">
+<summary><span class="lvl design">Design</span> You are rolling out a new engine version to a production fleet. Design the evaluation and rollout.</summary>
+<div class="answer">
+<p>Pre-production: run the regression system (performance sweeps on production-like traces; numerical equivalence checks; offline task suites sized for the regression you care to detect, using paired analysis). Staging: shadow traffic (duplicate real requests, discard responses) to compare latency, errors and output statistics (lengths, refusal rates) at real load. Canary: route a small percentage of traffic (by tenant or random), monitor SLO burn rate, error rates, TTFT/TPOT percentiles, KV usage, preemptions and quality signals against control; hold long enough for statistical power. Expand gradually (1% → 10% → 50% → 100%), with automatic rollback on burn-rate alerts. Drain replicas before upgrading; keep the old version available for fast rollback; document versions and configuration in traces.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch24-qa-14">
+<summary><span class="lvl design">Design</span> A dashboard shows P99 TTFT rising every afternoon. How do you investigate?</summary>
+<div class="answer">
+<p>Check whether it correlates with load (request and token rates, especially prefill tokens and long-context requests) and with utilisation of the affected pools; compare the latency-versus-load curve to the morning's to see whether the system got slower at the same load or simply busier. Look at traces of slow requests: is the time in the prefill queue (capacity or admission), in prefill itself (long prompts, cache misses), in routing or in KV transfer? Check prefix-cache hit rate (a change in afternoon traffic mix?), KV usage and preemptions (memory pressure), autoscaling events (did scale-up lag?), and tenant breakdowns (a batch job or a tenant burst?). Check hardware signals (thermal throttling, clocks). Fix accordingly: capacity or forecast-based scaling, routing, rate limits, prompt structure, or prefill pool sizing.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch24-qa-15">
+<summary><span class="lvl core">Core</span> What makes a benchmark workload realistic for LLM serving?</summary>
+<div class="answer">
+<p>Arrival process (Poisson or real timestamps with burstiness and daily patterns), input and output length distributions matching production (heavy tails, reasoning outputs), realistic prefix sharing (system prompts, multi-turn histories, shared documents), real text and tokenisation (not random tokens), natural end-of-sequence behaviour or stated fixed lengths, the product's sampling parameters (temperature affects speculation and lengths), structured-output and tool-call usage, and the mix of tenants, adapters and models. Best: anonymised production traces; otherwise public conversation datasets and published traces (e.g. Azure LLM traces). Always state the workload, since rankings change with it.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch24-qa-16">
+<summary><span class="lvl core">Core</span> Explain why throughput is a function, not a number.</summary>
+<div class="answer">
+<p>An inference system's throughput depends on the operating point: batch size, arrival rate and latency it is allowed. At low load, throughput equals offered load and latency is minimal; as load rises, batching raises throughput until memory or the latency target binds, and near saturation latency grows without bound while throughput plateaus. Any single throughput number corresponds to some latency, often unstated and often at saturation where no production system can run. The meaningful summaries are the throughput–latency curve (or frontier across configurations) and goodput, the highest load meeting stated percentile targets for TTFT and TPOT.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch24-qa-17">
+<summary><span class="lvl core">Core</span> How do you sanity-check a reported inference benchmark against first principles?</summary>
+<div class="answer">
+<p>Convert the claim into per-step quantities: tokens per second divided by steps per second (1/TPOT) gives the batch; with the model's weight bytes, the cache bytes per token and plausible contexts, compute the bytes each step must read and the FLOPs it must perform, and compare with the hardware's aggregate bandwidth and peak compute for the stated number of GPUs. If the implied bytes or FLOPs per second exceed the hardware, or the implied cache does not fit in memory, the claim is impossible as stated; if it is far below the roofline, the configuration is probably poor. Repeat for prefill (FLOPs per prompt token against peak) and for communication (all-reduce sizes against link bandwidth). Then check the measurement method: open or closed loop, percentiles, workload, precision. Example: 120k tokens/s at 10 ms TPOT for BF16 70B on 8 H100s implies 1,200 sequences per step and over 400 GB of bytes per step, more than twice what 26.8 TB/s can deliver in 10 ms.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch24-qa-18">
+<summary><span class="lvl deep">Deep-dive</span> Why does energy per token fall with batch size and lower precision, and how would you measure it?</summary>
+<div class="answer">
+<p>GPU power has a large component that does not scale with useful work: static and idle power, memory refresh and the energy of moving weights from HBM, which in decode is paid once per step regardless of batch size. Batching spreads that energy over more tokens, so joules per token fall roughly as the step time per token does (e.g. ~1.5 J at batch 1 versus ~0.09 J at batch 64 for an 8B model on an H100). Lower precision reads fewer bytes per weight and uses more energy-efficient tensor-core paths, reducing both time and energy per token. Measure with the GPU's power counters sampled at high frequency during a steady-state, open-loop run at the target latency, integrate to energy, divide by tokens served, and include idle periods and host power if the goal is fleet energy. Report alongside throughput, latency target and workload; consider power capping experiments for decode-heavy pools.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-mlperf">V. J. Reddi et al. MLPerf Inference Benchmark. <em>ISCA</em>, 2020. <a href="https://arxiv.org/abs/1911.02549">arXiv:1911.02549</a>; MLCommons, MLPerf Inference rules and results. <a href="https://mlcommons.org/benchmarks/inference-datacenter/">mlcommons.org</a>.</li>
+<li>G. Tene. How NOT to Measure Latency (coordinated omission). Talk, 2013–2015; HdrHistogram documentation.</li>
+<li>B. Beyer, C. Jones, J. Petoff, N. R. Murphy (eds.). <em>Site Reliability Engineering</em>, chapters on SLOs and alerting on SLOs. O'Reilly, 2016; and <em>The Site Reliability Workbook</em>, 2018.</li>
+<li>OpenTelemetry specification: traces, metrics and logs. <a href="https://opentelemetry.io/docs/specs/">opentelemetry.io</a>.</li>
+<li>L. Zheng et al. Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena. <em>NeurIPS</em>, 2023. <a href="https://arxiv.org/abs/2306.05685">arXiv:2306.05685</a>.</li>
+<li>E. Miller. Adding Error Bars to Evals: A Statistical Approach to Language Model Evaluations. 2024. <a href="https://arxiv.org/abs/2411.00640">arXiv:2411.00640</a>.</li>
+<li>L. Zheng et al. LMSYS-Chat-1M: A Large-Scale Real-World LLM Conversation Dataset. 2023. <a href="https://arxiv.org/abs/2309.11998">arXiv:2309.11998</a>.</li>
+<li>P. Patel et al. Splitwise (Azure LLM inference traces). <em>ISCA</em>, 2024. <a href="https://arxiv.org/abs/2311.18677">arXiv:2311.18677</a>.</li>
+<li>SemiAnalysis. InferenceMAX: open, continuous inference benchmarking. 2025.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

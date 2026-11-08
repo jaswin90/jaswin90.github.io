@@ -1,0 +1,705 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 7 · GPU Programming for Mathematicians — Introduction to LLM Engineering</title>
+<meta name="description" content="Chapter 7 of Introduction to LLM Engineering: CUDA kernels, coalescing and bank conflicts, tiled matrix multiplication, parallel reductions, the online softmax, kernel fusion, Triton, CUDA Graphs, torch.compile and CUTLASS/CuTe.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script defer src="/library/assets/book-shim.js" data-library="/library/" data-field="/library/AI_Engineering/" data-field-title="AI Engineering"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-chapter="ch07" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Part II · The Machine — Chapter 7</div>
+<h1 id="top">GPU Programming for Mathematicians</h1>
+<p class="lede">How fast GPU code is actually written: from a first CUDA kernel to tiled matrix multiplication, parallel reductions, the online softmax, kernel fusion, Triton, and the compilers and libraries that generate most of the kernels an LLM runs.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Chapter 6 kept arriving at the same conclusion. The element-wise operations are memory-bound, so fuse them. Matrix multiplication needs reuse, so tile it. Small kernels drown in launch overhead, so capture them in a graph. Each conclusion ends with an instruction to write better GPU code, and for a reader without a systems background that is the last black box left in the stack. You do not need to become a kernel engineer to be an excellent inference engineer, and most people in the field rarely write CUDA. But you do need to read kernels, judge whether one is likely to be good, and know what is and is not possible. FlashAttention (Chapter 9), PagedAttention (Chapter 10), fused MoE kernels (Chapter 19) and quantised GEMMs (Chapter 14) are all, at bottom, clever kernels, and their design choices make sense only if you know how kernels work.</p>
+<p>This chapter teaches that skill through four worked programs of increasing sophistication: a vector addition, a tiled matrix multiplication, a parallel reduction, and a fused softmax. Each introduces one idea that matters for performance: launching parallel work, reusing data on-chip, cooperating across threads, and fusing operations so data stays on-chip. The mathematical heart of the chapter is the <strong>online softmax</strong>, an associative reformulation of a seemingly sequential computation. It is the key that unlocks FlashAttention. We then introduce <strong>Triton</strong>, the Python-embedded language in which most LLM kernels outside NVIDIA's libraries are now written, and finish with the tools that remove launch overhead and generate kernels automatically: CUDA Graphs, <code>torch.compile</code> and the newer kernel languages.</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Read and write a simple CUDA kernel, and explain the role of the grid, block and thread indices.</li>
+<li>Explain memory coalescing and shared-memory bank conflicts, and why they decide whether a memory-bound kernel reaches peak bandwidth.</li>
+<li>Write a shared-memory tiled matrix multiplication, and derive its arithmetic intensity as a function of tile size.</li>
+<li>Implement a parallel reduction with warp shuffles, and explain why reductions need associativity.</li>
+<li>Derive the online softmax and its merge rule, and prove that the merge is associative.</li>
+<li>Explain kernel fusion quantitatively, and write fused kernels in Triton.</li>
+<li>Explain what CUDA Graphs, <code>torch.compile</code>, CUTLASS/CuTe and newer kernel languages each contribute.</li>
+<li>Time a GPU kernel correctly and convert the result into achieved bandwidth or FLOP/s.</li>
+</ol>
+<p class="small muted">Uses: Chapter 5 (§5.2 execution model, §5.3 the SM, §5.4 the memory hierarchy) and Chapter 6 (§6.2–6.3). Symbols: <a href="../notation.html">notation page</a>.</p>
+</div>
+
+<h2 id="s7-1">7.1 A first kernel</h2>
+<p>We begin with the simplest possible parallel computation, \(z=x+y\) for vectors of length \(n\), because it shows every piece of the machinery without any algorithmic distraction. In CUDA, the C++ dialect for NVIDIA GPUs, the kernel is written from the point of view of one thread:</p>
+<pre><code><span class="c-kw">__global__</span> <span class="c-kw">void</span> add(<span class="c-kw">const float</span>* x, <span class="c-kw">const float</span>* y, <span class="c-kw">float</span>* z, <span class="c-kw">int</span> n) {
+    <span class="c-kw">int</span> i = blockIdx.x * blockDim.x + threadIdx.x;   <span class="c-com">// this thread's global index</span>
+    <span class="c-kw">if</span> (i &lt; n) z[i] = x[i] + y[i];                    <span class="c-com">// guard: the last block may overhang</span>
+}
+
+<span class="c-com">// Host code: launch ceil(n / 256) blocks of 256 threads each.</span>
+add&lt;&lt;&lt;(n + 255) / 256, 256&gt;&gt;&gt;(x, y, z, n);</code></pre>
+<p>Three details carry over to every kernel. First, the <code>__global__</code> qualifier marks a function that runs on the GPU and is launched from the CPU. Second, each thread computes its own index from three built-in variables: which block it is in (<code>blockIdx</code>), how large blocks are (<code>blockDim</code>) and its position within the block (<code>threadIdx</code>). This is the map-over-an-index-set of §5.2, written out explicitly. Third, the launch configuration <code>&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;</code> chooses the grid. Here it is enough blocks of 256 threads to cover \(n\) elements, with a guard for the last, partial block.</p>
+<p>How fast is it? Each element requires reading 8 bytes and writing 4 for one FLOP, an arithmetic intensity of \(1/12\) FLOPs per byte, so the kernel is as memory-bound as a kernel can be. Its runtime is \(12n/\beta\) at best, and the only question is whether it reaches that bound. It does, if two conditions hold. Enough threads must be in flight to cover memory latency (§5.1), which for large \(n\) is automatic. And consecutive threads must access consecutive addresses, the subject of the next section.</p>
+
+<h2 id="s7-2">7.2 Coalescing and bank conflicts</h2>
+<p>When the 32 threads of a warp execute a load, the hardware does not fetch 32 separate values. It fetches whole aligned 32-byte <em>sectors</em> from memory, grouped into transactions of up to 128 bytes. If the 32 threads read 32 consecutive 4-byte floats, the warp needs exactly one 128-byte transaction, and every byte fetched is used. This is a <strong>coalesced</strong> access. If instead each thread reads an element 32 floats apart, for example walking down a column of a row-major matrix, the warp touches 32 different sectors. The hardware fetches 32 × 32 = 1,024 bytes to use 128, wasting seven-eighths of the bandwidth.</p>
+
+<figure class="diagram" id="fig-7-1">
+<svg class="dg" viewBox="0 0 720 220" role="img" aria-label="Coalesced versus strided memory access by a warp">
+<text x="180" y="20" text-anchor="middle" class="t-b">Coalesced: thread i reads x[i]</text>
+<text x="540" y="20" text-anchor="middle" class="t-b">Strided: thread i reads x[32·i]</text>
+<line x1="360" y1="10" x2="360" y2="210" class="grid"/>
+<g>
+<rect x="40" y="40" width="280" height="22" rx="3" class="bx5"/><text x="180" y="56" text-anchor="middle" class="t-xs">threads 0 … 31 of one warp</text>
+<rect x="40" y="110" width="280" height="26" rx="3" class="bx3"/><text x="180" y="127" text-anchor="middle" class="t-xs">one 128-byte segment, every byte used</text>
+<line x1="60" y1="62" x2="60" y2="110" class="ln"/><line x1="120" y1="62" x2="120" y2="110" class="ln"/><line x1="180" y1="62" x2="180" y2="110" class="ln"/><line x1="240" y1="62" x2="240" y2="110" class="ln"/><line x1="300" y1="62" x2="300" y2="110" class="ln"/>
+<text x="180" y="170" text-anchor="middle" class="t-sm t-s3 t-b">1 transaction, 100% efficiency</text>
+</g>
+<g>
+<rect x="400" y="40" width="280" height="22" rx="3" class="bx5"/><text x="540" y="56" text-anchor="middle" class="t-xs">threads 0 … 31 of one warp</text>
+<rect x="400" y="110" width="30" height="26" rx="3" class="bx2"/><rect x="440" y="110" width="30" height="26" rx="3" class="bx2"/><rect x="480" y="110" width="30" height="26" rx="3" class="bx2"/><rect x="520" y="110" width="30" height="26" rx="3" class="bx2"/><text x="590" y="127" class="t-sm">· · ·</text><rect x="640" y="110" width="30" height="26" rx="3" class="bx2"/>
+<line x1="410" y1="62" x2="415" y2="110" class="ln"/><line x1="450" y1="62" x2="455" y2="110" class="ln"/><line x1="490" y1="62" x2="495" y2="110" class="ln"/><line x1="530" y1="62" x2="535" y2="110" class="ln"/><line x1="660" y1="62" x2="655" y2="110" class="ln"/>
+<text x="540" y="152" text-anchor="middle" class="t-xs">32 separate sectors, each mostly unused</text>
+<text x="540" y="170" text-anchor="middle" class="t-sm t-s2 t-b">32 sectors, ≈ 12.5% efficiency</text>
+</g>
+<text x="360" y="200" text-anchor="middle" class="t-xs">The same number of useful bytes; an eightfold difference in bytes fetched.</text>
+</svg>
+<figcaption><b>Figure 7.1 — Memory coalescing.</b> When a warp's 32 threads touch consecutive addresses, the hardware serves them with one wide transaction. When they touch addresses far apart, it must fetch a separate sector for each, mostly wasted.</figcaption></figure>
+
+<p>Figure 7.1 contrasts the two patterns. The left warp reads one contiguous 128-byte segment, and every byte fetched is used. The right warp reads 32 widely spaced floats, and the hardware fetches 32 sectors of 32 bytes each to deliver 128 useful bytes. For a memory-bound kernel this is an eightfold slowdown. Coalescing is therefore the first thing to check in any memory-bound kernel. It is also why <strong>data layout</strong> is a recurring theme in LLM systems: the KV cache layout in PagedAttention (Chapter 10), the "interleaved" storage of quantised weights (Chapter 14) and the head-major versus token-major ordering of attention tensors are all chosen so that the threads that run together read memory that sits together.</p>
+<p>Shared memory has its own access rule. It is divided into 32 <strong>banks</strong>, each serving one 4-byte word per cycle, with consecutive words in consecutive banks. If the threads of a warp access 32 different banks, the access completes in one cycle. If several threads access different addresses in the <em>same</em> bank, their accesses are serialised, a <strong>bank conflict</strong>. The classic trap is a \(32\times32\) tile stored row by row and read by column: every element of a column lies in the same bank, so a warp reading one column suffers a 32-way conflict. The classic fix is to pad each row by one element (declare the tile as <code>[32][33]</code>), which shifts each row by one bank and spreads a column across all 32 banks. Modern kernels use more elaborate "swizzled" layouts for the same purpose, and the TMA engine of §5.5 can write tiles in swizzled form automatically.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — the cost of an uncoalesced read</div>
+<p>A warp of 32 threads each reads one 4-byte float. <strong>Coalesced:</strong> the addresses are consecutive, so the 128 bytes fall in four 32-byte sectors of one cache line, and the memory system moves exactly 128 bytes. <strong>Strided by 32 floats:</strong> each thread's address lies in a different line, so the hardware fetches 32 sectors of 32 bytes, 1,024 bytes, to deliver 128 useful bytes: an eightfold waste of bandwidth. A kernel that reads a matrix column-wise from row-major storage in this way runs at one eighth of its bandwidth roofline, which is why kernels stage tiles through shared memory and transpose there (§7.2).</p>
+</div>
+
+<h2 id="s7-3">7.3 Tiled matrix multiplication</h2>
+<p>Matrix multiplication is where reuse becomes possible, and the shared-memory tiled GEMM is the canonical example of how to obtain it. Recall the argument of §5.4. Computing \(C=AB\) with \(A\in\mathbb R^{M\times K}\) and \(B\in\mathbb R^{K\times N}\) uses each element of \(A\) in \(N\) products and each element of \(B\) in \(M\). A kernel that fetches every operand from HBM for every multiply-add has constant intensity. The tiled kernel instead assigns each thread block a \(t\times t\) tile of \(C\). The block marches along the shared dimension \(K\) in steps of \(t\). At each step, its threads cooperatively load a \(t\times t\) tile of \(A\) and one of \(B\) into shared memory, synchronise, and then accumulate the tile product from shared memory:</p>
+<pre><code><span class="c-kw">#define</span> TILE 32
+<span class="c-kw">__global__</span> <span class="c-kw">void</span> matmul(<span class="c-kw">const float</span>* A, <span class="c-kw">const float</span>* B, <span class="c-kw">float</span>* C, <span class="c-kw">int</span> M, <span class="c-kw">int</span> N, <span class="c-kw">int</span> K) {
+    <span class="c-kw">__shared__ float</span> As[TILE][TILE], Bs[TILE][TILE];          <span class="c-com">// on-chip tiles</span>
+    <span class="c-kw">int</span> row = blockIdx.y * TILE + threadIdx.y;                 <span class="c-com">// this thread's output element</span>
+    <span class="c-kw">int</span> col = blockIdx.x * TILE + threadIdx.x;
+    <span class="c-kw">float</span> acc = 0.f;
+    <span class="c-kw">for</span> (<span class="c-kw">int</span> k0 = 0; k0 &lt; K; k0 += TILE) {                       <span class="c-com">// march along K</span>
+        As[threadIdx.y][threadIdx.x] = (row &lt; M &amp;&amp; k0 + threadIdx.x &lt; K) ? A[row * K + k0 + threadIdx.x] : 0.f;
+        Bs[threadIdx.y][threadIdx.x] = (k0 + threadIdx.y &lt; K &amp;&amp; col &lt; N) ? B[(k0 + threadIdx.y) * N + col] : 0.f;
+        __syncthreads();                                          <span class="c-com">// tiles fully loaded</span>
+        <span class="c-kw">for</span> (<span class="c-kw">int</span> k = 0; k &lt; TILE; ++k)                            <span class="c-com">// TILE multiply-adds per loaded pair</span>
+            acc += As[threadIdx.y][k] * Bs[k][threadIdx.x];
+        __syncthreads();                                          <span class="c-com">// before overwriting tiles</span>
+    }
+    <span class="c-kw">if</span> (row &lt; M &amp;&amp; col &lt; N) C[row * N + col] = acc;
+}
+<span class="c-com">// Launch: dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE), block(TILE, TILE);</span></code></pre>
+<p>Notice how the loads are arranged. Thread \((y,x)\) loads element \((y,x)\) of each tile, so consecutive threads of a warp (consecutive \(x\)) read consecutive addresses of a row of \(A\) and of \(B\): coalesced. The two <code>__syncthreads()</code> barriers are essential. The first ensures no thread reads a tile before all threads have finished writing it. The second ensures no thread overwrites a tile while others are still reading it.</p>
+
+<figure class="diagram" id="fig-7-2">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Tiled matrix multiplication: a thread block computes one output tile by streaming tiles of A and B through shared memory">
+<text x="120" y="20" text-anchor="middle" class="t-b">A (M × K)</text>
+<rect x="30" y="30" width="180" height="140" class="fill-muted"/>
+<rect x="30" y="80" width="180" height="30" class="bx2" opacity=".55"/>
+<rect x="90" y="80" width="30" height="30" class="bx2"/>
+<text x="120" y="190" text-anchor="middle" class="t-xs">block row of A (t rows); tile k0 highlighted</text>
+<text x="380" y="20" text-anchor="middle" class="t-b">B (K × N)</text>
+<rect x="300" y="30" width="160" height="140" class="fill-muted"/>
+<rect x="390" y="30" width="30" height="140" class="bx5" opacity=".55"/>
+<rect x="390" y="90" width="30" height="30" class="bx5"/>
+<text x="380" y="190" text-anchor="middle" class="t-xs">block column of B; matching tile</text>
+<text x="600" y="20" text-anchor="middle" class="t-b">C (M × N)</text>
+<rect x="520" y="30" width="160" height="140" class="fill-muted"/>
+<rect x="610" y="80" width="30" height="30" class="bx3"/>
+<text x="600" y="190" text-anchor="middle" class="t-xs">one thread block owns one t × t tile</text>
+<rect x="160" y="212" width="400" height="36" rx="6" class="bx4"/><text x="360" y="235" text-anchor="middle" class="t-sm">shared memory: As[t][t], Bs[t][t]; each element loaded once, used t times</text>
+<line x1="105" y1="110" x2="250" y2="212" class="ln dash"/><line x1="405" y1="120" x2="420" y2="212" class="ln dash"/><line x1="625" y1="110" x2="540" y2="212" class="ln dash"/>
+</svg>
+<figcaption><b>Figure 7.2 — Tiled matrix multiplication.</b> A thread block computes one \(t\times t\) tile of \(C\) by walking along \(K\), loading matching tiles of \(A\) and \(B\) into shared memory and reusing each loaded element \(t\) times.</figcaption></figure>
+
+<p>Figure 7.2 shows the data flow. The block that owns the green tile of \(C\) needs the whole block row of \(A\) (orange band) and block column of \(B\) (purple band), but it never needs them all at once. It streams them through shared memory one pair of tiles at a time, and each element brought on-chip is used in \(t\) multiply-adds. The intensity of the traffic between HBM (or L2) and the block is therefore</p>
+\[ I_{\text{block}} = \frac{2t^2t_k}{2t\,t_k\,b} = \frac{t}{b}\quad\text{FLOPs per byte}, \]
+<p>where \(t_k\) is the step along \(K\). This is a clean, important formula: intensity grows linearly with the tile width.</p>
+
+<figure class="chart" id="fig-7-3">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Intensity of a block's traffic versus tile width (BF16 operands)","height":320,
+ "x":{"label":"Square tile width t (log)","log":true,"min":1,"max":1024,"ticks":[1,4,16,64,256,1024]},
+ "y":{"label":"FLOPs per byte fetched by the block (log)","log":true,"min":0.3,"max":1000},
+ "hlines":[{"y":295,"text":"H100 HBM ridge ≈ 295"},{"y":32,"text":"H100 shared-memory ridge ≈ 32"}],
+ "series":[{"name":"t / b, b = 2","color":"s1","points":[[1,0.5],[2,1],[4,2],[8,4],[16,8],[32,16],[64,32],[128,64],[256,128],[512,256],[1024,512]]}]}
+</script>
+<figcaption><b>Figure 7.3 — Bigger tiles, more reuse.</b> A block's traffic has intensity \(t/b\). Tiles of practical size (64–256) reach the shared-memory ridge but not the HBM ridge, so real GEMMs also rely on L2 reuse across blocks.</figcaption></figure>
+
+<p>Figure 7.3 plots \(t/b\) for BF16, and it makes clear why one level of tiling is not enough on a modern GPU. Our 32-wide tiles give 16 FLOPs per byte. Even 256-wide tiles, about as large as on-chip memory allows, give 128, below the H100's HBM ridge of 295. Production GEMMs close the gap with two further levels of reuse. Across blocks, thread blocks that run concurrently are launched in an order (called rasterisation or swizzling) chosen so that they share rows of \(A\) and columns of \(B\). Most of their tile loads then hit in the 50 MB L2 cache, and each input element crosses from HBM only a few times. Within a block, each thread accumulates a small sub-tile of \(C\) in its registers rather than a single element, multiplying the reuse of every value read from shared memory. That keeps shared-memory bandwidth from becoming the binding constraint, the hierarchical-roofline effect of §6.2. Finally, the inner loop uses tensor-core instructions rather than scalar multiply-adds, and the tile loads are issued asynchronously (TMA, §5.5) into multi-stage buffers so that the next tiles arrive while the current ones are being multiplied. Each refinement is easy to state and hard to implement well, which is why almost nobody writes production GEMMs by hand: libraries such as cuBLAS and CUTLASS do it, tuned per GPU and per shape.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — synchronisation as a barrier</div>
+<p><code>__syncthreads()</code> is a <em>barrier</em>: no thread of the block proceeds past it until every thread has reached it. It imposes a partial order on events (all writes before the barrier happen before all reads after it), which is exactly what correctness requires when threads communicate through shared memory. Barriers exist only within a block, because blocks may run in any order and need not be resident at the same time. Algorithms that need global synchronisation must either end the kernel and start another, or use atomic operations.</p>
+</div>
+
+<details class="drill">
+<summary>Drill 7.2 — How much does a tile buy?</summary>
+<p>A GEMM kernel computes an \(M_t\times N_t\) output tile by streaming \(k\)-slices of the two input panels through shared memory, in BF16. Show that its arithmetic intensity with respect to the data it loads is \(2M_tN_t/((M_t+N_t)b)\), and evaluate it for \(128\times128\) and \(128\times256\) tiles. Is that enough to reach the H100 ridge point from HBM?</p>
+<p><em>Solution.</em> For each \(k\)-slice of width \(k_s\), the tile loads \((M_t+N_t)k_s\) elements and performs \(2M_tN_tk_s\) FLOPs, so the intensity is \(2M_tN_t/((M_t+N_t)b)\). For \(128\times128\): \(2\times16{,}384/(256\times2)=64\) FLOP/B; for \(128\times256\): \(2\times32{,}768/(384\times2)\approx85\) FLOP/B. Both are well below the ridge of about 295 FLOP/B, so tiling into shared memory alone does not make a GEMM compute-bound against HBM; the rest comes from L2-cache reuse, because neighbouring thread blocks that share input panels are scheduled together (rasterisation), so most panel loads hit L2 rather than HBM (§7.3, and the correction logged in REVIEW.md).</p>
+</details>
+
+<h2 id="s7-4">7.4 Reductions: computing sums in parallel</h2>
+<p>Many LLM operations reduce a vector to a scalar: the mean square in RMSNorm, the maximum and sum in softmax, the dot products in attention, the total in a top-\(p\) mass. Summing \(n\) numbers looks inherently sequential, \(((x_1+x_2)+x_3)+\cdots\), but because addition is associative, the sum can be computed as a balanced binary tree in \(\lceil\log_2 n\rceil\) parallel steps. At step \(s\), each of the \(n/2^{s}\) active threads adds a pair of partial sums.</p>
+
+<figure class="diagram" id="fig-7-4">
+<svg class="dg" viewBox="0 0 720 220" role="img" aria-label="Tree reduction of eight values in three steps">
+<g class="t-sm">
+<rect x="40" y="30" width="60" height="28" rx="4" class="bx"/><text x="70" y="49" text-anchor="middle">x₀</text>
+<rect x="120" y="30" width="60" height="28" rx="4" class="bx"/><text x="150" y="49" text-anchor="middle">x₁</text>
+<rect x="200" y="30" width="60" height="28" rx="4" class="bx"/><text x="230" y="49" text-anchor="middle">x₂</text>
+<rect x="280" y="30" width="60" height="28" rx="4" class="bx"/><text x="310" y="49" text-anchor="middle">x₃</text>
+<rect x="360" y="30" width="60" height="28" rx="4" class="bx"/><text x="390" y="49" text-anchor="middle">x₄</text>
+<rect x="440" y="30" width="60" height="28" rx="4" class="bx"/><text x="470" y="49" text-anchor="middle">x₅</text>
+<rect x="520" y="30" width="60" height="28" rx="4" class="bx"/><text x="550" y="49" text-anchor="middle">x₆</text>
+<rect x="600" y="30" width="60" height="28" rx="4" class="bx"/><text x="630" y="49" text-anchor="middle">x₇</text>
+<rect x="80" y="90" width="60" height="28" rx="4" class="bx5"/><rect x="240" y="90" width="60" height="28" rx="4" class="bx5"/><rect x="400" y="90" width="60" height="28" rx="4" class="bx5"/><rect x="560" y="90" width="60" height="28" rx="4" class="bx5"/>
+<rect x="160" y="140" width="60" height="28" rx="4" class="bx2"/><rect x="480" y="140" width="60" height="28" rx="4" class="bx2"/>
+<rect x="320" y="185" width="60" height="28" rx="4" class="bx3"/><text x="350" y="204" text-anchor="middle">Σ</text>
+</g>
+<g class="ln"><line x1="70" y1="58" x2="105" y2="90"/><line x1="150" y1="58" x2="115" y2="90"/><line x1="230" y1="58" x2="265" y2="90"/><line x1="310" y1="58" x2="275" y2="90"/><line x1="390" y1="58" x2="425" y2="90"/><line x1="470" y1="58" x2="435" y2="90"/><line x1="550" y1="58" x2="585" y2="90"/><line x1="630" y1="58" x2="595" y2="90"/>
+<line x1="110" y1="118" x2="185" y2="140"/><line x1="270" y1="118" x2="195" y2="140"/><line x1="430" y1="118" x2="505" y2="140"/><line x1="590" y1="118" x2="515" y2="140"/>
+<line x1="190" y1="168" x2="345" y2="185"/><line x1="510" y1="168" x2="355" y2="185"/></g>
+<text x="680" y="110" class="t-xs">step 1</text><text x="680" y="158" class="t-xs">step 2</text><text x="680" y="203" class="t-xs">step 3</text>
+</svg>
+<figcaption><b>Figure 7.4 — A tree reduction.</b> Eight values are summed in three parallel steps instead of seven sequential ones. Within a warp, each step is a single "shuffle" instruction that passes values between lanes' registers.</figcaption></figure>
+
+<p>Figure 7.4 shows eight values summed in three steps. On a GPU the tree is implemented at two levels. Within a warp, threads exchange register values directly with <em>shuffle</em> instructions, which take no shared memory and no synchronisation:</p>
+<pre><code><span class="c-kw">__device__ float</span> warp_sum(<span class="c-kw">float</span> v) {                 <span class="c-com">// every lane returns the sum over the warp</span>
+    <span class="c-kw">for</span> (<span class="c-kw">int</span> offset = 16; offset &gt; 0; offset /= 2)
+        v += __shfl_xor_sync(0xffffffff, v, offset);   <span class="c-com">// add the value held by lane (id XOR offset)</span>
+    <span class="c-kw">return</span> v;
+}</code></pre>
+<p>Five shuffle steps reduce 32 values. Across warps, each warp writes its partial sum to shared memory, and one warp reduces those partials. Across thread blocks, which cannot synchronise, partial results are written to HBM and combined by a second kernel or by atomic additions. The reduction order determines the floating-point result bit for bit, which is why the batch-dependent choice between these strategies causes the nondeterminism of §4.8.</p>
+<p>The essential requirement is <strong>associativity</strong>. A tree reduction computes \((x_1\oplus x_2)\oplus(x_3\oplus x_4)\) rather than \(((x_1\oplus x_2)\oplus x_3)\oplus x_4\), and these agree only if \(\oplus\) is associative. Addition and maximum are associative, so sums and maxima parallelise directly. Softmax, at first sight, is not a reduction at all, which brings us to the most important idea of the chapter.</p>
+
+<h2 id="s7-5">7.5 The online softmax</h2>
+<p>Softmax over a vector \(x\in\mathbb R^{n}\) is computed in a numerically safe way as</p>
+\[ \operatorname{softmax}(x)_i = \frac{e^{x_i-m}}{\ell},\qquad m=\max_j x_j,\qquad \ell=\sum_j e^{x_j-m}. \]
+<p>Subtracting the maximum prevents overflow: without it \(e^{x_i}\) overflows for \(x_i\gtrsim 88\) in FP32, or about 11 in FP16. But the formula seems to require <em>three passes</em> over the data: one to find \(m\), one to compute \(\ell\) given \(m\), and one to produce the outputs. For a memory-bound operation, three passes means three times the memory traffic. Worse, in attention the vector \(x\) is a row of the \(T\times T\) score matrix, which we would very much like never to store at all. Can the maximum and the normaliser be computed together, in one pass, from data seen piece by piece?</p>
+<p>Milakov and Gimelshein (2018) showed that they can<span class="cite"><a href="#r-online">[1]</a></span>. Maintain a running maximum \(m\) and a running normaliser \(\ell\) <em>relative to that maximum</em>. When a new element \(x\) arrives, the maximum may increase, and the old normaliser, which was computed relative to the old maximum, must be rescaled:</p>
+\[ m' = \max(m, x),\qquad \ell' = \ell\,e^{m-m'} + e^{x-m'} . \]
+<p>Starting from \(m=-\infty,\ \ell=0\), one pass produces exactly \(m=\max_j x_j\) and \(\ell=\sum_je^{x_j-m}\). More useful still, the same idea combines the summaries of two <em>blocks</em> of data. If block \(a\) has summary \((m_a,\ell_a)\) and block \(b\) has \((m_b,\ell_b)\), then the summary of their union is</p>
+<div class="box formula">
+\[ (m_a,\ell_a)\oplus(m_b,\ell_b) = \Big(m,\ \ell_a e^{m_a-m} + \ell_b e^{m_b-m}\Big),\qquad m=\max(m_a,m_b). \]
+</div>
+
+<div class="box thm">
+<div class="box-title">Proposition — the online-softmax merge is associative</div>
+<p>Map each summary to the pair \((m,\ell)\) and observe that \(\ell e^{m}=\sum_{j\in\text{block}}e^{x_j}\) is invariant: it is the true sum of exponentials of the block, represented as a mantissa \(\ell\) relative to the exponent \(m\). The merge computes \(\max\) of the exponents and the sum of the represented quantities, \(\ell e^{m}=\ell_ae^{m_a}+\ell_be^{m_b}\), re-expressed relative to the new maximum. Since \(\max\) and \(+\) are associative and commutative, so is \(\oplus\). In exact arithmetic the result is independent of how the data are split into blocks and in what order the blocks are merged. ∎</p>
+</div>
+
+<p>Associativity is what makes the trick so powerful: softmax normalisation becomes a <em>reduction</em>, so it can be computed in a single pass, in parallel, over blocks processed in any order, by a tree of merges. The same merge extends to the output of attention. If each block also keeps a partial weighted sum of values \(o_a=\sum_{j\in a}e^{x_j-m_a}v_j\), then</p>
+\[ o = o_a e^{m_a-m} + o_b e^{m_b-m},\qquad \text{output} = o/\ell , \]
+<p>so attention over a long sequence can be computed block by block, never materialising the full row of scores. That single equation is the core of FlashAttention, which we derive in full in Chapter 9, and of FlashDecoding, which splits a long KV cache across thread blocks and merges their partial results with exactly this rule.</p>
+
+<figure class="diagram" id="fig-7-5">
+<svg class="dg" viewBox="0 0 720 200" role="img" aria-label="Online softmax merges per-block maxima and normalisers">
+<defs><marker id="a75" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="30" y="30" width="190" height="34" rx="6" class="bx"/><text x="125" y="52" text-anchor="middle" class="t-sm">block a: x₁ … x₂₅₆</text>
+<rect x="270" y="30" width="190" height="34" rx="6" class="bx"/><text x="365" y="52" text-anchor="middle" class="t-sm">block b: x₂₅₇ … x₅₁₂</text>
+<rect x="510" y="30" width="190" height="34" rx="6" class="bx"/><text x="605" y="52" text-anchor="middle" class="t-sm">block c: x₅₁₃ … x₇₆₈</text>
+<rect x="45" y="90" width="160" height="30" rx="6" class="bx5"/><text x="125" y="110" text-anchor="middle" class="t-sm">(mₐ, ℓₐ, oₐ)</text>
+<rect x="285" y="90" width="160" height="30" rx="6" class="bx5"/><text x="365" y="110" text-anchor="middle" class="t-sm">(m_b, ℓ_b, o_b)</text>
+<rect x="525" y="90" width="160" height="30" rx="6" class="bx5"/><text x="605" y="110" text-anchor="middle" class="t-sm">(m_c, ℓ_c, o_c)</text>
+<line x1="125" y1="64" x2="125" y2="88" class="ln" marker-end="url(#a75)"/><line x1="365" y1="64" x2="365" y2="88" class="ln" marker-end="url(#a75)"/><line x1="605" y1="64" x2="605" y2="88" class="ln" marker-end="url(#a75)"/>
+<rect x="190" y="148" width="340" height="36" rx="8" class="bx3"/><text x="360" y="170" text-anchor="middle" class="t-sm">merge ⊕ (any order): m = max, ℓ and o rescaled by e^(mᵢ − m)</text>
+<line x1="125" y1="120" x2="250" y2="148" class="ln" marker-end="url(#a75)"/><line x1="365" y1="120" x2="365" y2="148" class="ln" marker-end="url(#a75)"/><line x1="605" y1="120" x2="480" y2="148" class="ln" marker-end="url(#a75)"/>
+</svg>
+<figcaption><b>Figure 7.5 — Softmax as a reduction.</b> Each block of scores is summarised by its maximum, its normaliser relative to that maximum, and (for attention) its partial output. Summaries merge associatively, so blocks can be processed independently and combined in any order.</figcaption></figure>
+
+<p>Figure 7.5 summarises the idea. Each block of a long row of scores is processed independently, perhaps by a different thread block or even a different GPU, and summarised by three quantities: its local maximum, its local normaliser and, for attention, its local weighted sum of values. The summaries then merge pairwise in any order. Nothing larger than a block is ever held, and every input is read exactly once. This turns a three-pass, memory-hungry operation into a one-pass, streaming one, which is the kind of reformulation that separates a fast kernel from a slow one.</p>
+
+<details class="drill">
+<summary>Drill 7.1 — Verify the merge on numbers</summary>
+<p>Block \(a=\{1,3\}\), block \(b=\{2,5\}\). Compute each summary and merge, and check against the direct computation.</p>
+<p><em>Solution.</em> \(m_a=3,\ \ell_a=e^{-2}+1\approx1.1353\). \(m_b=5,\ \ell_b=e^{-3}+1\approx1.0498\). Merge: \(m=5\), \(\ell=1.1353\,e^{-2}+1.0498\approx0.1536+1.0498=1.2034\). Direct: \(e^{1-5}+e^{3-5}+e^{2-5}+e^{0}=0.0183+0.1353+0.0498+1=1.2034\). ✓</p>
+</details>
+
+<h2 id="s7-6">7.6 Kernel fusion</h2>
+<p>We can now make Chapter 6's advice to "fuse the element-wise operations" precise. Consider a chain of \(k\) element-wise operations applied to a tensor of \(S\) bytes, for example a residual addition, an RMSNorm scaling and a cast. If each runs as a separate kernel, each reads its input from HBM and writes its output back: \(2kS\) bytes in total. If they are fused into one kernel, the data are read once, transformed \(k\) times in registers, and written once: \(2S\) bytes. For memory-bound operations the time is proportional to the bytes, so fusion of \(k\) operations is worth a factor of \(k\), and it also saves \(k-1\) kernel launches.</p>
+
+<figure class="chart" id="fig-7-6">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"HBM traffic of a chain of element-wise operations, unfused versus fused","height":300,
+ "x":{"label":"Number of chained element-wise operations k","min":0,"max":9,"ticks":[1,2,3,4,5,6,7,8]},
+ "y":{"label":"Bytes moved, in units of the tensor size S","min":0,"max":18,"ticks":[0,2,4,6,8,10,12,14,16,18]},
+ "series":[
+  {"name":"Separate kernels: 2kS","color":"s2","points":[[1,2],[2,4],[3,6],[4,8],[5,10],[6,12],[7,14],[8,16]]},
+  {"name":"One fused kernel: 2S","color":"s1","points":[[1,2],[2,2],[3,2],[4,2],[5,2],[6,2],[7,2],[8,2]]}
+ ]}
+</script>
+<figcaption><b>Figure 7.6 — Fusion removes round-trips to HBM.</b> Unfused, every operation reads and writes the whole tensor; fused, the chain costs one read and one write. For memory-bound operations, time is proportional to these bytes.</figcaption></figure>
+
+<p>Figure 7.6 shows the linear growth of unfused traffic against the flat cost of a fused kernel. In an LLM the opportunities are everywhere. "Add the residual, then RMSNorm" is one kernel in every serious engine, as are "SiLU of the gate times the up-projection" in SwiGLU, "apply RoPE to \(q\) and \(k\), then write \(k\) and \(v\) into the paged cache", and "dequantise the weights inside the GEMM" for quantised models. The most valuable fusions put memory-bound operations into the <em>prologue</em> or <em>epilogue</em> of a matrix multiplication. A bias, activation or scaling applied to the output tile while it is still in registers costs essentially nothing. The deepest fusion of all is FlashAttention, which fuses the score matrix product, the softmax and the value product into one kernel so that the \(T\times T\) intermediate never touches HBM.</p>
+<p>Fusion has limits. A fused kernel needs all its inputs at once, so operations that require a global synchronisation, such as a reduction across the whole tensor followed by a use of its result everywhere, may not fuse into one pass unless they can be reformulated, as the online softmax reformulates softmax. Fusing too much can exhaust registers and shared memory, lowering occupancy. And each fused kernel is specialised code that must be written, tested and maintained. That last cost is why compilers that fuse automatically (§7.8) matter so much.</p>
+
+<h2 id="s7-7">7.7 Triton: kernels at the level of blocks</h2>
+<p>CUDA asks the programmer to think about individual threads, then coordinate them into warps and blocks by hand. Coalescing, bank conflicts, shuffles and barriers are all the programmer's responsibility. Tillet, Kung and Cox's <strong>Triton</strong> (2019)<span class="cite"><a href="#r-triton">[2]</a></span>, now maintained by OpenAI, raises the level of abstraction. A Triton program describes what one <em>block</em> of work does, in terms of whole tiles of data (vectors and small matrices). The compiler decides how to map each tile onto threads, registers and shared memory, handling coalescing, vectorisation, shuffles and, for matrix products, tensor-core instructions. Triton is embedded in Python, which is one reason it has become the default way to write custom kernels in the LLM ecosystem, from vLLM and SGLang to <code>torch.compile</code>, which generates Triton code.</p>
+<p>Here is a row-wise softmax in Triton. Each program instance handles one row, which fits in on-chip memory for typical widths:</p>
+<pre><code><span class="c-kw">import</span> triton, triton.language <span class="c-kw">as</span> tl
+
+@triton.jit
+<span class="c-kw">def</span> softmax_kernel(out_ptr, in_ptr, n_cols, stride, BLOCK: tl.constexpr):
+    row = tl.program_id(0)                                   <span class="c-com"># which row this program handles</span>
+    cols = tl.arange(0, BLOCK)                               <span class="c-com"># a whole vector of column indices</span>
+    mask = cols &lt; n_cols
+    x = tl.load(in_ptr + row * stride + cols, mask=mask, other=-float(<span class="c-str">'inf'</span>))
+    x = x - tl.max(x, axis=0)                                <span class="c-com"># reduction: compiler emits shuffles</span>
+    num = tl.exp(x)
+    y = num / tl.sum(num, axis=0)
+    tl.store(out_ptr + row * stride + cols, y, mask=mask)
+
+<span class="c-com"># launch one program per row:</span>
+<span class="c-com"># softmax_kernel[(n_rows,)](out, x, n_cols, x.stride(0), BLOCK=triton.next_power_of_2(n_cols))</span></code></pre>
+<p>Compare this with what the equivalent CUDA would need: per-thread index arithmetic, a two-level reduction with shuffles and shared memory, and careful coalescing. In Triton the reductions are a single <code>tl.max</code> or <code>tl.sum</code>, and the masking of the ragged last block is a keyword argument. The kernel reads each row once and writes it once, so it is a fused softmax: three logical passes over the row, one pass over HBM. The fused residual-add-and-RMSNorm that every engine uses is equally short:</p>
+<pre><code>@triton.jit
+<span class="c-kw">def</span> add_rmsnorm(x_ptr, res_ptr, w_ptr, out_ptr, d, eps, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK); mask = cols &lt; d
+    x = tl.load(x_ptr + row * d + cols, mask=mask, other=0.).to(tl.float32)
+    r = tl.load(res_ptr + row * d + cols, mask=mask, other=0.).to(tl.float32)
+    h = x + r                                                <span class="c-com"># residual add</span>
+    tl.store(res_ptr + row * d + cols, h.to(res_ptr.dtype.element_ty), mask=mask)   <span class="c-com"># updated residual stream</span>
+    rms = tl.sqrt(tl.sum(h * h, axis=0) / d + eps)           <span class="c-com"># one reduction, in FP32</span>
+    w = tl.load(w_ptr + cols, mask=mask, other=0.)
+    tl.store(out_ptr + row * d + cols, (h / rms * w).to(out_ptr.dtype.element_ty), mask=mask)</code></pre>
+<p>Five HBM round-trips in an unfused implementation (add, square, mean, scale, multiply by \(\gamma\)) become one read of two tensors and two writes, with the arithmetic done in FP32 registers for accuracy. Triton also supports tiled matrix products through <code>tl.dot</code>, which compiles to tensor-core instructions, and an autotuner that tries several tile sizes and keeps the fastest for each problem shape. That is how one Triton kernel can approach cuBLAS-level performance across many shapes.</p>
+
+<figure class="diagram" id="fig-7-7">
+<svg class="dg" viewBox="0 0 720 200" role="img" aria-label="CUDA programs threads; Triton programs blocks of data">
+<text x="180" y="22" text-anchor="middle" class="t-b">CUDA: you program a thread</text>
+<text x="540" y="22" text-anchor="middle" class="t-b">Triton: you program a block of data</text>
+<line x1="360" y1="10" x2="360" y2="190" class="grid"/>
+<g>
+<rect x="40" y="40" width="20" height="20" class="bx2"/><rect x="64" y="40" width="20" height="20" class="bx2"/><rect x="88" y="40" width="20" height="20" class="bx2"/><rect x="112" y="40" width="20" height="20" class="bx2"/><rect x="136" y="40" width="20" height="20" class="bx2"/><rect x="160" y="40" width="20" height="20" class="bx2"/><rect x="184" y="40" width="20" height="20" class="bx2"/><rect x="208" y="40" width="20" height="20" class="bx2"/><text x="250" y="55" class="t-xs">… one per element</text>
+<text x="40" y="92" class="t-xs">you write: index arithmetic, coalescing,</text>
+<text x="40" y="108" class="t-xs">shuffles, shared-memory staging, barriers,</text>
+<text x="40" y="124" class="t-xs">tensor-core fragments, bank-conflict padding</text>
+<text x="40" y="158" class="t-sm">maximal control, maximal effort</text>
+</g>
+<g>
+<rect x="400" y="40" width="200" height="22" rx="4" class="bx5"/><text x="500" y="56" text-anchor="middle" class="t-xs">x = tl.load(ptr + tl.arange(0, BLOCK))</text>
+<text x="400" y="92" class="t-xs">you write: tile-level loads, tl.dot, tl.sum,</text>
+<text x="400" y="108" class="t-xs">masks; the compiler maps tiles to threads,</text>
+<text x="400" y="124" class="t-xs">registers, shared memory and tensor cores</text>
+<text x="400" y="158" class="t-sm">most of the performance, much less effort</text>
+</g>
+</svg>
+<figcaption><b>Figure 7.7 — Two levels of abstraction.</b> CUDA exposes individual threads and leaves their coordination to the programmer; Triton exposes tiles and leaves the mapping to threads to the compiler.</figcaption></figure>
+
+<p>Figure 7.7 contrasts the two levels. In CUDA you program a thread and are responsible for everything that makes 32 of them cooperate efficiently. In Triton you program a tile, and the compiler handles that mapping. The trade-off is control. The very fastest kernels on new hardware (FlashAttention-3 on Hopper, FlashAttention-4 on Blackwell) depend on warp specialisation, explicit asynchronous pipelines and hardware features that a tile-level compiler may not expose or may not schedule optimally. Those are written in lower-level tools: CUDA with CUTLASS/CuTe, or the Python-embedded CuTe-DSL. For the large majority of LLM kernels, however, Triton gives most of the performance for a fraction of the effort.</p>
+
+<h2 id="s7-8">7.8 Launch overhead, CUDA Graphs and compilers</h2>
+<p>A decode step of Llama 3 8B launches hundreds of kernels, and at small batch many of them run for only a few microseconds. Each launch costs the CPU a few microseconds to prepare and submit, so the GPU can spend much of its time waiting for the next kernel: the overhead regime of §3.4 and Figure 6.4. <strong>CUDA Graphs</strong> remove this cost. The engine runs the decode step once in "capture" mode, recording the sequence of kernels, their arguments and their dependencies as a graph. Thereafter it replays the whole graph with a single launch, and the GPU executes the recorded kernels back to back. The catch is that a captured graph has fixed shapes and fixed memory addresses. Engines therefore capture one graph per batch size in a set of buckets (for example 1, 2, 4, 8, 16, … 256), pad each actual batch up to the nearest bucket, and keep inputs in pre-allocated buffers whose addresses never change. Prefill, whose shapes vary freely, usually runs without graphs, where launch overhead matters little relative to its long kernels.</p>
+<p><code>torch.compile</code> (PyTorch 2, 2023)<span class="cite"><a href="#r-pt2">[3]</a></span> automates much of the rest. It captures a model's Python code as a graph of operations (TorchDynamo), then compiles that graph (TorchInductor), fusing chains of element-wise and reduction operations into generated Triton kernels and calling library GEMMs for matrix products. It can also wrap the result in CUDA Graphs. Inference engines use it, often alongside hand-written kernels for attention and quantised matrix products, to get fusion without writing every fused kernel by hand.</p>
+<p>At the other end of the spectrum, NVIDIA's <strong>CUTLASS</strong> is a C++ template library of building blocks for high-performance GEMMs and convolutions, and its core abstraction, <strong>CuTe</strong>, describes data layouts algebraically. A CuTe layout is a function from logical coordinates to memory offsets, given by a shape and a stride, and layouts can be composed, partitioned and tiled with algebraic operations. That makes the intricate data arrangements of tensor-core kernels expressible and checkable. CuTe-DSL brings the same abstractions to Python, and FlashAttention-4 is written in it. Research languages push further. <strong>ThunderKittens</strong> (2024)<span class="cite"><a href="#r-tk">[4]</a></span> treats \(16\times16\) register tiles as the primitive data type. <strong>TileLang</strong> and others offer tile-level programming with explicit control over pipelining. The trend across all of them is the same: as tensor cores become faster and more asynchronous, kernel languages move towards expressing <em>tiles and pipelines</em> rather than threads.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — a layout is a function</div>
+<p>A CuTe layout with shape \((s_1,\dots,s_r)\) and stride \((d_1,\dots,d_r)\) is the map \(\mathbb Z_{s_1}\times\cdots\times\mathbb Z_{s_r}\to\mathbb Z\), \((c_1,\dots,c_r)\mapsto\sum_i c_id_i\). Row-major and column-major storage of a matrix are two such maps; a tile is the restriction of a layout to a sub-box; "swizzling" composes a layout with a bijection on offsets that spreads accesses across shared-memory banks. Kernel bugs that look mysterious often become transparent when the layouts are written down as functions and composed.</p>
+</div>
+
+
+<div class="box example">
+<div class="box-title">Worked example — launch overhead in a decode step</div>
+<p>A decode step of Llama 3 8B launches roughly ten kernels per layer (normalisations, projections, attention, activation, residual adds) over 32 layers, about 320 launches. At 4–5 µs of CPU-side launch cost each, the launches alone take about 1.5 ms, and if the GPU finishes small kernels faster than the CPU issues them it idles between them. Against a 10 ms step at batch 64 that is a 15% loss; against a 2 ms step at batch 1 on a small model, it can exceed the GPU time. Capturing the step in a CUDA graph replaces the 320 launches with one, cutting the overhead to tens of microseconds, which is why engines capture decode steps in graphs for each batch-size bucket (§7.8, §12.2).</p>
+</div>
+
+<h2 id="s7-9">7.9 Timing a kernel correctly</h2>
+<p>Every claim in this chapter, that a fused kernel is faster or a layout coalesces, must eventually be checked by measurement. GPU timing has traps that catch almost everyone the first time, and most of them follow from one fact established in §5.2: kernel launches are <em>asynchronous</em>. When Python calls a GPU operation, the call returns as soon as the kernel is queued, long before it finishes. A naive timing loop therefore measures how fast the CPU can enqueue work, not how fast the GPU does it. The correct pattern records events on the GPU's own timeline and synchronises before reading them:</p>
+<pre><code><span class="c-kw">import</span> torch
+
+<span class="c-kw">def</span> time_gpu(fn, warmup=10, iters=100):
+    <span class="c-kw">for</span> _ <span class="c-kw">in</span> range(warmup):                 <span class="c-com"># compile, autotune, warm caches and clocks</span>
+        fn()
+    start = torch.cuda.Event(enable_timing=<span class="c-kw">True</span>)
+    end = torch.cuda.Event(enable_timing=<span class="c-kw">True</span>)
+    start.record()                           <span class="c-com"># timestamps recorded on the GPU stream</span>
+    <span class="c-kw">for</span> _ <span class="c-kw">in</span> range(iters):
+        fn()
+    end.record()
+    torch.cuda.synchronize()                 <span class="c-com"># wait for the GPU to finish</span>
+    <span class="c-kw">return</span> start.elapsed_time(end) / iters   <span class="c-com"># milliseconds per call</span></code></pre>
+<p>Four further cautions turn a measurement into evidence. <strong>Warm up.</strong> The first calls include one-off costs such as compilation, autotuning and memory allocation, and the GPU may still be raising its clock. <strong>Beware of caches.</strong> If the same small input is used on every iteration, it may stay in the 50 MB L2 cache, and a "memory-bound" kernel will appear to exceed HBM bandwidth. Benchmark on inputs larger than L2, or rotate among several buffers. <strong>Convert to a rate.</strong> Report achieved bandwidth (necessary bytes ÷ time) or FLOP/s alongside the time, and compare with the roofline. A vector addition of \(10^8\) floats should take about \(12\times10^8/3.35\times10^{12}\approx0.36\) ms on an H100. Measuring 0.45 ms means 80% of peak, which is excellent. Measuring 0.05 ms means the measurement is wrong. <strong>Measure the distribution.</strong> Report the median and spread over repetitions, because clock changes, other processes and power management add noise. Triton's <code>triton.testing.do_bench</code> implements most of these practices and is a good default.</p>
+<p>The same principles apply at larger scale. When benchmarking a whole serving system (Chapter 28), asynchrony becomes queueing, cache effects become prefix-cache hit rates, and warm-up becomes the period before CUDA graphs are captured and memory pools are filled. The habit of predicting the answer from first principles before measuring, then explaining any gap, is the same.</p>
+
+<h2 id="looking-ahead" class="unnumbered">Looking ahead</h2>
+<p>Part II is complete. We have built a model of the GPU (Chapter 5), a quantitative tool for predicting and measuring performance on it (Chapter 6), and the programming ideas with which fast kernels are written (this chapter): coalesced access, on-chip tiling, parallel reductions, the online softmax and fusion. With these in hand we can return to the problem that Part I identified as central. The KV cache grows with every token, dominates memory capacity, and at realistic context lengths dominates the bytes each decode step must read (§6.4–6.5). Part III attacks it from three directions: making the cache smaller (Chapter 8), reading it with IO-aware kernels built on exactly the online softmax derived here (Chapter 9), and managing it in memory as carefully as an operating system manages pages (Chapter 10).</p>
+
+<h2 id="summary">Chapter summary</h2>
+<ul>
+<li>A CUDA kernel is written per thread; threads compute their index from <code>blockIdx</code>, <code>blockDim</code> and <code>threadIdx</code>. Memory-bound kernels such as vector addition reach peak bandwidth only with enough parallelism and coalesced access.</li>
+<li>Coalescing: a warp reading 32 consecutive words uses one 128-byte transaction; strided access can waste 7/8 of the bandwidth. Shared memory has 32 banks; same-bank accesses serialise; padding or swizzling avoids conflicts.</li>
+<li>Tiled GEMM: each block computes a \(t\times t\) output tile from tiles staged in shared memory, giving intensity \(t/b\). Practical tiles fall short of the HBM ridge, so real GEMMs add L2 reuse across blocks, register tiling, tensor cores and asynchronous pipelines (cuBLAS, CUTLASS).</li>
+<li>Reductions use associativity to sum in \(\log n\) steps: warp shuffles inside a warp, shared memory across warps, multiple kernels or atomics across blocks. Reduction order determines bit-level results.</li>
+<li>Online softmax: \(m'=\max(m,x)\), \(\ell'=\ell e^{m-m'}+e^{x-m'}\); block summaries merge associatively, and partial attention outputs merge the same way. This is the basis of FlashAttention and FlashDecoding.</li>
+<li>Fusion of \(k\) memory-bound operations cuts HBM traffic from \(2kS\) to \(2S\). The best fusions put element-wise work into GEMM prologues and epilogues.</li>
+<li>Triton programs tiles rather than threads; the compiler handles mapping, reductions and tensor cores, giving most of the performance with far less effort. The very fastest kernels use CUTLASS/CuTe or CuTe-DSL.</li>
+<li>Timing: kernels launch asynchronously, so time with GPU events and synchronise; warm up, avoid L2-resident inputs, and report achieved bandwidth against the roofline.</li>
+<li>CUDA Graphs remove launch overhead by replaying captured kernel sequences (fixed shapes, so engines bucket batch sizes). <code>torch.compile</code> captures and fuses automatically, generating Triton.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+<div class="mcq" data-id="ch07-mcq-01" data-topic="§7.1 First kernel">
+<p class="q">In <code>int i = blockIdx.x * blockDim.x + threadIdx.x;</code>, what does <code>blockDim.x</code> hold?</p>
+<ol class="opts"><li>The number of blocks in the grid</li><li data-correct>The number of threads per block (in x)</li><li>The block's index</li><li>The warp size</li></ol>
+<div class="explain">The global index is (block index) × (threads per block) + (thread index within block).</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-02" data-topic="§7.1 First kernel">
+<p class="q">Why does the vector-add kernel contain <code>if (i &lt; n)</code>?</p>
+<ol class="opts"><li>To avoid divergence</li><li data-correct>The grid is rounded up to whole blocks, so the last block may contain threads beyond the end of the array</li><li>To synchronise threads</li><li>For coalescing</li></ol>
+<div class="explain">\(\lceil n/256\rceil\) blocks cover \(n\) elements with up to 255 extra threads, which must not write.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-03" data-topic="§7.1 First kernel">
+<p class="q">The arithmetic intensity of FP32 vector addition \(z=x+y\) is:</p>
+<ol class="opts"><li>1</li><li data-correct>1/12 FLOPs per byte</li><li>12</li><li>n</li></ol>
+<div class="explain">One FLOP per element; 8 bytes read and 4 written.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-04" data-topic="§7.2 Coalescing">
+<p class="q">A warp's 32 threads each read one float spaced 32 floats apart. Compared with consecutive reads, roughly how many more bytes are fetched?</p>
+<ol class="opts"><li>Same</li><li>2×</li><li data-correct>8×</li><li>32×</li></ol>
+<div class="explain">32 sectors of 32 bytes (1,024 B) versus one 128-byte segment.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-05" data-topic="§7.2 Coalescing">
+<p class="q">Why do data layouts (e.g. of the KV cache or quantised weights) matter so much in LLM kernels?</p>
+<ol class="opts"><li>They change the model's accuracy</li><li data-correct>Threads that run together should read memory that sits together, so the layout decides whether accesses coalesce</li><li>They change the number of FLOPs</li><li>They determine the vocabulary</li></ol>
+<div class="explain">Memory-bound kernels live or die by coalescing.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-06" data-topic="§7.2 Bank conflicts">
+<p class="q">A warp reads one column of a <code>float tile[32][32]</code> in shared memory. Why is this slow, and what is the classic fix?</p>
+<ol class="opts"><li>It is not slow</li><li data-correct>All 32 elements of a column lie in the same bank (32-way conflict); pad rows to <code>[32][33]</code></li><li>It is uncoalesced in HBM; transpose in HBM</li><li>Too many registers; use fewer threads</li></ol>
+<div class="explain">Row stride 32 words maps a column to one bank; stride 33 spreads it across all 32 banks.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-07" data-topic="§7.3 Tiled GEMM">
+<p class="q">In the tiled GEMM, why are there two <code>__syncthreads()</code> calls per iteration?</p>
+<ol class="opts"><li>To double the speed</li><li data-correct>One ensures the tiles are fully loaded before anyone reads them; the other ensures everyone has finished reading before the tiles are overwritten</li><li>To flush HBM</li><li>One per warp</li></ol>
+<div class="explain">Shared memory is reused across iterations, so both read-after-write and write-after-read hazards must be prevented.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-08" data-topic="§7.3 Tiled GEMM">
+<p class="q">The intensity of the traffic a thread block fetches in a tiled GEMM with \(t\times t\) tiles and \(b\)-byte operands is about:</p>
+<ol class="opts"><li>\(b/t\)</li><li data-correct>\(t/b\)</li><li>\(t^2/b\)</li><li>\(1/b\)</li></ol>
+<div class="explain">\(2t^2t_k\) FLOPs per \(2tt_kb\) bytes.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-09" data-topic="§7.3 Tiled GEMM">
+<p class="q">With 128-wide square BF16 tiles, a block's traffic has intensity about 64. Why can a production GEMM still be compute-bound on H100 (ridge 295)?</p>
+<ol class="opts"><li>It cannot</li><li data-correct>Concurrently running blocks share input tiles through the L2 cache, so HBM sees each element only a few times; registers add further reuse</li><li>H100 has no ridge point</li><li>It uses FP64</li></ol>
+<div class="explain">Rasterised/swizzled block order makes L2 serve most tile loads; HBM intensity then reaches the thousands.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-10" data-topic="§7.3 Production GEMMs">
+<p class="q">Which are features of production GEMM kernels beyond the textbook tiled kernel? (select all that apply)</p>
+<ol class="opts"><li data-correct>Register tiling: each thread accumulates a sub-tile of C</li><li data-correct>Tensor-core instructions in the inner loop</li><li data-correct>Asynchronous multi-stage loading (e.g. TMA) overlapping copy and compute</li><li>Recomputing A for every output element</li></ol>
+<div class="explain">All three raise reuse or overlap; recomputation would destroy reuse.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-11" data-topic="§7.3 Barriers">
+<p class="q">Why can't <code>__syncthreads()</code> synchronise threads in different blocks?</p>
+<ol class="opts"><li>It is too slow</li><li data-correct>Blocks may run in any order and need not be resident simultaneously, so a grid-wide barrier could deadlock</li><li>Blocks have different warp sizes</li><li>It only works on the CPU</li></ol>
+<div class="explain">Grid-wide synchronisation needs a new kernel launch, atomics, or special cooperative launches.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-12" data-topic="§7.4 Reductions">
+<p class="q">A tree reduction of \(n\) values takes how many parallel steps?</p>
+<ol class="opts"><li>\(n\)</li><li>\(n/2\)</li><li data-correct>\(\lceil\log_2 n\rceil\)</li><li>1</li></ol>
+<div class="explain">Each step halves the number of partial results.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-13" data-topic="§7.4 Reductions">
+<p class="q">What property of an operation \(\oplus\) is required for a tree reduction to compute the same result as a sequential one (in exact arithmetic)?</p>
+<ol class="opts"><li>Commutativity only</li><li data-correct>Associativity</li><li>Linearity</li><li>Idempotence</li></ol>
+<div class="explain">The tree regroups terms; associativity makes grouping irrelevant. (Commutativity additionally allows reordering.)</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-14" data-topic="§7.4 Shuffles">
+<p class="q">Warp shuffle instructions allow threads to:</p>
+<ol class="opts"><li>Access HBM faster</li><li data-correct>Read another lane's register value directly, without shared memory or barriers</li><li>Change warps</li><li>Launch kernels</li></ol>
+<div class="explain">Five xor-shuffle steps sum 32 values held in registers.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-15" data-topic="§7.4 Determinism">
+<p class="q">Why can two correct parallel reductions of the same FP32 array give slightly different sums?</p>
+<ol class="opts"><li>A hardware bug</li><li data-correct>Floating-point addition is not associative, and different strategies add in different orders</li><li>Random number generation</li><li>Bank conflicts</li></ol>
+<div class="explain">This is the root of the batch-dependent nondeterminism of §4.8.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-16" data-topic="§7.5 Online softmax">
+<p class="q">Why subtract the maximum before exponentiating in softmax?</p>
+<ol class="opts"><li>To make outputs sum to one</li><li data-correct>To avoid overflow of \(e^{x}\) (e.g. for \(x\gtrsim88\) in FP32, ≈ 11 in FP16) without changing the result</li><li>To speed up exp</li><li>To make softmax linear</li></ol>
+<div class="explain">\(e^{x_i-m}/\sum_je^{x_j-m}\) equals \(e^{x_i}/\sum_je^{x_j}\) exactly.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-17" data-topic="§7.5 Online softmax">
+<p class="q">In the online softmax, when a new element \(x\) raises the running maximum from \(m\) to \(m'\), the running normaliser becomes:</p>
+<ol class="opts"><li>\(\ell+e^{x}\)</li><li data-correct>\(\ell e^{m-m'}+e^{x-m'}\)</li><li>\(\ell e^{m'-m}+e^{x}\)</li><li>\(\max(\ell, e^{x})\)</li></ol>
+<div class="explain">The old normaliser was relative to \(m\); rescale it to \(m'\) and add the new term.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-18" data-topic="§7.5 Merge">
+<p class="q">Merging block summaries \((m_a,\ell_a)\) and \((m_b,\ell_b)\) gives:</p>
+<ol class="opts"><li>\((m_a+m_b,\ \ell_a+\ell_b)\)</li><li data-correct>\((m,\ \ell_ae^{m_a-m}+\ell_be^{m_b-m})\) with \(m=\max(m_a,m_b)\)</li><li>\((\max(m_a,m_b),\ \max(\ell_a,\ell_b))\)</li><li>\((m_a,\ \ell_a\ell_b)\)</li></ol>
+<div class="explain">Both normalisers are re-expressed relative to the joint maximum, then added.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-19" data-topic="§7.5 Associativity">
+<p class="q">The key invariant that proves the merge is associative is that:</p>
+<ol class="opts"><li>\(m\) is always 0</li><li data-correct>\(\ell e^{m}\) equals the true sum of exponentials of the block, and the merge just adds these sums</li><li>\(\ell\le1\)</li><li>Blocks have equal size</li></ol>
+<div class="explain">The pair \((m,\ell)\) is a floating-point-like representation of \(\sum e^{x_j}\); max and + are associative.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-20" data-topic="§7.5 Attention">
+<p class="q">To merge partial attention outputs \(o_a=\sum_{j\in a}e^{x_j-m_a}v_j\) and \(o_b\), one computes:</p>
+<ol class="opts"><li>\(o_a+o_b\)</li><li data-correct>\(o_ae^{m_a-m}+o_be^{m_b-m}\), then divides by the merged \(\ell\)</li><li>\(\max(o_a,o_b)\)</li><li>\((o_a+o_b)/2\)</li></ol>
+<div class="explain">Same rescaling as the normaliser; the basis of FlashAttention and FlashDecoding.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-21" data-topic="§7.5 Online softmax">
+<p class="q">The main practical benefit of the online softmax in attention is that it:</p>
+<ol class="opts"><li>Reduces FLOPs</li><li data-correct>Lets the softmax be computed block by block in one pass, so the full row of scores never needs to be stored in HBM</li><li>Removes the need for the maximum</li><li>Improves accuracy in FP64</li></ol>
+<div class="explain">Single-pass, streaming, parallel over blocks.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-22" data-topic="§7.6 Fusion">
+<p class="q">Fusing 4 memory-bound element-wise operations on an \(S\)-byte tensor reduces HBM traffic from:</p>
+<ol class="opts"><li>\(4S\) to \(S\)</li><li data-correct>\(8S\) to \(2S\)</li><li>\(2S\) to \(S\)</li><li>It doesn't change traffic</li></ol>
+<div class="explain">Each separate kernel reads and writes \(S\); the fused kernel reads and writes once.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-23" data-topic="§7.6 Fusion">
+<p class="q">Which fusion avoids writing a \(T\times T\) intermediate to HBM?</p>
+<ol class="opts"><li>Residual add + RMSNorm</li><li>SiLU × up-projection</li><li data-correct>FlashAttention: score matmul + softmax + value matmul in one kernel</li><li>Dequantise-in-GEMM</li></ol>
+<div class="explain">The scores and probabilities live only in on-chip memory.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-24" data-topic="§7.6 Epilogues">
+<p class="q">Why is applying a bias or activation in a GEMM's epilogue almost free?</p>
+<ol class="opts"><li>Bias has no FLOPs</li><li data-correct>The output tile is still in registers, so the extra element-wise work needs no additional HBM traffic</li><li>Epilogues run on the CPU</li><li>Tensor cores compute it</li></ol>
+<div class="explain">The memory-bound cost of a separate kernel disappears.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-25" data-topic="§7.6 Limits">
+<p class="q">Which are genuine limits on kernel fusion? (select all that apply)</p>
+<ol class="opts"><li data-correct>Operations needing a global synchronisation (unless reformulated, e.g. online softmax)</li><li data-correct>Register and shared-memory pressure reducing occupancy</li><li data-correct>Engineering cost of writing and maintaining specialised kernels</li><li>Fusion always increases HBM traffic</li></ol>
+<div class="explain">Compilers that fuse automatically address the third limit.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-26" data-topic="§7.7 Triton">
+<p class="q">The central abstraction of Triton is:</p>
+<ol class="opts"><li>A single thread</li><li data-correct>A program instance operating on whole tiles (blocks) of data, with the compiler mapping tiles to threads</li><li>A warp</li><li>A CUDA graph</li></ol>
+<div class="explain">Loads, reductions (<code>tl.sum</code>, <code>tl.max</code>) and matmuls (<code>tl.dot</code>) act on tiles.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-27" data-topic="§7.7 Triton">
+<p class="q">In the Triton softmax, why are out-of-range elements loaded with <code>other=-inf</code>?</p>
+<ol class="opts"><li>To cause an error</li><li data-correct>So padding lanes do not affect the maximum and contribute \(e^{-\infty}=0\) to the sum</li><li>For coalescing</li><li>To use FP8</li></ol>
+<div class="explain">The block width is a power of two ≥ the row length; masked lanes must be neutral.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-28" data-topic="§7.7 Triton vs CUDA">
+<p class="q">Why are the very fastest attention kernels on new GPUs (e.g. FlashAttention-3/4) not written in Triton?</p>
+<ol class="opts"><li>Triton cannot do matrix products</li><li data-correct>They depend on warp specialisation, explicit asynchronous pipelines and new hardware features that tile-level compilers may not expose or schedule optimally</li><li>Triton is only for CPUs</li><li>Licensing</li></ol>
+<div class="explain">They use CUTLASS/CuTe or CuTe-DSL for finer control.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-29" data-topic="§7.8 CUDA Graphs">
+<p class="q">Why do engines capture one CUDA graph per batch-size bucket and pad batches?</p>
+<ol class="opts"><li>Graphs improve accuracy</li><li data-correct>A captured graph has fixed shapes and memory addresses, so each shape needs its own graph</li><li>To reduce HBM usage</li><li>Graphs only support powers of two</li></ol>
+<div class="explain">Padding to the nearest bucket trades a little wasted compute for eliminated launch overhead.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-30" data-topic="§7.8 torch.compile">
+<p class="q">What does TorchInductor (the backend of <code>torch.compile</code>) typically generate for chains of element-wise and reduction ops?</p>
+<ol class="opts"><li>CPU assembly</li><li data-correct>Fused Triton kernels</li><li>New model weights</li><li>CUDA graphs only</li></ol>
+<div class="explain">Matrix products are usually dispatched to libraries; surrounding ops are fused into Triton.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-31" data-topic="§7.8 CuTe">
+<p class="q">In CuTe, a layout is best understood as:</p>
+<ol class="opts"><li>A memory allocator</li><li data-correct>A function from logical coordinates to memory offsets, defined by a shape and a stride, which can be composed and tiled</li><li>A thread block</li><li>A data type</li></ol>
+<div class="explain">Row-major, column-major, tiled and swizzled arrangements are all layouts.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-32" data-topic="§7.5 Drill">
+<p class="q">Blocks \(\{1,3\}\) and \(\{2,5\}\): the merged online-softmax normaliser (relative to max 5) is about:</p>
+<ol class="opts"><li>1.05</li><li data-correct>1.20</li><li>2.18</li><li>4.00</li></ol>
+<div class="explain">\(e^{-4}+e^{-2}+e^{-3}+1\approx1.2034\).</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-33" data-topic="§7.9 Timing">
+<p class="q">Timing a GPU operation with Python's <code>time.time()</code> before and after the call, with no synchronisation, mostly measures:</p>
+<ol class="opts"><li>The kernel's execution time</li><li data-correct>How long it takes the CPU to enqueue the kernel, since launches are asynchronous</li><li>HBM latency</li><li>The compile time</li></ol>
+<div class="explain">Use CUDA events recorded on the stream and synchronise before reading them.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-34" data-topic="§7.9 Timing">
+<p class="q">A benchmark of a memory-bound kernel on a 4 MB input reports 6 TB/s on an H100 (peak HBM 3.35 TB/s). The most likely explanation is:</p>
+<ol class="opts"><li>A faster HBM</li><li data-correct>The input stays resident in the 50 MB L2 cache across iterations</li><li>Tensor cores</li><li>Clock boost</li></ol>
+<div class="explain">Benchmark on inputs larger than L2, or rotate buffers, to measure HBM bandwidth.</div>
+</div>
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+<details class="qa" data-id="ch07-qa-01">
+<summary><span class="lvl warm">Warm-up</span> Write a CUDA kernel for element-wise addition and explain the launch configuration.</summary>
+<div class="answer">
+<pre><code>__global__ void add(const float* x, const float* y, float* z, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &lt; n) z[i] = x[i] + y[i];
+}
+add&lt;&lt;&lt;(n + 255) / 256, 256&gt;&gt;&gt;(x, y, z, n);</code></pre>
+<p>Each thread handles one element; 256 threads per block (a multiple of the warp size) and enough blocks to cover \(n\), with a bounds check for the tail. Consecutive threads touch consecutive addresses, so loads and stores coalesce. Intensity is 1/12 FLOPs/byte, so the kernel is memory-bound at ≈ \(12n/\beta\); large \(n\) gives enough parallelism to saturate bandwidth. Improvements: vectorised loads (float4), grid-stride loops for very large \(n\).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch07-qa-02">
+<summary><span class="lvl core">Core</span> What is memory coalescing, and how would you detect and fix uncoalesced access?</summary>
+<div class="answer">
+<p>When a warp's threads access consecutive, aligned addresses, the hardware combines them into a few wide transactions (one 128-byte segment for 32 floats). Scattered or strided accesses need a separate 32-byte sector per thread, wasting bandwidth (up to 8× for 4-byte elements). Detect: Nsight Compute's sectors-per-request and achieved DRAM bandwidth versus useful bytes. Fix: change the data layout (transpose, struct-of-arrays), change the thread-to-data mapping so consecutive threads read consecutive elements, stage through shared memory (load coalesced, then read in any pattern), use vectorised loads.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch07-qa-03">
+<summary><span class="lvl core">Core</span> Explain the shared-memory tiled GEMM and derive its arithmetic intensity.</summary>
+<div class="answer">
+<p>Each thread block computes a \(t\times t\) output tile. It iterates along \(K\) in steps of \(t_k\); at each step the block's threads cooperatively (and coalescedly) load a \(t\times t_k\) tile of \(A\) and a \(t_k\times t\) tile of \(B\) into shared memory, synchronise, accumulate the tile product, and synchronise again before the next load. FLOPs per step: \(2t^2t_k\); bytes per step: \(2tt_kb\); intensity \(t/b\). For BF16 tiles of 128 that is 64, below the H100 HBM ridge, so production kernels add L2 reuse across blocks (rasterised scheduling), register tiling (each thread owns a sub-tile), tensor cores and asynchronous multi-stage pipelines. Shared memory and register capacity bound \(t\).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch07-qa-04">
+<summary><span class="lvl core">Core</span> Derive the online softmax and explain why it matters for attention.</summary>
+<div class="answer">
+<p>Safe softmax needs \(m=\max_jx_j\) and \(\ell=\sum_je^{x_j-m}\), seemingly two passes before the output pass. Online: keep \((m,\ell)\); for each new \(x\), \(m'=\max(m,x)\), \(\ell'=\ell e^{m-m'}+e^{x-m'}\). Blocks merge: \(m=\max(m_a,m_b)\), \(\ell=\ell_ae^{m_a-m}+\ell_be^{m_b-m}\). This is associative because \(\ell e^{m}\) represents the block's \(\sum e^{x_j}\) exactly and the merge adds those sums. With partial outputs \(o_a=\sum e^{x_j-m_a}v_j\) merged by the same rescaling, attention can be computed over blocks of keys in one pass without storing the \(T\times T\) score matrix: FlashAttention. Splitting a long KV cache across thread blocks and merging gives FlashDecoding.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch07-qa-05">
+<summary><span class="lvl core">Core</span> Implement a fused residual-add + RMSNorm in Triton and explain what it saves.</summary>
+<div class="answer">
+<p>See §7.7: one program per row loads \(x\) and the residual \(r\), computes \(h=x+r\) in FP32, stores \(h\) back as the new residual stream, computes \(\text{rms}=\sqrt{\operatorname{mean}(h^2)+\epsilon}\) with one <code>tl.sum</code>, and stores \(h/\text{rms}\cdot\gamma\). Savings: unfused there are separate kernels for the add, square, mean, rsqrt-scale and multiply by γ, each reading and writing the tensor (≈ 5 round-trips plus launches). Fused: read two tensors once, write two once. The operation is memory-bound, so time falls roughly in proportion to bytes, and launch overhead falls too. Accumulating in FP32 avoids precision loss in the reduction.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch07-qa-06">
+<summary><span class="lvl core">Core</span> What are shared-memory bank conflicts and how do you avoid them?</summary>
+<div class="answer">
+<p>Shared memory has 32 banks, each serving one 4-byte word per cycle, with consecutive words in consecutive banks. If several threads in a warp access different addresses in the same bank in one instruction, the accesses serialise (n-way conflict). Classic case: reading a column of a 32×32 float tile (stride 32 words means the same bank). Fixes: pad rows (<code>[32][33]</code>), use swizzled layouts (XOR-based permutation of columns per row), change access patterns, or let TMA write swizzled tiles. Broadcast (all threads reading the same address) is not a conflict.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch07-qa-07">
+<summary><span class="lvl deep">Deep-dive</span> Why does every LLM engine use CUDA Graphs for decode but not usually for prefill? What constraints do graphs impose?</summary>
+<div class="answer">
+<p>Decode at small and medium batch launches hundreds of short kernels; per-launch CPU cost (microseconds) can rival kernel time, leaving the GPU idle. A CUDA graph records the whole step and replays it with one launch, eliminating that overhead. Prefill kernels are long and shapes vary with prompt length, so launch overhead is negligible and capturing every shape is impractical. Constraints: fixed shapes (capture per batch-size bucket and pad), fixed memory addresses (persistent input and output buffers, static KV-cache tensors with block tables passed as data), no CPU-dependent control flow inside the captured region, and capture cost and memory per graph. Engines (vLLM, SGLang) capture a set of decode batch sizes at start-up.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch07-qa-08">
+<summary><span class="lvl core">Core</span> When would you write a kernel in Triton versus CUDA/CUTLASS, versus relying on torch.compile?</summary>
+<div class="answer">
+<p><strong>torch.compile</strong>: first choice for fusing element-wise and reduction chains automatically with no kernel code; good for prototyping and many production paths. <strong>Triton</strong>: custom fused operations the compiler does not produce (fused RoPE + KV write, custom attention variants, quantised matmuls with unusual formats, MoE routing kernels), when you want near-library performance with Python productivity and portability. <strong>CUDA / CUTLASS / CuTe-DSL</strong>: when you need the last 10–30% on the newest hardware (warp specialisation, TMA/wgmma/tcgen05 pipelines, persistent kernels), or features the compiler does not expose. Always compare against vendor libraries (cuBLAS, cuDNN, FlashAttention) first.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch07-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Write a parallel sum reduction for a large array, describing all three levels.</summary>
+<div class="answer">
+<p>(1) <strong>Thread level:</strong> grid-stride loop. Each thread sums many elements with coalesced (vectorised) loads into a register. (2) <strong>Warp level:</strong> <code>for (off = 16; off &gt; 0; off /= 2) v += __shfl_xor_sync(0xffffffff, v, off);</code>, giving the warp's sum in every lane. (3) <strong>Block level:</strong> lane 0 of each warp writes to shared memory, <code>__syncthreads()</code>, and the first warp reduces those values. (4) <strong>Grid level:</strong> each block writes its partial sum to global memory; either a second kernel reduces the partials, or each block does <code>atomicAdd</code> (non-deterministic order). Accumulate in FP32 (or use Kahan summation) for accuracy; for reproducibility use a fixed-order two-pass approach.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch07-qa-10">
+<summary><span class="lvl core">Core</span> Quantify the benefit of kernel fusion for a decode step and name the fusions every engine implements.</summary>
+<div class="answer">
+<p>For memory-bound ops, time ∝ bytes; fusing \(k\) ops cuts traffic from \(2kS\) to \(2S\) and removes \(k-1\) launches. In decode the activations are small, so the bigger win is often launches (hundreds per step) plus avoiding extra passes over the KV cache or logits. Standard fusions: residual add + RMSNorm; QKV projection as one GEMM; RoPE fused with the KV-cache write (and often with the QKV GEMM epilogue); SiLU × up-projection (gate/up fused GEMM + activation epilogue); attention (FlashAttention / paged decode kernels); dequantisation inside the GEMM for quantised weights; fused MoE routing and expert GEMMs; fused sampling (penalties + temperature + top-k/p). Together with CUDA graphs these typically give large decode speed-ups over naive PyTorch.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch07-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> Prove that the online-softmax merge is associative, and discuss its floating-point behaviour.</summary>
+<div class="answer">
+<p>Represent a block by \(S=\sum_{j}e^{x_j}\) written as \(S=\ell e^{m}\) with \(m\) the block max. The merge outputs \(m=\max(m_a,m_b)\) and \(\ell=\ell_ae^{m_a-m}+\ell_be^{m_b-m}\), so \(\ell e^{m}=\ell_ae^{m_a}+\ell_be^{m_b}=S_a+S_b\). Since max and + are associative and commutative, any bracketing gives \((\max_jx_j,\ \sum_je^{x_j}/e^{\max_jx_j})\). In floating point: every exponent argument is \(\le0\), so no overflow; \(\ell\in[1, n]\), so it is well scaled; rounding errors depend on the merge order (non-associative addition), giving last-bit differences between tilings, harmless numerically but relevant to bit-reproducibility. Rescaling the running output \(o\) by \(e^{m_a-m}\le1\) is stable.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch07-qa-12">
+<summary><span class="lvl warm">Warm-up</span> What do CUTLASS and CuTe provide, and why would an inference engineer care?</summary>
+<div class="answer">
+<p>CUTLASS is NVIDIA's open-source C++ template library of building blocks for high-performance GEMMs, convolutions and related kernels (tiling, pipelining, tensor-core MMA, epilogues). CuTe is its layout algebra: layouts as functions from coordinates to offsets that compose and tile, making tensor-core data arrangements tractable. Inference engineers care because custom GEMM variants (quantised weights with in-kernel dequantisation, grouped GEMMs for MoE, fused epilogues) and attention kernels (FlashAttention-3, FlashMLA) are built on them; CuTe-DSL exposes the same in Python (FlashAttention-4 uses it).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch07-qa-13">
+<summary><span class="lvl design">Design</span> Your model has a custom attention variant with no optimised kernel, and decode is 3× slower than a standard model of the same size. Plan the work.</summary>
+<div class="answer">
+<p>(1) Profile: confirm attention dominates and whether it is memory-bound (likely) or overhead-bound (many small kernels). (2) Write the roofline target: cache bytes per step / β. (3) Quick wins: <code>torch.compile</code> the variant to fuse element-wise parts; CUDA graphs. (4) If the variant is expressible as standard attention plus a mask or bias, use FlexAttention or FlashInfer's customisable interfaces. (5) Otherwise write a Triton decode kernel: one program per (sequence, head-group, KV split), loading K/V tiles coalescedly from the paged cache, computing scores, online softmax and partial outputs, then a merge kernel (FlashDecoding pattern); share KV loads across query heads in a group. (6) Autotune block sizes; validate against a reference for numerical error; measure MBU. (7) Only if needed, a CUTLASS/CuTe implementation for the last gains on the target GPU.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch07-qa-14">
+<summary><span class="lvl core">Core</span> Why does a tiled GEMM need L2 reuse across blocks on an H100, and how is it obtained?</summary>
+<div class="answer">
+<p>A block's traffic has intensity \(t/b\); with BF16 and practical tiles (128–256) that is 64–128 FLOPs/byte, below the HBM ridge (≈ 295). If every block fetched its tiles from HBM independently, the GEMM would be memory-bound. But many blocks need the same tiles: all blocks in a row of C share A's block row, all in a column share B's block column. Launching blocks in an order where concurrently resident blocks form a compact 2-D region (grouped rasterisation, swizzling) makes these shared tiles hit in the 50 MB L2, so each input crosses from HBM only a few times and the effective HBM intensity reaches the thousands. Persistent kernels and thread-block clusters with distributed shared memory (Hopper) or TMA multicast can share tiles even more explicitly.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch07-qa-15">
+<summary><span class="lvl deep">Deep-dive</span> What changes when writing kernels for Hopper and Blackwell compared with Ampere?</summary>
+<div class="answer">
+<p>Ampere: synchronous warp-level MMA plus asynchronous global→shared copies (cp.async); classic multi-stage pipelines. Hopper: warpgroup-level asynchronous MMA (wgmma) consuming operands directly from shared memory; TMA for bulk asynchronous tile copies with hardware swizzling and multicast across clusters; thread-block clusters with distributed shared memory. High performance needs warp specialisation (producer warps issue TMA, consumer warpgroups issue wgmma), barriers on asynchronous transactions, and ping-pong scheduling to overlap softmax with MMA (FlashAttention-3). Blackwell: tcgen05 MMA with accumulators in dedicated tensor memory, two-CTA cooperative MMAs, FP4/FP6 and block-scaled formats, even larger tiles. Bottlenecks shift to exponentials, shared-memory bandwidth and synchronisation (FlashAttention-4 emulates part of exp on FMA units). Kernels must be re-architected, not just recompiled.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-online">M. Milakov and N. Gimelshein. Online normalizer calculation for softmax. 2018. <a href="https://arxiv.org/abs/1805.02867">arXiv:1805.02867</a>.</li>
+<li id="r-triton">P. Tillet, H. T. Kung, D. Cox. Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations. <em>MAPL</em>, 2019.</li>
+<li id="r-pt2">J. Ansel et al. PyTorch 2: Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation. <em>ASPLOS</em>, 2024.</li>
+<li id="r-tk">B. F. Spector, S. Arora, A. Singhal, D. Y. Fu, C. Ré. ThunderKittens: Simple, Fast, and Adorable AI Kernels. 2024. <a href="https://arxiv.org/abs/2410.20399">arXiv:2410.20399</a>.</li>
+<li>NVIDIA. CUDA C++ Programming Guide and CUDA C++ Best Practices Guide (coalescing, shared memory, bank conflicts, CUDA Graphs).</li>
+<li>NVIDIA. CUTLASS and CuTe documentation; CuTe-DSL. <a href="https://github.com/NVIDIA/cutlass">github.com/NVIDIA/cutlass</a>.</li>
+<li>D. B. Kirk and W. W. Hwu. <em>Programming Massively Parallel Processors</em>, 4th ed., chapters on tiling, reductions and memory coalescing. 2022.</li>
+<li>M. Harris. Optimizing Parallel Reduction in CUDA. NVIDIA Developer Technology, 2007.</li>
+<li>Triton tutorials: fused softmax, layer normalisation, matrix multiplication. <a href="https://triton-lang.org">triton-lang.org</a>.</li>
+<li>T. Dao et al. FlashAttention. 2022. <a href="https://arxiv.org/abs/2205.14135">arXiv:2205.14135</a> (fusion of attention via online softmax).</li>
+<li>L. Wang et al. TileLang: A Composable Tiled Programming Model for AI Systems. 2025. <a href="https://arxiv.org/abs/2504.17577">arXiv:2504.17577</a>.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

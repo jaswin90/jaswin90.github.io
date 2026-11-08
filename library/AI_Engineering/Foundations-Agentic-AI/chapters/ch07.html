@@ -1,0 +1,587 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 7 · Reflection, Critique and Self-Correction — Foundations of Agentic AI</title>
+<meta name="description" content="Chapter 7 of Foundations of Agentic AI: generate-critique-refine, revision as a Markov chain, why intrinsic self-correction fails, external feedback, Reflexion, trained critics and judge biases, and evaluator-optimizer design.">
+<script>try{var t=localStorage.getItem('aai-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script defer src="/library/assets/book-shim.js" data-library="/library/" data-field="/library/AI_Engineering/" data-field-title="AI Engineering"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-chapter="ch07" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Part II · Reasoning and Planning — Chapter 7</div>
+<h1 id="top">Reflection, Critique and Self-Correction</h1>
+<p class="lede">People improve their work by reviewing it. It is natural to ask a language model to do the same: look at its answer, find what is wrong, and fix it. Sometimes this works remarkably well; sometimes it makes good answers worse. This chapter explains which, and why, with a simple model of revision as a Markov chain and a clear rule: self-correction is only as good as the feedback that drives it.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Chapter 6 ended with a conclusion that is easy to state and hard to live with: search is bounded by the evaluator. Where an external verifier exists (tests, a checker, a solver) agents can sample, search and select their way to high reliability. Where it does not, they must fall back on judging their own work. Many of the most valuable agent tasks have no external verifier: a research report, a customer reply, a design document, the plan for a multi-step change. If an agent cannot reliably critique its own outputs, it cannot improve them without help.</p>
+<p>The research record on self-correction is contradictory at first sight. In early 2023 a series of papers reported large gains from having models critique and refine their own outputs (Self-Refine) or reflect on failed attempts (Reflexion). Later in the same year, careful re-examinations found that, on reasoning tasks without external feedback, models asked to check their answers changed correct answers to incorrect ones about as often as the reverse, and accuracy fell. Both findings are right; they describe different regimes. This chapter builds a small mathematical model that predicts which regime a given system is in, distinguishes intrinsic from external feedback, explains how Reflexion turns failures into lessons without changing any weights, examines models used as critics and judges and their biases, and ends with design rules for building revision into agents.</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Describe the generate–critique–refine loop and its variants (Self-Refine, Self-Debug, CRITIC, Reflexion).</li>
+<li>Model iterative revision as a two-state Markov chain, derive its fixed point and convergence rate, and predict when revision helps or hurts.</li>
+<li>Explain the evidence that intrinsic self-correction often fails on reasoning tasks, and why external feedback changes the picture.</li>
+<li>Explain how Reflexion implements learning across episodes through verbal memory, and its limits.</li>
+<li>Describe trained critics and model judges, and their known biases (position, verbosity, self-preference).</li>
+<li>Design a revision loop for an agent with explicit feedback sources, gating and stopping rules, and compute its cost.</li>
+</ol>
+</div>
+<p>We build on the verification gate of §2.7, the verifier analysis of §6.2 and the calibration discussion of §3.6.</p>
+
+<h2 id="s7-1">7.1 Why self-correction is appealing</h2>
+<p>Revision is a universal strategy for doing hard things well. A mathematician checks a proof, a programmer runs the code and reads the error, a writer drafts and redrafts. Each relies on the same asymmetry that made search work in Chapter 6: it is often easier to <em>recognise</em> a flaw than to avoid making it. If a model could exploit that asymmetry on its own work, it would gain the benefits of a verifier without needing an external one, and every agent task could be followed by a cheap round of improvement.</p>
+<p>The idea is attractive for agents for a second reason. Per-step reliability (§1.8) and error detection (§2.6) are the levers that decide whether an agent can complete long tasks. A model that critiques its own step before acting raises \(r\), the detection probability, at the cost of one extra call; a model that reviews its whole trajectory after a failure and adjusts its approach for the next attempt learns, within a session, what reinforcement learning would otherwise have to teach through training. Both promise to improve an agent through prompting alone.</p>
+<p>Whether the promise holds depends on a question we can make precise. When the model reviews an answer, how often does it correctly flag a wrong answer, how often does it wrongly flag a right one, and when it revises, how often does the revision fix the problem and how often does it break something? These rates, not the eloquence of the critique, decide the outcome. Before analysing them we need the basic loop.</p>
+
+<h2 id="s7-2">7.2 Generate, critique, refine</h2>
+<p>The canonical loop was given its name by Madaan and colleagues in <strong>Self-Refine</strong> (2023)<span class="cite"><a href="#ref-selfrefine">[1]</a></span>. A single model plays three roles in sequence. It <em>generates</em> an initial output; it <em>critiques</em> the output, producing specific, actionable feedback ("the second paragraph repeats the first; the function does not handle an empty list"); and it <em>refines</em> the output using the feedback. The critique and refinement can repeat until the critique finds nothing to change or a maximum number of rounds is reached. Figure 7.1 draws the loop.</p>
+
+<figure class="diagram" id="fig-7-1">
+<svg class="dg" viewBox="0 0 720 220" role="img" aria-label="The generate, critique, refine loop">
+<defs><marker id="ah71" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="20" y="80" width="110" height="50" rx="8" class="bx2"/><text x="75" y="110" text-anchor="middle" class="t-sm">task</text>
+<rect x="170" y="80" width="120" height="50" rx="8" class="fill-acc"/><text x="230" y="102" text-anchor="middle" class="t-on t-sm">generate</text><text x="230" y="120" text-anchor="middle" class="t-on t-xs">output y₀</text>
+<rect x="340" y="30" width="140" height="50" rx="8" class="bx4"/><text x="410" y="52" text-anchor="middle" class="t-sm">critique</text><text x="410" y="70" text-anchor="middle" class="t-xs">specific feedback</text>
+<rect x="340" y="130" width="140" height="50" rx="8" class="bx3"/><text x="410" y="152" text-anchor="middle" class="t-sm">refine</text><text x="410" y="170" text-anchor="middle" class="t-xs">yₖ₊₁ from yₖ + feedback</text>
+<rect x="540" y="80" width="160" height="50" rx="8" class="bx2"/><text x="620" y="102" text-anchor="middle" class="t-sm">stop</text><text x="620" y="120" text-anchor="middle" class="t-xs">no issues, or k = max</text>
+<line x1="130" y1="105" x2="168" y2="105" class="ln" marker-end="url(#ah71)"/>
+<line x1="290" y1="95" x2="338" y2="62" class="ln" marker-end="url(#ah71)"/>
+<line x1="410" y1="80" x2="410" y2="128" class="ln" marker-end="url(#ah71)"/>
+<path d="M480,155 C520,155 520,70 482,58" class="ln dash" marker-end="url(#ah71)"/><text x="530" y="160" class="t-xs">repeat</text>
+<line x1="480" y1="55" x2="538" y2="95" class="ln" marker-end="url(#ah71)"/><text x="520" y="62" class="t-xs">done</text>
+<text x="360" y="210" text-anchor="middle" class="t-xs">one model in three roles; the critique may also come from tools, tests or another model</text>
+</svg>
+<figcaption><b>Figure 7.1 — Generate, critique, refine.</b> The output is reviewed, specific feedback is written, and the output is revised using it, repeatedly until the critique is satisfied or a round limit is hit. What the loop achieves depends almost entirely on where the critique's information comes from.</figcaption></figure>
+
+<p>Self-Refine reported improvements across seven tasks, including dialogue response quality, code readability, sentiment-reversal rewriting and mathematical reasoning, averaging around 20 percentage points of preference or accuracy over single-pass outputs with GPT-3.5 and GPT-4. Look closely at which tasks gained most, though: they were mostly tasks where quality is a matter of style or completeness (is the response engaging, is the code readable), where a critique can always find <em>something</em> to improve and the model is a competent judge of the improvement. On mathematical reasoning, the gains were small.</p>
+<p>Figure 7.1's caption names the variable that matters. The same loop appears in many systems with different sources of critique. In <strong>Self-Debug</strong> (Chen et al., 2023) the "critique" includes the output of executing the code: error messages, failing test cases, and the model's own explanation of the code line by line<span class="cite"><a href="#ref-selfdebug">[2]</a></span>. In <strong>CRITIC</strong> (Gou et al., 2023) the model critiques its output by calling tools, a search engine to check claimed facts, a code interpreter to check calculations, before revising<span class="cite"><a href="#ref-critic">[3]</a></span>. In both, the critique contains information the model did not have when it generated the first output, and in both the gains on reasoning and factual tasks were much larger than with intrinsic critique. To see why, we need a model of what revision does.</p>
+
+<h2 id="s7-3">7.3 Revision as a Markov chain</h2>
+<p>Consider a task with a correct/incorrect outcome, and an answer revised over rounds \(k=0,1,2,\dots\). Track only whether the current answer is correct. At each round, a correct answer stays correct unless the loop breaks it, which happens with probability \(\nu\) (the critique wrongly flags it and the revision makes it wrong). An incorrect answer becomes correct with probability \(\mu\) (the critique flags it and the revision fixes it). This is a two-state Markov chain, drawn in Figure 7.2, and its behaviour can be solved exactly.</p>
+
+<figure class="diagram" id="fig-7-2">
+<svg class="dg" viewBox="0 0 720 200" role="img" aria-label="Two-state Markov chain of answer correctness under revision">
+<defs><marker id="ah72" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker>
+<marker id="ah72a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead-acc"/></marker></defs>
+<circle cx="220" cy="100" r="56" class="bx3"/><text x="220" y="96" text-anchor="middle" class="t-b">correct</text><text x="220" y="116" text-anchor="middle" class="t-xs">probability aₖ</text>
+<circle cx="500" cy="100" r="56" class="bx4"/><text x="500" y="96" text-anchor="middle" class="t-b">incorrect</text><text x="500" y="116" text-anchor="middle" class="t-xs">1 − aₖ</text>
+<path d="M270,72 C330,30 390,30 450,72" class="ln" marker-end="url(#ah72)"/><text x="360" y="34" text-anchor="middle" class="t-sm">ν: break a good answer</text>
+<path d="M450,128 C390,170 330,170 270,128" class="ln-acc" marker-end="url(#ah72a)"/><text x="360" y="180" text-anchor="middle" class="t-sm t-acc">μ: fix a bad answer</text>
+<text x="110" y="104" text-anchor="end" class="t-xs">stay: 1 − ν</text>
+<text x="610" y="104" class="t-xs">stay: 1 − μ</text>
+</svg>
+<figcaption><b>Figure 7.2 — Revision as a Markov chain.</b> Each round fixes an incorrect answer with probability \(\mu\) and breaks a correct one with probability \(\nu\). Accuracy converges to \(\mu/(\mu+\nu)\), whatever it started at.</figcaption></figure>
+
+<p>Let \(a_k\) be the probability that the answer after \(k\) rounds is correct. The chain gives \(a_{k+1}=a_k(1-\nu)+(1-a_k)\mu\), a linear recurrence whose solution is</p>
+<div class="box formula">
+\[ a_k=a^*+(a_0-a^*)(1-\mu-\nu)^k,\qquad a^*=\frac{\mu}{\mu+\nu}. \]
+</div>
+<p>Three consequences follow, and together they explain the contradictory literature. First, <strong>the loop converges to \(a^*=\mu/(\mu+\nu)\), regardless of where it starts</strong>. Revision does not add accuracy to the initial answer; it replaces the initial accuracy with the loop's own fixed point. Second, <strong>revision helps if and only if \(a_0&lt;a^*\)</strong>, that is, if the initial answer is less accurate than the loop's equilibrium. A model that is already right 90% of the time, revising with \(\mu=0.1\) and \(\nu=0.05\), converges to \(0.1/0.15=0.67\) and gets worse with every round. Third, the convergence rate is \(1-\mu-\nu\): if both rates are small, the loop changes little per round, and most of the benefit (or harm) comes in the first few rounds.</p>
+<p>The fixed point has a revealing form. A loop that rarely breaks good answers (\(\nu\) small) can have a high \(a^*\) even if it fixes only a small fraction of bad ones. A loop whose critic flags correct answers as often as wrong ones, and whose revisions are as likely to introduce errors as remove them, has \(\mu\approx \nu\) and \(a^*\approx\tfrac12\), dragging any good model towards a coin toss. Figure 7.3 plots the three regimes.</p>
+
+<figure class="chart" id="fig-7-3">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Accuracy over revision rounds for three feedback regimes","height":340,
+ "x":{"label":"Revision round k","min":0,"max":5,"ticks":[0,1,2,3,4,5]},
+ "y":{"label":"Probability the answer is correct","min":0.4,"max":1,"fmt":"pct"},
+ "series":[
+  {"name":"external feedback: μ = 0.3, ν = 0.02 (a* = 0.94)","color":"s1","points":[[0,0.6],[1,0.708],[2,0.7814],[3,0.8314],[4,0.8653],[5,0.8884]]},
+  {"name":"good critic: μ = 0.1, ν = 0.02 (a* = 0.83)","color":"s3","points":[[0,0.75],[1,0.76],[2,0.7688],[3,0.7765],[4,0.7834],[5,0.7894]]},
+  {"name":"intrinsic, weak detection: μ = ν = 0.05 (a* = 0.5)","color":"s2","points":[[0,0.75],[1,0.725],[2,0.7025],[3,0.6822],[4,0.664],[5,0.6476]]}
+ ]}
+</script>
+<figcaption><b>Figure 7.3 — Revision converges to its own fixed point.</b> With informative external feedback, a 60% initial answer climbs towards 94%. With a decent critic, a 75% answer improves slowly. With a critic that cannot tell right from wrong, a 75% answer degrades towards 50% with every round.</figcaption></figure>
+
+<p>Figure 7.3 is the chapter's central picture. The blue curve is the regime of Self-Debug and CRITIC: feedback from execution or tools makes \(\mu\) large (failing tests point to the bug) and \(\nu\) tiny (code that passes is rarely touched), so revision climbs fast towards a high ceiling. The orange curve is the regime of intrinsic self-correction on reasoning: the model has no new information, its critique of a correct answer is about as likely to find a spurious flaw as its critique of a wrong one is to find the real flaw, and every round erodes accuracy. The green curve is what a well-trained critic can do without external tools: modest, steady gains.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — measuring \(\mu\) and \(\nu\) for a revision loop</div>
+<p>A team runs a "review your answer and fix any mistakes" step after a research agent writes each factual claim. On 1,000 labelled claims, 800 were correct initially. After one round of revision, 760 of the 800 correct claims remained correct and 40 became incorrect; of the 200 incorrect claims, 30 were fixed.</p>
+<p><b>Rates.</b> \(\nu=40/800=0.05\), \(\mu=30/200=0.15\). Fixed point \(a^*=0.15/0.20=0.75\).</p>
+<p><b>Prediction.</b> \(a_0=0.80>a^*\): the loop should hurt. After one round, \(a_1=0.8\times0.95+0.2\times0.15=0.76+0.03=0.79\), matching the observed 790 of 1,000. After three rounds: \(0.75+0.05\times0.8^3=0.776\).</p>
+<p><b>Fix.</b> Give the reviser a search tool and require it to change a claim only if a retrieved source contradicts it. On a new sample this lowers \(\nu\) to 0.01 and raises \(\mu\) to 0.40: \(a^*=0.40/0.41=0.976\), and one round gives \(0.8\times0.99+0.2\times0.40=0.872\).</p>
+</div>
+
+<p>The worked example shows the practical use of the model: two numbers measured on a labelled sample predict whether a revision loop will help, how many rounds are worthwhile, and what to change. It also shows the most common pattern in practice: intrinsic review of a mostly correct output has a small \(\mu\) and a non-negligible \(\nu\), so it hurts, while adding external evidence moves both rates in the right direction.</p>
+
+<h2 id="s7-4">7.4 When intrinsic self-correction fails</h2>
+<p>In October 2023 Huang and colleagues at Google DeepMind published a paper with a deliberately blunt title, "Large Language Models Cannot Self-Correct Reasoning Yet"<span class="cite"><a href="#ref-huang">[4]</a></span>. They studied <strong>intrinsic self-correction</strong>: the model is asked to review and, if needed, revise its own answer, with no external feedback of any kind. On reasoning benchmarks such as GSM8K (mathematics), CommonSenseQA and HotpotQA, accuracy after self-correction was consistently <em>lower</em> than before, for GPT-3.5 and GPT-4 alike, and on CommonSenseQA the drop was large. Inspecting the changes, they found that the models often switched correct answers to incorrect ones, and that their critiques of correct answers invented problems that were not there.</p>
+<p>The paper also explained why earlier work had found the opposite. Several influential results had used the ground-truth label to decide when to stop: the loop ran until the answer was correct, and then stopped. That is not self-correction but correction by an oracle, and it guarantees improvement by construction, because a correct answer is never revised. In the chain model, an oracle stop sets \(\nu=0\), so \(a^*=1\). Without it, \(\nu\) is whatever the model's critique produces on correct answers, and for reasoning tasks it is far from zero. A survey by Kamoi and colleagues (2024) reached the same conclusion after reviewing the field: self-correction works when reliable external feedback is available, or on tasks for which the model has been specifically trained to critique, and generally not otherwise<span class="cite"><a href="#ref-kamoi">[5]</a></span>.</p>
+<p>The deeper reason connects to the generator–verifier gap of §6.7. For a model to fix its own mistake, it must recognise the mistake, and the knowledge it uses to recognise mistakes is the same knowledge it used to make the answer. If the model made a reasoning error because it lacked or misapplied some knowledge, it will usually lack or misapply the same knowledge when it reviews. There is a gap between generating and verifying only for problems where checking is genuinely easier than solving, such as when a calculation can be redone in a different way or a constraint can be checked directly, and for those problems intrinsic review does help a little. We can make the dependence on the critic's detection rates explicit. Write the one-round outcome as a function of the critic's true-positive rate (the fraction of wrong answers it flags) and false-positive rate (the fraction of right answers it flags), with revision fixing 60% of flagged wrong answers and breaking 50% of flagged right ones, starting from 75% accuracy:</p>
+\[ a_1=a_0\,(1-0.5\cdot\mathrm{FPR})+(1-a_0)\cdot0.6\cdot\mathrm{TPR}=0.75-0.375\,\mathrm{FPR}+0.15\,\mathrm{TPR}. \]
+
+<figure class="chart" id="fig-7-4">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Accuracy after one round of review, starting at 75%","height":330,
+ "x":{"label":"Critic's true-positive rate (fraction of wrong answers flagged)","min":0,"max":1,"fmt":"pct","ticks":[0,0.25,0.5,0.75,1]},
+ "y":{"label":"Accuracy after one round","min":0.6,"max":0.95,"fmt":"pct"},
+ "hlines":[{"y":0.75,"text":"no review"}],
+ "series":[
+  {"name":"critic false-positive rate 0","color":"s1","points":[[0,0.75],[0.25,0.7875],[0.5,0.825],[0.75,0.8625],[1,0.9]]},
+  {"name":"false-positive rate 0.1","color":"s3","points":[[0,0.7125],[0.25,0.75],[0.5,0.7875],[0.75,0.825],[1,0.8625]]},
+  {"name":"false-positive rate 0.3","color":"s2","points":[[0,0.6375],[0.25,0.675],[0.5,0.7125],[0.75,0.75],[1,0.7875]]}
+ ]}
+</script>
+<figcaption><b>Figure 7.4 — A critic must flag far more wrong answers than right ones.</b> Starting from 75% accuracy, review helps only when the critic's true-positive rate exceeds 2.5 times its false-positive rate. A critic that flags 30% of correct answers needs to catch three-quarters of wrong ones merely to break even.</figcaption></figure>
+
+<p>Figure 7.4 shows the arithmetic behind the negative results. When the initial answer is usually right, wrong answers are a minority and right answers a majority, so every false flag on a right answer is multiplied by a large base, and every true flag on a wrong answer by a small one. The break-even condition here is \(\mathrm{TPR}>2.5\,\mathrm{FPR}\); in general it is \(\mathrm{TPR}/\mathrm{FPR}>a_0 b/\big((1-a_0)c\big)\), where \(b\) is the break probability and \(c\) the fix probability of a revision, a threshold that rises steeply with initial accuracy. The better the model is to begin with, the better its critic must be. This is the precise sense in which self-correction is hardest for the strongest models on the tasks they mostly get right, and it is why "review your work" prompts appended to capable agents so often make no difference or do harm.</p>
+
+<details class="drill">
+<summary>Drill 7.1 — break-even for a critic</summary>
+<p>A coding agent's patches are correct 85% of the time. A critic model flags patches for revision; a revision fixes a wrong patch with probability 0.5 and breaks a correct one with probability 0.4. (a) What ratio TPR/FPR must the critic exceed for review to help? (b) If the critic's FPR is 0.1, what TPR is needed?</p>
+<p>(a) \(a_0b/((1-a_0)c)=0.85\times0.4/(0.15\times0.5)=0.34/0.075=4.53\). (b) TPR \(>0.453\). The critic must catch almost half of the wrong patches while flagging no more than one correct patch in ten. If instead the "critic" is the test suite, with FPR near zero, any positive TPR helps.</p>
+</details>
+
+<h2 id="s7-5">7.5 External feedback</h2>
+<p>If the trouble with intrinsic correction is that the model has no new information, the remedy is to give it some. Feedback is <strong>external</strong> when it comes from a source whose errors are independent of the model's: an interpreter, a compiler, a test suite, a search engine, a database, a solver, a human. External feedback changes both rates of the chain at once. It raises \(\mu\), because the feedback points to the specific flaw (a failing test names the input; a search result contradicts the claim), and it lowers \(\nu\), because a correct output that passes the check is left alone.</p>
+<p>The evidence matches. Self-Debug improved code generation substantially on several benchmarks by feeding execution results back to the model; its "rubber duck" variant, in which the model explains its code line by line without any execution, also helped, but less, which is consistent with explanation as a partial verifier. CRITIC let models verify their outputs with tools (search for factual claims, a Python interpreter for arithmetic, a toxicity classifier for detoxification) and showed consistent gains over intrinsic critique, which on some tasks hurt. Its ablations make the point cleanly: removing the tool calls and keeping the critique prompt removed most of the gain.</p>
+<p>For agents, this is good news, because agents are built around tools. Almost every agent task has <em>some</em> external check available: the coding agent can run tests and linters; the support agent can read back the booking and check the policy tool's verdict; the research agent can check that a quoted sentence appears in the cited page and that a URL resolves. The design principle is to turn as much of the critique as possible into checks of this kind, and to reserve the model's own judgement for what genuinely cannot be checked. In the chain model, every check that is cheap and reliable is a way of buying a large \(\mu\) and a small \(\nu\).</p>
+
+<div class="box example">
+<div class="box-title">Worked example — a citation check for the research agent</div>
+<p>The research agent writes reports with 30 cited claims each. Measured on a labelled sample, 12% of citations are wrong (the page does not support the claim). An intrinsic "check your citations" pass has \(\mu=0.2\), \(\nu=0.04\) per claim.</p>
+<p><b>Intrinsic.</b> \(a^*=0.2/0.24=0.83&lt;0.88=a_0\): the pass makes things slightly worse.</p>
+<p><b>External.</b> A tool fetches each cited page and returns the passages most similar to the claim; the agent must quote a supporting passage or drop or fix the claim. Measured \(\mu=0.7\), \(\nu=0.01\): \(a^*=0.986\), one round gives \(0.88\times0.99+0.12\times0.7=0.871+0.084=0.955\).</p>
+<p><b>Cost.</b> Thirty page fetches and a short check per claim: perhaps 30 calls of 3,000 cached tokens and 100 output tokens, about \(30\times(\$0.0009+\$0.0015)=\$0.072\) per report, to cut wrong citations from 3.6 per report to about 1.4.</p>
+</div>
+
+<h3 id="cove">Making intrinsic checks more independent</h3>
+<p>Between purely intrinsic review and genuinely external feedback lies a useful middle ground: checks performed by the same model but structured so that their errors are less correlated with the errors of the original answer. The principle is that a check is informative to the extent that it can fail independently of the thing it checks. Re-reading one's own answer is a poor check, because the same misconception that produced an error makes the error look right. Re-deriving the answer by a <em>different route</em> (solving an equation backwards, recomputing a total by a different grouping, answering a sub-question without seeing the draft) is a better one, because a different route is less likely to repeat the same mistake.</p>
+<p><strong>Chain-of-Verification</strong> (CoVe; Dhuliawala et al., 2023) applies this to factual hallucination<span class="cite"><a href="#ref-cove">[6]</a></span>. The model drafts an answer; plans a set of verification questions about the facts in the draft ("Was person X born in city Y?"); answers each verification question <em>independently</em>, in a fresh context that does not contain the draft; and finally revises the draft in light of the answers. The crucial step is the independence: when the verification questions were answered with the draft visible, the model tended to repeat the draft's errors, and when they were answered without it, many errors surfaced. On list-generation and closed-book question-answering tasks, CoVe substantially reduced the number of hallucinated items. In the chain model, independence lowers the correlation between the critic's judgement and the original error, which raises the critic's true-positive rate without raising its false-positive rate.</p>
+<p>The same idea gives cheap checks for agents. A coding agent can be asked, in a fresh context, "what should this function return for these inputs?" and the answers compared with the code's behaviour. A support agent can compute the fare difference twice, once by the model and once by the tool, and escalate on disagreement. A research agent can answer each factual sub-question in a context without its draft. None of these is as good as a deterministic check, but each is markedly better than "review your answer", and they fill the gap where no tool exists.</p>
+
+<h2 id="s7-6">7.6 Reflexion: learning from failure across attempts</h2>
+<p>Self-Refine revises an output within one attempt. A different form of reflection operates <em>across</em> attempts: after an episode fails, the agent writes a lesson, and the next attempt starts with that lesson in its context. Shinn and colleagues called this <strong>Reflexion</strong> (2023), describing it as "verbal reinforcement learning"<span class="cite"><a href="#ref-reflexion">[7]</a></span>. Figure 7.5 shows its three components: an <em>actor</em> that attempts the task, an <em>evaluator</em> that judges the outcome (unit tests, an environment's success signal, a heuristic such as "the agent repeated the same action three times"), and a <em>self-reflection</em> model that, given a failed trajectory and the evaluator's signal, writes a short diagnosis and plan ("I assumed the list was sorted; the test with an unsorted list failed; next time sort first"). Reflections accumulate in an episodic memory that is placed in the actor's context on later attempts.</p>
+
+<figure class="diagram" id="fig-7-5">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-label="Reflexion: actor, evaluator, self-reflection and episodic memory across attempts">
+<defs><marker id="ah75" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker>
+<marker id="ah75a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead-acc"/></marker></defs>
+<rect x="30" y="60" width="140" height="56" rx="8" class="fill-acc"/><text x="100" y="84" text-anchor="middle" class="t-on t-b">actor</text><text x="100" y="102" text-anchor="middle" class="t-on t-xs">attempt k</text>
+<rect x="230" y="60" width="140" height="56" rx="8" class="bx4"/><text x="300" y="84" text-anchor="middle" class="t-b">evaluator</text><text x="300" y="102" text-anchor="middle" class="t-xs">tests · env signal</text>
+<rect x="430" y="60" width="140" height="56" rx="8" class="bx2"/><text x="500" y="84" text-anchor="middle" class="t-b">self-reflection</text><text x="500" y="102" text-anchor="middle" class="t-xs">diagnose, plan</text>
+<rect x="430" y="160" width="250" height="50" rx="8" class="bx5"/><text x="555" y="182" text-anchor="middle" class="t-sm">episodic memory of reflections</text><text x="555" y="200" text-anchor="middle" class="t-xs">"sort before searching" · "check empty input"</text>
+<rect x="610" y="60" width="90" height="56" rx="8" class="bx3"/><text x="655" y="92" text-anchor="middle" class="t-sm">success</text>
+<line x1="170" y1="88" x2="228" y2="88" class="ln" marker-end="url(#ah75)"/><text x="199" y="80" text-anchor="middle" class="t-xs">trajectory</text>
+<line x1="370" y1="88" x2="428" y2="88" class="ln" marker-end="url(#ah75)"/><text x="399" y="80" text-anchor="middle" class="t-xs">failed</text>
+<path d="M300,60 C300,20 655,20 655,58" class="ln" marker-end="url(#ah75)"/><text x="480" y="22" text-anchor="middle" class="t-xs">passed</text>
+<line x1="500" y1="116" x2="500" y2="158" class="ln" marker-end="url(#ah75)"/>
+<path d="M430,185 C200,185 100,170 100,118" class="ln-acc" marker-end="url(#ah75a)"/><text x="270" y="204" text-anchor="middle" class="t-xs t-acc">in context for attempt k + 1</text>
+</svg>
+<figcaption><b>Figure 7.5 — Reflexion.</b> After a failed attempt, a reflection model writes a short diagnosis and plan, which is stored and placed in the actor's context next time. The policy changes through its context rather than its weights.</figcaption></figure>
+
+<p>Figure 7.5 is a learning system in which the "parameters" being updated are sentences in a memory. Reflexion reported strong results: on HumanEval, 91% pass@1 for GPT-4 with Reflexion against 80% without; on the ALFWorld household-task environment, 130 of 134 tasks solved, against far fewer for a ReAct baseline; and gains on HotpotQA. The mechanism is the one Figure 7.3 predicts: the evaluator is external (unit tests the agent writes and runs, or the environment's success signal), so the reflections are grounded in observed failure, and a lesson like "the function must handle duplicates" is specific information the model did not have before the failed attempt.</p>
+<p>Reflexion's limits are equally instructive. It needs a reasonably reliable evaluator to know that an attempt failed; with only the model's own judgement it inherits the problems of §7.4. It needs the task to be <em>repeatable</em>, since the lesson helps only the next attempt at the same or a similar task, so it suits benchmark-style retries, coding with tests and simulated environments, not a live customer conversation that cannot be rerun. Its lessons can be wrong (a reflection that misdiagnoses the failure misleads every later attempt) and they accumulate, occupying context. And the HumanEval result used the agent's own generated tests to decide success; with hidden tests used only for final scoring, a fair comparison must count every attempt's cost. In the language of Chapter 6, Reflexion is best-of-\(n\) in which each new sample is conditioned on the failures of the previous ones, which makes the samples more diverse and better aimed, and its success depends on the same verifier quality.</p>
+<p>The idea of keeping lessons in memory extends beyond retries of one task. A coding agent that records "this repository's tests must be run with <code>pytest -p no:cacheprovider</code>" or a support agent that records "customers on fare class Q cannot change online" benefits on every future task in that setting. Such accumulated lessons are a form of <em>procedural memory</em>, and Chapter 13 treats them as part of an agent's memory architecture, including the question of how to stop wrong lessons from accumulating.</p>
+
+<details class="drill">
+<summary>Drill 7.2 — Reflexion as conditioned retries</summary>
+<p>An agent solves a task on 40% of first attempts. Each failure produces a reflection that raises the next attempt's success probability by 15 percentage points (40% → 55% → 70% …, capped at 85%). Success is checked by reliable tests. (a) What is the probability of success within three attempts? (b) Compare with three independent attempts at 40%.</p>
+<p>(a) \(1-(0.60)(0.45)(0.30)=1-0.081=0.919\). (b) Independent: \(1-0.6^3=0.784\). Conditioning on reflections is worth 13.5 points here, if the reflections are right. With wrong reflections, the conditioned attempts can be worse than independent ones.</p>
+</details>
+
+<h2 id="s7-7">7.7 Critics and judges</h2>
+<p>When no external check exists, the next best thing is a critic that is better than the generator at finding flaws. Two developments made such critics practical. The first is <strong>trained critics</strong>. OpenAI's CriticGPT (McAleese et al., 2024) was trained with RLHF to write critiques of code, and found substantially more inserted and naturally occurring bugs than human contractors working alone; human reviewers assisted by its critiques caught more bugs than either alone, though the critic also produced some false alarms ("nitpicks" and hallucinated bugs) that had to be managed<span class="cite"><a href="#ref-criticgpt">[8]</a></span>. A critic trained specifically to find flaws, with rewards for finding real ones and penalties for inventing them, can have a much better TPR/FPR ratio than the generator prompted to review itself. The second is <strong>reasoning critics</strong>: reasoning models asked to verify a solution step by step, which turn verification into the kind of multi-step computation that §5.1 showed benefits from writing.</p>
+<p>The most common critic in practice is the <strong>LLM judge</strong>: a model, often a strong one, asked to score an output or compare two outputs against a rubric. Judges made evaluation of open-ended tasks affordable, and Chapter 19 studies them as evaluation instruments. Here we need their biases, because a judge used inside a revision loop or a best-of-\(n\) selector will push outputs in the direction of its biases. Zheng and colleagues (2023), introducing MT-Bench and the "LLM-as-a-judge" methodology, documented three<span class="cite"><a href="#ref-judge">[9]</a></span>. <em>Position bias</em>: when comparing two answers, judges favour one position (often the first) independent of content. <em>Verbosity bias</em>: judges tend to prefer longer answers, even when the extra length adds nothing. <em>Self-enhancement bias</em>: judges may favour outputs written by themselves or by models like them. Later work added others, such as sensitivity to confident tone and to the presence of citations whether or not they support the claims.</p>
+<p>Each bias becomes a failure mode of any system that optimises against the judge. A revision loop guided by a verbosity-biased judge makes outputs longer each round. A best-of-\(n\) selector with position bias selects partly at random. A loop where the judge and the generator are the same model rewards the generator's own style. The standard mitigations are simple and should be routine: evaluate both orderings and average; use rubrics with specific, checkable criteria rather than overall impressions; control length explicitly; use a judge from a different model family where possible; and, above all, calibrate the judge against human labels on the task before trusting it, measuring its TPR and FPR exactly as for any other verifier.</p>
+
+<h3 id="oversight">Critiques for human reviewers</h3>
+<p>Critics have a second use that matters as much as automatic revision: helping <em>people</em> check agent work. As agents take on longer tasks, the bottleneck in deploying them safely becomes human review: a forty-file pull request or a sixty-page report cannot be checked line by line by a busy engineer. Saunders and colleagues (2022) showed that model-written critiques of summaries helped human evaluators find substantially more flaws than they found unaided, including flaws the humans agreed were important but had missed<span class="cite"><a href="#ref-saunders">[10]</a></span>, and CriticGPT reproduced the effect for code. This is the simplest instance of what alignment researchers call <strong>scalable oversight</strong>: using AI assistance so that human judgement can keep pace with AI output.</p>
+<p>For an agent designer, the practical form is a review report attached to every substantial agent output: a list of the specific places a critic thinks deserve human attention, ordered by its estimated risk, with the evidence for each. The human's time is then spent where the critic points, rather than uniformly. The quality measures are the critic's precision (what fraction of its flags are real problems, which determines whether reviewers keep trusting it) and its recall on serious problems (which determines what slips through). Both must be measured against careful human review on a sample. Chapter 15 returns to oversight in its more ambitious form, debate, in which two models argue and a human judges, and Chapter 20 to the role of human review in agent safety.</p>
+
+<h2 id="s7-8">7.8 Building revision into agents</h2>
+<p>We can now assemble the chapter into design rules for an agent, and they are best seen in the structure that Anthropic's guide calls the <strong>evaluator–optimizer</strong> pattern<span class="cite"><a href="#ref-bea">[11]</a></span>: one component produces, another evaluates and gives feedback, and the loop continues until the evaluator is satisfied or a budget is spent. Figure 7.6 shows the pattern as it should be built in an agent, with the feedback sources ordered by reliability.</p>
+
+<figure class="diagram" id="fig-7-6">
+<svg class="dg" viewBox="0 0 720 284" role="img" aria-label="An evaluator–optimizer loop with tiered feedback sources">
+<defs><marker id="ah76" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="20" y="96" width="130" height="56" rx="8" class="fill-acc"/><text x="85" y="120" text-anchor="middle" class="t-on t-b">producer</text><text x="85" y="138" text-anchor="middle" class="t-on t-xs">agent output</text>
+<rect x="200" y="20" width="230" height="44" rx="8" class="bx3"/><text x="315" y="40" text-anchor="middle" class="t-sm">1 deterministic checks</text><text x="315" y="56" text-anchor="middle" class="t-xs">tests, schema, policy tool, read-back</text>
+<rect x="200" y="78" width="230" height="44" rx="8" class="bx2"/><text x="315" y="98" text-anchor="middle" class="t-sm">2 tool-grounded critique</text><text x="315" y="114" text-anchor="middle" class="t-xs">search, execution, quote matching</text>
+<rect x="200" y="136" width="230" height="44" rx="8" class="bx4"/><text x="315" y="156" text-anchor="middle" class="t-sm">3 trained critic / judge</text><text x="315" y="172" text-anchor="middle" class="t-xs">calibrated rubric, other model family</text>
+<rect x="200" y="194" width="230" height="44" rx="8" class="bx5"/><text x="315" y="214" text-anchor="middle" class="t-sm">4 human review</text><text x="315" y="230" text-anchor="middle" class="t-xs">for high-stakes or unresolved cases</text>
+<line x1="150" y1="124" x2="198" y2="42" class="ln" marker-end="url(#ah76)"/>
+<rect x="490" y="96" width="210" height="56" rx="8" class="bx3"/><text x="595" y="118" text-anchor="middle" class="t-sm">accept · revise · escalate</text><text x="595" y="136" text-anchor="middle" class="t-xs">revise only on specific flags; max k rounds</text>
+<line x1="430" y1="42" x2="488" y2="110" class="ln" marker-end="url(#ah76)"/><line x1="430" y1="100" x2="488" y2="118" class="ln" marker-end="url(#ah76)"/><line x1="430" y1="158" x2="488" y2="128" class="ln" marker-end="url(#ah76)"/><line x1="430" y1="216" x2="488" y2="138" class="ln" marker-end="url(#ah76)"/>
+<path d="M595,152 C595,276 85,276 85,154" class="ln dash" marker-end="url(#ah76)"/><text x="470" y="278" text-anchor="middle" class="t-xs">feedback to producer</text>
+</svg>
+<figcaption><b>Figure 7.6 — Evaluator–optimizer with tiered feedback.</b> Checks are applied from most to least reliable: deterministic checks first, then tool-grounded critique, then a calibrated model critic, then a human. Revision happens only on specific flags, for a bounded number of rounds.</figcaption></figure>
+
+<p>Figure 7.6 encodes five rules. <em>Prefer external feedback</em>: every check that can be made deterministic or tool-grounded should be, because it buys a high \(\mu\) and a low \(\nu\). <em>Revise only on specific flags</em>: a critique that says "this could be clearer" invites change for its own sake and raises \(\nu\); a critique that says "test <code>test_empty_input</code> fails with <code>IndexError</code>" or "the cited page does not mention the 2019 figure" is actionable and leaves correct parts alone. <em>Protect what passes</em>: outputs, or parts of outputs, that pass reliable checks should not be revised, which is the oracle-stop of §7.4 made legitimate by a real check. <em>Bound the loop</em>: since gains concentrate in the first rounds and each round costs a call, set a small maximum, typically one to three, and escalate unresolved cases. <em>Measure the rates</em>: estimate \(\mu\) and \(\nu\) on a labelled sample (as in the worked example of §7.3) before deploying a revision step, and re-measure when the model or prompts change.</p>
+
+<h3 id="trained-correction">Self-correction that is trained, not prompted</h3>
+<p>The negative results of §7.4 concern models <em>prompted</em> to correct themselves. Models can also be <em>trained</em> to do it, and then the picture changes. The reasoning models of §5.6 learned, through reinforcement learning on verifiable rewards, to re-check steps and revise within a chain of thought, because revisions that fixed errors were rewarded and revisions that broke correct work were not; in the chain model, training directly pushes \(\mu\) up and \(\nu\) down. Kumar and colleagues at Google DeepMind (2024) made this explicit with SCoRe, a multi-turn RL method that trains a model to produce a first attempt and then a revised one, rewarding improvement from the first to the second<span class="cite"><a href="#ref-score">[12]</a></span>. They found that naive supervised training on correction examples tended to produce models that either made no changes or made the same edits regardless of correctness, and that RL with a reward shaped to favour genuine improvement raised self-correction gains substantially, by 15.6 points on the MATH benchmark and 9.1 on HumanEval for the models they studied. The lesson for engineers is that self-correction is a capability that varies by model and by task, should be measured as \(\mu\) and \(\nu\) on one's own data, and is likely to keep improving as developers train for it, so that a revision step that hurt last year's model may help this year's. The measurement, not the prompt, decides.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — is a review step worth its cost?</div>
+<p>A support agent drafts replies that violate policy 6% of the time. Option A: an intrinsic "review your reply against the policy" pass, measured at \(\mu=0.3\), \(\nu=0.02\). Option B: a policy tool that checks the specific action proposed (refund amount, fee waiver) deterministically, plus the intrinsic pass only for wording, measured at \(\mu=0.8\), \(\nu=0.005\) on policy violations.</p>
+<p><b>Violation rate after one round.</b> A: \(0.06(1-0.3)+0.94\times0.02=0.042+0.0188=0.061\). No better than without review: the pass breaks almost as many good replies as it fixes bad ones. B: \(0.06\times0.2+0.94\times0.005=0.012+0.0047=0.0167\).</p>
+<p><b>Cost per reply.</b> A: one extra call on a 10k-token cached context with 200 output tokens, about \(\$0.003+\$0.003=\$0.006\). B: a tool call (negligible) plus the same review call, about $0.006. Same cost, very different value.</p>
+<p><b>If a violation costs $20</b> (an improper refund or a complaint), B saves \((0.06-0.0167)\times\$20=\$0.87\) per reply; A saves nothing.</p>
+</div>
+
+<details class="drill">
+<summary>Drill 7.3 — how many rounds?</summary>
+<p>A revision loop with external feedback has \(\mu=0.4\), \(\nu=0.01\), and starts at \(a_0=0.7\). Each round costs $0.01 and each remaining error costs $1. How many rounds minimise expected cost?</p>
+<p>\(a^*=0.4/0.41=0.976\); \(a_k=0.976-0.276\times0.59^k\). Error rates: \(k=0\): 0.300; 1: 0.187; 2: 0.120; 3: 0.081; 4: 0.058; 5: 0.045. Each round's saving: 0.113, 0.067, 0.039, 0.023, 0.013 dollars, all above the $0.01 cost, and the sixth round saves $0.008, below it. Five rounds; in practice two or three capture most of the gain, and the per-round cost is often higher than this.</p>
+</details>
+
+<details class="drill">
+<summary>Drill 7.4 — the value of independence</summary>
+<p>A model's draft lists 10 facts, of which 2 are wrong. Verification questions answered <em>with</em> the draft in context agree with the draft 95% of the time when the fact is wrong and 99% when right. Answered <em>without</em> the draft, they agree 40% of the time when wrong and 95% when right. A fact is revised whenever the verification disagrees. Compare the expected number of wrong facts after revision, assuming revision of a flagged wrong fact fixes it with probability 0.8 and revision of a flagged right fact breaks it with probability 0.5.</p>
+<p>With draft: flagged wrong \(2\times0.05=0.1\), fixed 0.08; flagged right \(8\times0.01=0.08\), broken 0.04. Wrong after: \(2-0.08+0.04=1.96\). Without draft: flagged wrong \(2\times0.6=1.2\), fixed 0.96; flagged right \(8\times0.05=0.4\), broken 0.2. Wrong after: \(2-0.96+0.2=1.24\). Independence turns a useless check into one that removes over a third of the errors.</p>
+</details>
+
+<h2 id="s7-9">7.9 Self-generated tests and self-verification</h2>
+<p>External feedback (§7.5) is the most reliable signal for revision, but many tasks arrive without it: a coding request with no test suite, a data transformation with no expected output. A natural move is to have the model generate the missing checks itself, writing tests before or alongside the solution and then using them as the verifier. The idea sounds circular, and partly it is, but it works better than intrinsic self-critique for a precise reason: executing a test is not the model's opinion. Once written, a test is checked by the interpreter, so the model's judgement enters only through which tests it writes, not through whether they pass.</p>
+<p>CodeT (Chen and colleagues at Microsoft, 2022) turned this into a selection method<span class="cite"><a href="#ref-codet">[13]</a></span>. Sample many candidate programs and many candidate tests from the same model, run every program against every test, and score each program by <em>dual agreement</em>: how many tests it passes, weighted by how many other programs pass the same set of tests. Correct programs tend to agree with each other and with correct tests; wrong programs fail in scattered, idiosyncratic ways. On HumanEval, selecting by dual agreement raised the pass@1 of a code model from 47.0% to 65.8%, without any reference tests. The same principle appears in agents that write a reproduction test before fixing a bug (§10.5): the test turns a vague issue into an executable target.</p>
+<p>The weakness is correlation. Tests and solutions come from the same model, so they can share a misconception: if the model misreads the specification, it writes a wrong solution and a test that confirms it. In the language of §6.2, self-generated tests have a false-positive rate that is not independent of the generator's error. A simple model makes the point. Suppose a solution is wrong with probability \(1-p\), and a self-generated test catches a wrong solution with probability \(r\) when the error is idiosyncratic but only \(r'\ll r\) when it comes from a misreading the test shares. If a fraction \(\phi\) of errors are misreadings, the probability that a wrong solution survives one test is \(1-[(1-\phi)r+\phi r']\), and no number of additional tests from the same model removes the \(\phi\) component. Diversity is the remedy: tests written from the specification before the solution is seen, tests from a different model or a differently prompted one, property-based tests that check invariants rather than specific outputs, and, where they exist, a few tests written by people.</p>
+<div class="box example">
+<div class="box-title">Worked example — how much do self-written tests catch?</div>
+<p>A coding agent's first solutions are wrong 40% of the time. Of those errors, 70% are idiosyncratic slips, which each self-written test catches with probability 0.5, and 30% are misreadings of the specification, which a self-written test catches with probability 0.05.</p>
+<p><b>One test.</b> A wrong solution is caught with probability \(0.7\times0.5+0.3\times0.05=0.365\).</p>
+<p><b>Five independent-looking tests.</b> Slips survive with \(0.5^5=0.031\), misreadings with \(0.95^5=0.774\). A wrong solution survives with probability \(0.7\times0.031+0.3\times0.774=0.254\), so 10.2% of all solutions are wrong but pass, against 40% before.</p>
+<p><b>The floor.</b> Misreadings are \(0.4\times0.3=12\%\) of all solutions, and five tests still let 77% of them through (9.3% of all solutions), while slips now contribute only 0.9%. More tests from the same model barely move the first term; tests derived from the specification by a separate call attack it directly.</p>
+</div>
+<p>Self-verification is therefore best seen as a way to convert some of a model's knowledge into executable form, where it can be checked mechanically, rather than as a replacement for external feedback. It catches slips cheaply and misses shared misconceptions, so it should be paired with checks that do not share the generator's view of the problem.</p>
+
+<h2 id="looking-ahead" class="unnumbered">Looking ahead</h2>
+<p>Part II has shown how an agent can decide better: by reasoning before acting (Chapter 5), by searching over alternatives with an evaluator (Chapter 6), and by revising with feedback (this chapter). A single lesson runs through all three: the most valuable information comes from outside the model, from executing code, running tests, querying databases and searching the web. Every one of these is a tool, and so far we have treated tools as given. But tools are where an agent's capability and its risk both live: what tools should an agent have, how are they described and called, how do models learn to use them, how should their outputs be shaped, and what happens when a call fails? Part III begins with the mechanics of tool use and function calling in Chapter 8.</p>
+
+<h2 id="summary">Chapter summary</h2>
+<ul>
+<li>The generate–critique–refine loop (Self-Refine) helps on style and completeness; on reasoning, its value depends on where the critique's information comes from.</li>
+<li>Model revision as a two-state chain with fix rate \(\mu\) and break rate \(\nu\): \(a_k=a^*+(a_0-a^*)(1-\mu-\nu)^k\), \(a^*=\mu/(\mu+\nu)\). Revision helps only if \(a_0&lt;a^*\); it converges to its own fixed point.</li>
+<li><b>Intrinsic self-correction</b> on reasoning tasks usually hurts (Huang et al., 2023); earlier gains often used oracle stopping (\(\nu=0\)). A critic must flag wrong answers far more often than right ones, with a threshold that rises with initial accuracy.</li>
+<li><b>External feedback</b> (execution, tests, search, tools) raises \(\mu\) and lowers \(\nu\): Self-Debug, CRITIC. Agents have many such checks available.</li>
+<li><b>Reflexion</b> learns across attempts by storing verbal lessons in episodic memory: strong on repeatable tasks with reliable evaluators; limited by wrong lessons, context cost and non-repeatable tasks.</li>
+<li><b>Trained critics</b> (CriticGPT) and reasoning verifiers can beat self-review; <b>LLM judges</b> have position, verbosity and self-preference biases, which optimisation amplifies. Calibrate judges against human labels.</li>
+<li>Build evaluator–optimizer loops with tiered feedback (deterministic → tool-grounded → critic → human), revise only on specific flags, protect what passes, bound rounds, and measure \(\mu\) and \(\nu\).</li>
+<li>Self-generated tests (CodeT-style dual agreement) turn the model's knowledge into executable checks; they catch slips but share the generator's misreadings, so pair them with independent checks.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ch07-mcq-01" data-topic="§7.2 Self-Refine">
+<p class="q">In Self-Refine, the critique, refinement and generation are performed by:</p>
+<ol class="opts"><li>Three different models</li><li data-correct>The same model prompted in three roles</li><li>A human and a model</li><li>A compiler</li></ol>
+<div class="explain">One model generates, critiques and refines in turn.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-02" data-topic="§7.2 Self-Refine">
+<p class="q">On which kind of task did Self-Refine gain most?</p>
+<ol class="opts"><li data-correct>Style and completeness tasks such as dialogue quality and code readability</li><li>Mathematical reasoning</li><li>Fact verification without tools</li><li>Arithmetic</li></ol>
+<div class="explain">Critiques can always find something to polish, and the model judges such improvements competently.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-03" data-topic="§7.3 Markov model">
+<p class="q">With fix rate \(\mu\) and break rate \(\nu\), revision accuracy converges to:</p>
+<ol class="opts"><li>\(a_0\)</li><li>1</li><li data-correct>\(\mu/(\mu+\nu)\)</li><li>\(1-\nu\)</li></ol>
+<div class="explain">The stationary distribution of the two-state chain.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-04" data-topic="§7.3 Markov model">
+<p class="q">Revision helps if and only if:</p>
+<ol class="opts"><li>\(\mu>0\)</li><li>\(\nu=0\)</li><li data-correct>The initial accuracy \(a_0\) is below the fixed point \(\mu/(\mu+\nu)\)</li><li>The critique is long</li></ol>
+<div class="explain">\(a_k\) moves monotonically from \(a_0\) towards \(a^*\).</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-05" data-topic="§7.3 Markov model">
+<p class="q">\(\mu=0.1\), \(\nu=0.05\), \(a_0=0.9\). After many rounds, accuracy is about:</p>
+<ol class="opts"><li>0.90</li><li>0.95</li><li data-correct>0.67</li><li>0.50</li></ol>
+<div class="explain">\(a^*=0.1/0.15\approx0.67\): revision degrades a good model.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-06" data-topic="§7.3 Markov model">
+<p class="q">The per-round convergence factor of the chain is:</p>
+<ol class="opts"><li>\(\mu\nu\)</li><li data-correct>\(1-\mu-\nu\)</li><li>\(\mu/\nu\)</li><li>\(a^*\)</li></ol>
+<div class="explain">\(a_k-a^*=(a_0-a^*)(1-\mu-\nu)^k\).</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-07" data-topic="§7.3 Measurement">
+<p class="q">Of 800 correct answers, 40 became incorrect after review; of 200 incorrect, 30 were fixed. The loop's fixed point is:</p>
+<ol class="opts"><li>0.80</li><li data-correct>0.75</li><li>0.85</li><li>0.95</li></ol>
+<div class="explain">\(\nu=0.05\), \(\mu=0.15\), \(a^*=0.75&lt;0.80\): the loop hurts.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-08" data-topic="§7.4 Intrinsic correction">
+<p class="q">Huang et al. (2023) found that intrinsic self-correction on reasoning benchmarks:</p>
+<ol class="opts"><li>Raised accuracy substantially</li><li data-correct>Usually lowered accuracy, often by changing correct answers</li><li>Had no effect</li><li>Worked only for GPT-4</li></ol>
+<div class="explain">Without external feedback, critiques of correct answers invented flaws.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-09" data-topic="§7.4 Oracle stopping">
+<p class="q">Why do loops that stop when the ground-truth answer is reached overstate self-correction?</p>
+<ol class="opts"><li>They use more rounds</li><li data-correct>A correct answer is never revised, which sets the break rate to zero by using the label</li><li>They use a bigger model</li><li>They change the task</li></ol>
+<div class="explain">Oracle stopping is correction by the label, not by the model.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-10" data-topic="§7.4 Critic rates">
+<p class="q">Starting at 75% accuracy, with revisions fixing 60% of flagged wrong answers and breaking 50% of flagged right ones, review helps when:</p>
+<ol class="opts"><li>TPR > FPR</li><li data-correct>TPR > 2.5 FPR</li><li>TPR > 0.5</li><li>FPR &lt; 0.5</li></ol>
+<div class="explain">\(0.15\,\mathrm{TPR}>0.375\,\mathrm{FPR}\).</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-11" data-topic="§7.4 Critic rates">
+<p class="q">As initial accuracy \(a_0\) rises, the TPR/FPR ratio a critic needs for review to help:</p>
+<ol class="opts"><li>Falls</li><li data-correct>Rises steeply</li><li>Stays constant</li><li>Becomes irrelevant</li></ol>
+<div class="explain">The threshold is \(a_0b/((1-a_0)c)\): a large base of correct answers multiplies false flags.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-12" data-topic="§7.4 Generator–verifier gap">
+<p class="q">Why is intrinsic review weak on reasoning errors?</p>
+<ol class="opts"><li>Because reviews are short</li><li data-correct>Because the model reviews with the same knowledge it used to make the error, so it usually cannot see it</li><li>Because of temperature</li><li>Because of the context window</li></ol>
+<div class="explain">Without new information, there is no generator–verifier gap to exploit.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-13" data-topic="§7.5 External feedback">
+<p class="q">External feedback is valuable mainly because it:</p>
+<ol class="opts"><li>Is cheaper</li><li data-correct>Carries information whose errors are independent of the model's, raising \(\mu\) and lowering \(\nu\)</li><li>Is longer</li><li>Avoids the need for revision</li></ol>
+<div class="explain">A failing test names the problem; a passing one protects the output.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-14" data-topic="§7.5 CRITIC">
+<p class="q">CRITIC's ablations showed that removing tool calls from the critique step:</p>
+<ol class="opts"><li>Improved results</li><li data-correct>Removed most of the gain</li><li>Had no effect</li><li>Made results perfect</li></ol>
+<div class="explain">The tools, not the critique prompt, carried the value.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-15" data-topic="§7.5 Self-Debug">
+<p class="q">Select all forms of feedback Self-Debug used.</p>
+<ol class="opts"><li data-correct>Execution results and error messages</li><li data-correct>Failing unit tests</li><li data-correct>The model's own line-by-line explanation of the code</li><li>Human code review</li></ol>
+<div class="explain">Explanation without execution helped too, but less.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-16" data-topic="§7.5 Agents">
+<p class="q">Which is an external check available to the support agent?</p>
+<ol class="opts"><li>Asking itself whether the reply is polite</li><li data-correct>Reading back the booking after a change and checking the policy tool's verdict</li><li>Raising the temperature</li><li>Writing a longer reply</li></ol>
+<div class="explain">Read-backs and deterministic policy checks are independent of the model's judgement.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-17" data-topic="§7.6 Reflexion">
+<p class="q">Reflexion changes the agent's policy across attempts by:</p>
+<ol class="opts"><li>Gradient updates to the weights</li><li data-correct>Adding verbal lessons from failed attempts to the context of later attempts</li><li>Changing the temperature</li><li>Switching models</li></ol>
+<div class="explain">"Verbal reinforcement learning": the parameters are sentences in memory.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-18" data-topic="§7.6 Reflexion">
+<p class="q">Select all requirements or limits of Reflexion.</p>
+<ol class="opts"><li data-correct>A reasonably reliable evaluator to know an attempt failed</li><li data-correct>A task that can be repeated</li><li data-correct>Lessons can be wrong and mislead later attempts</li><li>It requires fine-tuning</li></ol>
+<div class="explain">It needs no training, but it does need evaluation, repeatability and correct diagnoses.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-19" data-topic="§7.6 Reflexion">
+<p class="q">First-attempt success 0.4; reflections raise success to 0.55, then 0.70. Probability of success within three attempts:</p>
+<ol class="opts"><li>0.784</li><li data-correct>0.919</li><li>0.70</li><li>0.99</li></ol>
+<div class="explain">\(1-0.6\times0.45\times0.3=0.919\).</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-20" data-topic="§7.6 Reflexion">
+<p class="q">Reflexion is least suited to:</p>
+<ol class="opts"><li>Coding with unit tests</li><li>Simulated household tasks</li><li data-correct>A live customer conversation that cannot be rerun</li><li>Benchmark retries</li></ol>
+<div class="explain">The lesson helps only a later attempt; irreversible one-shot tasks offer none.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-21" data-topic="§7.7 Critics">
+<p class="q">CriticGPT's main finding was that a critic trained with RLHF to critique code:</p>
+<ol class="opts"><li>Found fewer bugs than humans</li><li data-correct>Found substantially more bugs than human reviewers alone, with some false alarms to manage</li><li>Never hallucinated bugs</li><li>Replaced tests</li></ol>
+<div class="explain">Human–critic teams caught more bugs than either alone.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-22" data-topic="§7.7 Judge biases">
+<p class="q">Select all biases of LLM judges documented by Zheng et al. (2023).</p>
+<ol class="opts"><li data-correct>Position bias</li><li data-correct>Verbosity bias</li><li data-correct>Self-enhancement bias</li><li>Bias towards shorter answers</li></ol>
+<div class="explain">Judges favour a position, longer answers, and outputs like their own.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-23" data-topic="§7.7 Judge biases">
+<p class="q">A revision loop guided by a verbosity-biased judge will tend to:</p>
+<ol class="opts"><li>Shorten outputs</li><li data-correct>Lengthen outputs each round without improving them</li><li>Have no effect</li><li>Fix factual errors</li></ol>
+<div class="explain">Optimising against a bias amplifies it.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-24" data-topic="§7.7 Judge mitigation">
+<p class="q">A standard mitigation for position bias in pairwise judging is:</p>
+<ol class="opts"><li>Always put the better answer first</li><li data-correct>Judge both orderings and combine the results</li><li>Use a longer rubric</li><li>Raise the temperature</li></ol>
+<div class="explain">Swapping and averaging cancels a position preference.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-25" data-topic="§7.8 Design">
+<p class="q">In a tiered evaluator–optimizer, which check should come first?</p>
+<ol class="opts"><li>Human review</li><li>A trained critic</li><li data-correct>Deterministic checks such as tests, schemas and policy tools</li><li>Self-review</li></ol>
+<div class="explain">Order by reliability and cost: cheapest, most reliable first.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-26" data-topic="§7.8 Design">
+<p class="q">Why should revision be triggered only by specific flags?</p>
+<ol class="opts"><li>To save tokens only</li><li data-correct>Vague critiques invite change for its own sake, raising the break rate \(\nu\)</li><li>Because models cannot read long critiques</li><li>Because of caching</li></ol>
+<div class="explain">Specific, actionable feedback changes what is wrong and leaves the rest alone.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-27" data-topic="§7.8 Design">
+<p class="q">"Protect what passes" means:</p>
+<ol class="opts"><li>Never revise anything</li><li data-correct>Do not revise outputs or parts that pass reliable checks</li><li>Cache passing outputs</li><li>Hide passing outputs from the critic</li></ol>
+<div class="explain">A legitimate version of oracle stopping, using a real check.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-28" data-topic="§7.8 Worked example">
+<p class="q">In the support worked example, why did the intrinsic policy review not help?</p>
+<ol class="opts"><li>It was too expensive</li><li data-correct>It broke nearly as many compliant replies as it fixed violating ones (\(\mu=0.3\) on 6% vs \(\nu=0.02\) on 94%)</li><li>It was not run</li><li>The policy was too long</li></ol>
+<div class="explain">\(0.06\times0.7+0.94\times0.02\approx0.061\), unchanged from 0.06.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-29" data-topic="§7.8 Rounds">
+<p class="q">Most of a revision loop's benefit typically comes:</p>
+<ol class="opts"><li data-correct>In the first one to three rounds</li><li>After ten rounds</li><li>Uniformly across rounds</li><li>Only in the last round</li></ol>
+<div class="explain">The gap to the fixed point shrinks geometrically.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-30" data-topic="§7.6 Procedural memory">
+<p class="q">A lesson such as "this repository's tests need a special flag" stored for future tasks is an example of:</p>
+<ol class="opts"><li>Working memory</li><li data-correct>Procedural memory accumulated from experience</li><li>A system prompt</li><li>A cache entry</li></ol>
+<div class="explain">Chapter 13 develops memory types; wrong lessons must be prevented from accumulating.</div>
+</div>
+
+<div class="mcq" data-id="ch07-mcq-31" data-topic="§7.5 Citation check">
+<p class="q">In the citation worked example, external checking lowered the break rate to 0.01 mainly because:</p>
+<ol class="opts"><li>The model became more careful</li><li data-correct>Claims were changed only if the fetched page failed to support them</li><li>Fewer claims were written</li><li>The temperature was lowered</li></ol>
+<div class="explain">A supported claim passes the check and is protected.</div>
+</div>
+<div class="mcq" data-id="ch07-mcq-32" data-topic="§7.9 Self-generated tests">
+<p class="q">Why can tests written by the same model fail to catch its errors, however many are written?</p>
+<ol class="opts"><li>Tests are too slow</li><li data-correct>Tests and solutions can share the same misreading of the specification, so their errors are correlated</li><li>Interpreters are unreliable</li><li>Tests always pass</li></ol>
+<div class="explain">The shared-misconception term does not shrink with more tests from the same source.</div>
+</div>
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer out loud first, then reveal the model answer and rate yourself.</p>
+
+<details class="qa" data-id="ch07-qa-01">
+<summary><span class="lvl warm">Warm-up</span> Can LLMs correct their own mistakes?</summary>
+<div class="answer"><p>It depends on the feedback. With intrinsic review only, on reasoning tasks, usually not: studies found accuracy falls because the model flags correct answers and "fixes" them, and it reviews with the same knowledge that produced the error. With external feedback (execution, tests, search, tool checks) or a well-trained critic, yes: the feedback carries new information, so wrong answers get fixed and right ones are left alone. Earlier positive results often used the ground-truth label to stop the loop, which is not self-correction.</p></div>
+</details>
+
+<details class="qa" data-id="ch07-qa-02">
+<summary><span class="lvl warm">Warm-up</span> What is Reflexion?</summary>
+<div class="answer"><p>A method in which an agent, after a failed attempt judged by an evaluator (tests, environment signals), writes a short verbal reflection diagnosing the failure and planning a fix; reflections are stored in an episodic memory and included in the context of later attempts. It improves performance on repeatable tasks without weight updates (e.g. HumanEval 80% → 91% pass@1 for GPT-4). It depends on a reliable evaluator, repeatability, and correct diagnoses; wrong lessons mislead later attempts.</p></div>
+</details>
+
+<details class="qa" data-id="ch07-qa-03">
+<summary><span class="lvl warm">Warm-up</span> What are the main biases of LLM judges and how do you mitigate them?</summary>
+<div class="answer"><p>Position bias (preferring the first or second answer), verbosity bias (preferring longer answers), self-enhancement (preferring outputs like their own), and susceptibility to confident tone and citation presence. Mitigations: judge both orderings and average; specific rubrics with checkable criteria; explicit length control or normalisation; a judge from a different model family; reference answers where possible; and calibration against human labels on the actual task, measuring agreement and error rates.</p></div>
+</details>
+
+<details class="qa" data-id="ch07-qa-04">
+<summary><span class="lvl core">Core</span> Model iterative self-refinement and derive when it helps.</summary>
+<div class="answer"><p>Track correctness as a two-state Markov chain: a correct answer is broken with probability \(\nu\) per round, an incorrect one fixed with probability \(\mu\). Then \(a_{k+1}=a_k(1-\nu)+(1-a_k)\mu\), so \(a_k=a^*+(a_0-a^*)(1-\mu-\nu)^k\) with \(a^*=\mu/(\mu+\nu)\). Refinement helps iff \(a_0&lt;a^*\); it converges geometrically at rate \(1-\mu-\nu\). Implications: strong models (high \(a_0\)) need very low \(\nu\); external checks that protect passing outputs drive \(\nu\to0\); measure \(\mu,\nu\) on a labelled sample before deploying. Caveats: real chains have more states (partially correct), and rates may change with rounds.</p></div>
+</details>
+
+<details class="qa" data-id="ch07-qa-05">
+<summary><span class="lvl core">Core</span> Your team added "Review your answer and fix any errors" to every agent step, and success dropped. Explain and fix.</summary>
+<div class="answer"><p>Most steps were already right, so the review's false flags on correct steps (break rate times a large base) outweighed fixes on the few wrong ones. Fix: remove intrinsic review from routine steps; replace it with external checks where available (tests, schema validation, policy tools, read-backs); trigger revision only on specific failures; protect outputs that pass checks; and if a model critic is needed, measure its TPR/FPR and use it only where TPR/FPR exceeds the break-even ratio \(a_0b/((1-a_0)c)\).</p></div>
+</details>
+
+<details class="qa" data-id="ch07-qa-06">
+<summary><span class="lvl core">Core</span> Why does external feedback make self-correction work?</summary>
+<div class="answer"><p>It provides information the model did not have and whose errors are independent of the model's. A failing test identifies a specific defect (raising the fix rate), and a passing test protects an output from needless change (lowering the break rate), so the loop's fixed point rises above initial accuracy. Search results contradicting a claim, interpreter errors, and policy-tool verdicts work the same way. In generator–verifier terms, the external source creates a verification gap that intrinsic review lacks.</p></div>
+</details>
+
+<details class="qa" data-id="ch07-qa-07">
+<summary><span class="lvl core">Core</span> How would you measure whether a revision step helps?</summary>
+<div class="answer"><p>Take a labelled sample of outputs; run the revision step; count correct→incorrect (estimate \(\nu\)) and incorrect→correct (estimate \(\mu\)); compute \(a^*\) and the one-round change \(a_0(1-\nu)+(1-a_0)\mu-a_0\); include cost and latency; check by task type, since rates vary. Repeat after model or prompt changes. For open-ended outputs, use pairwise human or calibrated judge preferences before and after revision, controlling for length.</p></div>
+</details>
+
+<details class="qa" data-id="ch07-qa-08">
+<summary><span class="lvl core">Core</span> Compare Self-Refine and Reflexion.</summary>
+<div class="answer"><p>Self-Refine revises one output within an attempt using critique (often intrinsic); it suits polishing and completeness, and its value depends on the critique source. Reflexion operates across attempts: after an evaluator judges an attempt failed, the model writes a lesson that conditions the next attempt; it suits repeatable tasks with reliable success signals, making retries better aimed than independent samples. Both are context-based learning without weight updates; both fail when feedback is unreliable.</p></div>
+</details>
+
+<details class="qa" data-id="ch07-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Derive the break-even TPR/FPR ratio for a critic-triggered revision and discuss its dependence on initial accuracy.</summary>
+<div class="answer"><p>After one round, \(a_1=a_0(1-\mathrm{FPR}\cdot b)+(1-a_0)\mathrm{TPR}\cdot c\), where \(b\) is the probability a flagged correct answer is broken and \(c\) the probability a flagged wrong one is fixed. \(a_1>a_0\) iff \((1-a_0)\mathrm{TPR}\,c>a_0\mathrm{FPR}\,b\), i.e. \(\mathrm{TPR}/\mathrm{FPR}>\frac{a_0}{1-a_0}\cdot\frac bc\). The odds of initial correctness multiply the threshold: at \(a_0=0.5\) with \(b=c\), any critic better than chance helps; at \(a_0=0.9\) it must be 9 times more likely to flag wrong than right; at 0.99, 99 times. This explains why self-review helps weak models more than strong ones, and why protection of passing outputs (making \(b\) or FPR zero) is so valuable.</p></div>
+</details>
+
+<details class="qa" data-id="ch07-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> Is Reflexion a form of reinforcement learning? Discuss.</summary>
+<div class="answer"><p>In a loose sense: it improves a policy from a reward signal (evaluator outcomes) through trial and error. But no parameters are updated by gradients; the "update" is a natural-language summary of the failure placed in context, relying on in-context learning to change behaviour. It is closer to a heuristic policy-improvement step with a learned (by pre-training) update operator, or to Bayesian conditioning on evidence of what failed. Differences from RL: no credit assignment over many episodes, no generalisation beyond what fits in context and what the model can infer from lessons, sensitivity to wrong diagnoses, and no guarantee of improvement. It can generate data for real RL or fine-tuning: successful trajectories after reflection become training examples.</p></div>
+</details>
+
+<details class="qa" data-id="ch07-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> How would you train a critic that beats self-review?</summary>
+<div class="answer"><p>Collect outputs with known flaws (naturally occurring, labelled by experts or by hidden tests, plus deliberately inserted bugs for coverage). Train the critic (SFT then RL) with rewards for identifying real flaws precisely and penalties for false flags and vague comments; use human preferences between critiques for quality; and evaluate TPR/FPR on held-out data. Use a model different from, or stronger than, the generator to decorrelate errors; let it use tools (execute code, search) and reason before judging. Deploy with calibrated thresholds and track the precision of its flags. CriticGPT is a concrete example: RLHF on critiques of code with inserted bugs, beating human reviewers at bug finding.</p></div>
+</details>
+
+<details class="qa" data-id="ch07-qa-12">
+<summary><span class="lvl deep">Deep-dive</span> Why do revision loops with model judges drift, and how do you stop it?</summary>
+<div class="answer"><p>Each round optimises the output against the judge; whatever the judge systematically over-rewards (length, hedging, confident tone, many citations, its own style) increases every round, while true quality may stall or fall: Goodhart's law on a small scale. Stop it by bounding rounds; revising only on specific, checkable flags; using rubric items that can be verified; length control; ensembles or judges from different model families; and periodic human calibration. Monitoring simple statistics (output length, citation count per round) reveals drift early.</p></div>
+</details>
+
+<details class="qa" data-id="ch07-qa-13">
+<summary><span class="lvl design">Design</span> Design a review stage for a research agent's reports.</summary>
+<div class="answer"><p>Tier 1, deterministic: every citation resolves; quoted text appears on the page; numbers in the report match the source; required sections exist. Tier 2, tool-grounded: for each claim, retrieve passages from the cited source and check support with a model; for uncited claims, search for support or contradiction; flag unsupported claims specifically. Tier 3, calibrated judge: coverage of the question and balance of sources against a rubric, with both-order comparisons if comparing versions. Revision: the agent fixes only flagged claims (drop, re-source or correct), up to two rounds; unresolved flags go to a human or are marked in the report. Measure citation precision, claim support rate and judge–human agreement.</p></div>
+</details>
+
+<details class="qa" data-id="ch07-qa-14">
+<summary><span class="lvl design">Design</span> How would you use Reflexion-style memory in a production coding agent across many tasks?</summary>
+<div class="answer"><p>After each task, extract lessons only from verified outcomes (tests passed after a change of approach, user corrections), phrase them as specific, scoped rules ("in repo X, run tests with flag Y"), store them with provenance and scope (repository, language, tool), and retrieve relevant ones into context at the start of new tasks. Guard against wrong lessons: require evidence, expire or down-weight lessons that correlate with failures, allow humans to review the lesson store, and cap how many are injected. Evaluate by A/B testing with and without memory on similar tasks.</p></div>
+</details>
+
+<details class="qa" data-id="ch07-qa-15">
+<summary><span class="lvl design">Design</span> A product requires "the agent double-checks its work". How do you implement this without making things worse?</summary>
+<div class="answer"><p>Translate "double-check" into specific checks with known reliability: run tests and linters for code; read back records after writes; validate tool arguments against schemas and policy; verify citations; recompute numbers with a tool. Apply model-based review only where no check exists and only after measuring that its TPR/FPR beats the break-even ratio. Revise on specific failures, protect what passes, bound rounds, and escalate unresolved cases. Report the effect in terms of error rate, cost and latency on an evaluation set before and after.</p></div>
+</details>
+
+<details class="qa" data-id="ch07-qa-16">
+<summary><span class="lvl core">Core</span> What is the evaluator–optimizer pattern?</summary>
+<div class="answer"><p>A workflow in which one component produces an output and another evaluates it and returns feedback, repeating until the evaluator is satisfied or a budget is reached. It suits tasks with clear evaluation criteria where iterative refinement demonstrably helps (translation with nuanced requirements, code with tests, search tasks needing several rounds). Its effectiveness is governed by the evaluator's quality; build it with tiered, mostly external checks and bounded rounds.</p></div>
+</details>
+
+<details class="qa" data-id="ch07-qa-17">
+<summary><span class="lvl deep">Deep-dive</span> Why does Chain-of-Verification answer its verification questions without the draft in context?</summary>
+<div class="answer"><p>A check is informative only if its errors are not the same as the errors of what it checks. With the draft visible, the model tends to copy or rationalise the draft's claims, so the verification agrees with wrong facts almost as often as with right ones: high correlation, low true-positive rate. Answering in a fresh context makes the verification a more independent draw from the model's knowledge, so a wrong fact in the draft is more likely to be contradicted, raising the true-positive rate while the false-positive rate stays low. The general principle for agents is to verify by a different route or in a fresh context (independent re-derivation, separate sub-agent, different tool) rather than by re-reading.</p></div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="ref-selfrefine">A. Madaan et al. Self-Refine: Iterative Refinement with Self-Feedback. <em>NeurIPS</em>, 2023. <a href="https://arxiv.org/abs/2303.17651">arXiv:2303.17651</a>.</li>
+<li id="ref-selfdebug">X. Chen, M. Lin, N. Schärli, D. Zhou. Teaching Large Language Models to Self-Debug. <em>ICLR</em>, 2024. <a href="https://arxiv.org/abs/2304.05128">arXiv:2304.05128</a>.</li>
+<li id="ref-critic">Z. Gou et al. CRITIC: Large Language Models Can Self-Correct with Tool-Interactive Critiquing. <em>ICLR</em>, 2024. <a href="https://arxiv.org/abs/2305.11738">arXiv:2305.11738</a>.</li>
+<li id="ref-huang">J. Huang et al. Large Language Models Cannot Self-Correct Reasoning Yet. <em>ICLR</em>, 2024. <a href="https://arxiv.org/abs/2310.01798">arXiv:2310.01798</a>.</li>
+<li id="ref-kamoi">R. Kamoi et al. When Can LLMs Actually Correct Their Own Mistakes? A Critical Survey of Self-Correction of LLMs. <em>TACL</em>, 2024. <a href="https://arxiv.org/abs/2406.01297">arXiv:2406.01297</a>.</li>
+<li id="ref-cove">S. Dhuliawala et al. Chain-of-Verification Reduces Hallucination in Large Language Models. <em>Findings of ACL</em>, 2024. <a href="https://arxiv.org/abs/2309.11495">arXiv:2309.11495</a>.</li>
+<li id="ref-reflexion">N. Shinn et al. Reflexion: Language Agents with Verbal Reinforcement Learning. <em>NeurIPS</em>, 2023. <a href="https://arxiv.org/abs/2303.11366">arXiv:2303.11366</a>.</li>
+<li id="ref-criticgpt">N. McAleese et al. LLM Critics Help Catch LLM Bugs. OpenAI, 2024. <a href="https://arxiv.org/abs/2407.00215">arXiv:2407.00215</a>.</li>
+<li id="ref-judge">L. Zheng et al. Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena. <em>NeurIPS Datasets and Benchmarks</em>, 2023. <a href="https://arxiv.org/abs/2306.05685">arXiv:2306.05685</a>.</li>
+<li id="ref-saunders">W. Saunders et al. Self-critiquing models for assisting human evaluators. 2022. <a href="https://arxiv.org/abs/2206.05802">arXiv:2206.05802</a>.</li>
+<li id="ref-bea">E. Schluntz and B. Zhang. Building Effective Agents. Anthropic, 2024. <a href="https://www.anthropic.com/research/building-effective-agents">anthropic.com</a>.</li>
+<li id="ref-score">A. Kumar et al. Training Language Models to Self-Correct via Reinforcement Learning. 2024. <a href="https://arxiv.org/abs/2409.12917">arXiv:2409.12917</a>.</li>
+<li id="ref-codet">B. Chen, F. Zhang, A. Nguyen, D. Zan, Z. Lin, J.-G. Lou and W. Chen. CodeT: Code Generation with Generated Tests. 2022. <a href="https://arxiv.org/abs/2207.10397">arXiv:2207.10397</a>.</li>
+<li>Further reading: L. Zhang et al., Generative Verifiers: Reward Modeling as Next-Token Prediction, <a href="https://arxiv.org/abs/2408.15240">arXiv:2408.15240</a>.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

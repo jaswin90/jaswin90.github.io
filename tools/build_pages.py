@@ -18,9 +18,10 @@ HOME_ABOUT = ('Welcome. This is my personal site. The library collects the books
 e = html.escape
 
 
-def page(title, desc, body, depth_root, extra_head='', active=''):
+def page(title, desc, body, depth_root, extra_head='', active='', account=True):
     nav = ''.join('<a href="%s"%s>%s</a>' % (href, ' aria-current="page"' if key == active else '', label)
                   for key, href, label in [('home', '/', 'Home'), ('library', '/library/', 'Library'), ('apps', '/apps/', 'Apps')])
+    account_slot = ('<span id="account-slot"></span>\n<script type="module" src="/assets/js/account.js"></script>\n') if account else ''
     return f'''<!doctype html>
 <html lang="en">
 <head>
@@ -42,7 +43,7 @@ def page(title, desc, body, depth_root, extra_head='', active=''):
 <span class="spacer"></span>
 <nav>{nav}</nav>
 <button class="btn icon-btn" id="theme-btn" aria-label="Toggle dark mode" title="Toggle dark mode">◐</button>
-</header>
+{account_slot}</header>
 <main class="site">
 {body}
 </main>
@@ -80,7 +81,7 @@ home = f'''<section class="hero">
     f'<a class="card" href="/apps/{e(a["slug"])}/"><h3>{e(a["title"])}</h3><p>{e(a["blurb"])}</p></a>' for a in APPS) + '''</div>
 <p><a href="/apps/">All apps →</a></p>
 </section>'''
-write('index.html', page(SITE_NAME, HOME_TAGLINE, home, '/', active='home'))
+write('index.html', page(SITE_NAME, HOME_TAGLINE, home, '/', active='home', account=False))
 
 # ---------------------------------------------------------------- library
 books_json = json.dumps([{'title': b['title'], 'url': book_url(f, b), 'progress_field': b.get('progress_field')}
@@ -90,10 +91,6 @@ lib = '''<section class="hero">
 <h1>The library</h1>
 <p class="sub">Free, interactive textbooks, grouped by field.</p>
 </section>
-<section class="account">
-<h2>Your account</h2>
-<div id="account"><p class="small muted">Loading…</p></div>
-</section>
 <section>
 <h2>Fields</h2>
 <div class="cards">''' + ''.join(
@@ -102,7 +99,10 @@ lib = '''<section class="hero">
     for f in LIB['fields']) + '''</div>
 </section>
 <script type="application/json" id="library-books">''' + books_json.replace('</', '<\\/') + '''</script>
-<script type="module" src="/library/assets/library-auth.js"></script>'''
+<section id="progress-section">
+<h2>Your progress</h2>
+<div id="progress"><p class="small muted">Loading…</p></div>
+</section>'''
 write('library/index.html', page('Library — ' + SITE_NAME, 'Free, interactive textbooks by field.', lib, '/', active='library'))
 
 # ---------------------------------------------------------------- fields

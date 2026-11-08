@@ -16,3 +16,22 @@ main.site { max-width: 60rem; margin: 0 auto; padding: 1rem 16px 3rem; }
 .lib-progress { padding-left: 1.2rem; }
 .topbar nav a[aria-current="page"] { color: var(--accent); }
 .site-foot { max-width: 60rem; margin: 0 auto; padding: 1rem 16px 2rem; border-top: 1px solid var(--border); }
+/* Account control in the top bar (same element on Library and Apps pages). */
+#account-slot { display: inline-flex; align-items: center; }
+.acct { position: relative; }
+.acct-btn { display: inline-flex; align-items: center; gap: .4rem; padding: .25rem .6rem .25rem .3rem; }
+.acct-btn img, .acct-initial { width: 24px; height: 24px; border-radius: 50%; }
+.acct-initial { display: inline-flex; align-items: center; justify-content: center; background: var(--accent); color: #fff; font-size: .8rem; font-weight: 700; }
+.acct-name { max-width: 7rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acct-menu { position: absolute; right: 0; top: calc(100% + 6px); min-width: 13rem; z-index: 60; background: var(--bg); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.12); padding: .35rem; font-family: var(--sans); }
+.acct-menu[hidden] { display: none; }
+.acct-who { padding: .4rem .6rem .5rem; border-bottom: 1px solid var(--border); margin-bottom: .25rem; overflow-wrap: anywhere; }
+.acct-menu a, .acct-menu button { display: block; width: 100%; text-align: left; padding: .45rem .6rem; border: 0; background: none; color: var(--fg); font: inherit; font-size: .9rem; border-radius: 6px; text-decoration: none; cursor: pointer; }
+.acct-menu a:hover, .acct-menu button:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.inv-ul { list-style: none; padding: 0; margin: .5rem 0; }
+.inv-ul li { display: flex; justify-content: space-between; align-items: center; gap: .5rem; padding: .35rem 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+@media (max-width: 480px) { .acct-name { display: none; } .topbar nav { gap: .6rem; } }
+/* Site pages keep their Home / Library / Apps links on phones (the books' stylesheet hides its nav there). */
+.topbar nav { display: flex !important; }
+.inv-ul li .btn { white-space: nowrap; flex-shrink: 0; }
+@media (max-width: 400px) { .topbar { gap: .5rem; } .topbar nav { gap: .55rem; font-size: .9rem; } }

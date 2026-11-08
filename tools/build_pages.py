@@ -89,12 +89,10 @@ books_json = json.dumps([{'title': b['title'], 'url': book_url(f, b), 'progress_
 lib = '''<section class="hero">
 <h1>Library</h1>
 </section>
-<section class="plain">
-<div class="cards">''' + ''.join(
-    f'<a class="card" href="/library/{e(f["slug"])}/"><h3>{e(f["title"])}</h3><p>{e(f["blurb"])}</p>'
-    f'<p class="small muted">' + ' · '.join(e(b['title']) for b in f['books']) + '</p></a>'
-    for f in LIB['fields']) + '''</div>
-</section>
+''' + ''.join(
+    f'<section class="plain shelf"><h2><a href="/library/{e(f["slug"])}/">{e(f["title"])}</a></h2><ul class="book-links">'
+    + ''.join(f'<li><a href="{book_url(f, b)}">{e(b["title"])}</a></li>' for b in f['books']) + '</ul></section>'
+    for f in LIB['fields']) + '''
 <script type="application/json" id="library-books">''' + books_json.replace('</', '<\\/') + '''</script>
 <section id="progress-section" hidden>
 <h2>Your progress</h2>
@@ -106,15 +104,12 @@ write('library/index.html', page('Library — ' + SITE_NAME, 'Free, interactive 
 for f in LIB['fields']:
     body = f'''<p class="crumbs small"><a href="/library/">Library</a> › {e(f["title"])}</p>
 <section class="hero">
-<div class="chapter-kicker">Field</div>
 <h1>{e(f["title"])}</h1>
-<p class="sub">{e(f["blurb"])}</p>
 </section>
-<section>
-<div class="cards">''' + ''.join(
-        f'<a class="card" href="{book_url(f, b)}"><h3>{e(b["title"])}</h3><p>{e(b["blurb"])}</p><p class="small muted">Read online →</p></a>'
-        for b in f['books']) + '''</div>
-<p class="small muted">To keep your progress across devices, sign in once at the <a href="/library/">library</a>; every book syncs automatically.</p>
+<section class="plain shelf">
+<ul class="book-links">''' + ''.join(
+        f'<li><a href="{book_url(f, b)}">{e(b["title"])}</a></li>'
+        for b in f['books']) + '''</ul>
 </section>'''
     write('library/%s/index.html' % f['slug'], page(f['title'] + ' — Library', f['blurb'], body, '/', active='library'))
 apps = '''<section class="hero">

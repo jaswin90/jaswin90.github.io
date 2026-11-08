@@ -35,3 +35,5 @@ main.site { max-width: 60rem; margin: 0 auto; padding: 1rem 16px 3rem; }
 .topbar nav { display: flex !important; }
 .inv-ul li .btn { white-space: nowrap; flex-shrink: 0; }
 @media (max-width: 400px) { .topbar { gap: .5rem; } .topbar nav { gap: .55rem; font-size: .9rem; } }
+section.plain { border: 0; }
+.site section.plain > .cards { margin-top: .5rem; }

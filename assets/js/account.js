@@ -137,8 +137,7 @@ async function main() {
   function signedOut() {
     slot.innerHTML = '<button class="btn" id="acct-signin" type="button">Sign in</button>';
     slot.querySelector('#acct-signin').addEventListener('click', () => signInDialog());
-    if (progressBox) progressBox.innerHTML = '<p class="small muted">Reading needs no account. To keep your progress in every book on every device, <a href="#" id="prog-signin">sign in</a> (invite-only); otherwise it is saved in this browser.</p>';
-    const l = document.getElementById('prog-signin'); if (l) l.addEventListener('click', (e) => { e.preventDefault(); signInDialog(); });
+    if (progressBox) progressBox.closest('section').hidden = true;   // progress is shown only when signed in
   }
 
   A.onAuthStateChanged(auth, async (user) => {
@@ -152,6 +151,7 @@ async function main() {
     if (NEXT) { location.replace(NEXT); return; }
     const admin = norm(user.email) === ADMIN_EMAIL;
     chip(user, admin);
+    if (progressBox) progressBox.closest('section').hidden = false;
     if (progressBox) progressBox.innerHTML = '<p class="small muted">Signed in as ' + esc(user.email) + '. Every book and app uses this account.</p>' + await progressHtml(user);
   });
 }
@@ -161,5 +161,4 @@ main().catch((e) => {
   if (!slot) return;
   slot.innerHTML = '<button class="btn" type="button">Sign in</button>';
   slot.firstChild.addEventListener('click', () => toast('Accounts could not load (offline?). Reading still works; progress is saved in this browser.'));
-  if (progressBox) progressBox.innerHTML = '<p class="small muted">Accounts could not load. Your progress is saved in this browser.</p>';
 });

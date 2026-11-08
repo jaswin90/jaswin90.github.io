@@ -87,19 +87,16 @@ write('index.html', page(SITE_NAME, HOME_TAGLINE, home, '/', active='home', acco
 books_json = json.dumps([{'title': b['title'], 'url': book_url(f, b), 'progress_field': b.get('progress_field')}
                          for f in LIB['fields'] for b in f['books']])
 lib = '''<section class="hero">
-<div class="chapter-kicker">Library</div>
-<h1>The library</h1>
-<p class="sub">Free, interactive textbooks, grouped by field.</p>
+<h1>Library</h1>
 </section>
-<section>
-<h2>Fields</h2>
+<section class="plain">
 <div class="cards">''' + ''.join(
     f'<a class="card" href="/library/{e(f["slug"])}/"><h3>{e(f["title"])}</h3><p>{e(f["blurb"])}</p>'
     f'<p class="small muted">' + ' · '.join(e(b['title']) for b in f['books']) + '</p></a>'
     for f in LIB['fields']) + '''</div>
 </section>
 <script type="application/json" id="library-books">''' + books_json.replace('</', '<\\/') + '''</script>
-<section id="progress-section">
+<section id="progress-section" hidden>
 <h2>Your progress</h2>
 <div id="progress"><p class="small muted">Loading…</p></div>
 </section>'''
@@ -121,7 +118,6 @@ for f in LIB['fields']:
 </section>'''
     write('library/%s/index.html' % f['slug'], page(f['title'] + ' — Library', f['blurb'], body, '/', active='library'))
 apps = '''<section class="hero">
-<div class="chapter-kicker">Apps</div>
 <h1>Apps</h1>
 <p class="sub">Small tools that run in your browser. Each app has its own sign-in where it needs one.</p>
 </section>

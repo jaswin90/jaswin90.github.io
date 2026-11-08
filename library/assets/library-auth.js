@@ -60,64 +60,13 @@ async function main() {
   const busy = (form, on, label) => { const s = form.querySelector('button[type=submit]'); if (s) { s.disabled = on; s.textContent = on ? 'Please wait…' : label; } };
   const google = '<div class="auth-or"><span>or</span></div><button type="button" class="btn auth-wide" data-act="google">Continue with Google</button>';
 
-  function viewSignIn(email) {
+  // Google accounts only: no passwords to manage, and Google has already verified the email.
+  function viewSignIn() {
     const b = show('<h2 id="auth-title">Sign in</h2>' +
-      '<p class="small muted">New here? <a href="#" data-act="to-signup">Create an account</a></p>' +
-      '<form class="auth-form" novalidate>' +
-      '<label>Email<input name="email" type="email" autocomplete="email" required value="' + esc(email) + '"></label>' +
-      '<label>Password<input name="password" type="password" autocomplete="current-password" required></label>' +
+      '<p class="small muted">Use your Google (Gmail) account. Accounts are invite-only.</p>' +
       '<p class="auth-err" role="alert" hidden></p>' +
-      '<button type="submit" class="btn primary auth-wide">Sign in</button>' +
-      '<p class="small"><a href="#" data-act="to-reset">Forgot your password?</a></p></form>' + google);
-    const form = b.querySelector('form');
-    form.addEventListener('submit', async e => {
-      e.preventDefault(); err(b, ''); busy(form, true, 'Sign in');
-      try { await A.signInWithEmailAndPassword(auth, form.email.value.trim(), form.password.value); close(); }
-      catch (x) { err(b, msgOf(x)); }
-      finally { busy(form, false, 'Sign in'); }
-    });
-    wire(b, () => form.email.value.trim());
-  }
-  function viewSignUp(email) {
-    const b = show('<h2 id="auth-title">Create an account</h2>' +
-      '<p class="small muted">Already have one? <a href="#" data-act="to-signin">Sign in</a></p>' +
-      '<form class="auth-form" novalidate>' +
-      '<label>Name<input name="name" type="text" autocomplete="name"></label>' +
-      '<label>Email<input name="email" type="email" autocomplete="email" required value="' + esc(email) + '"></label>' +
-      '<label>Password (at least 8 characters)<input name="password" type="password" autocomplete="new-password" minlength="8" required></label>' +
-      '<p class="auth-err" role="alert" hidden></p>' +
-      '<button type="submit" class="btn primary auth-wide">Create account</button></form>' + google);
-    const form = b.querySelector('form');
-    form.addEventListener('submit', async e => {
-      e.preventDefault(); err(b, '');
-      if (form.password.value.length < 8) { err(b, MESSAGES['auth/weak-password']); return; }
-      busy(form, true, 'Create account');
-      try {
-        const cred = await A.createUserWithEmailAndPassword(auth, form.email.value.trim(), form.password.value);
-        const name = form.name.value.trim(); if (name) await A.updateProfile(cred.user, { displayName: name });
-        await A.sendEmailVerification(cred.user, { url: returnUrl() });
-        viewConfirm(cred.user);
-      } catch (x) { err(b, msgOf(x)); busy(form, false, 'Create account'); }
-    });
-    wire(b, () => form.email.value.trim());
-  }
-  function viewReset(email) {
-    const b = show('<h2 id="auth-title">Reset your password</h2>' +
-      '<form class="auth-form" novalidate><label>Email<input name="email" type="email" autocomplete="email" required value="' + esc(email) + '"></label>' +
-      '<p class="auth-err" role="alert" hidden></p><button type="submit" class="btn primary auth-wide">Email me a reset link</button>' +
-      '<p class="small"><a href="#" data-act="to-signin">Back to sign in</a></p></form>');
-    const form = b.querySelector('form');
-    form.addEventListener('submit', async e => {
-      e.preventDefault(); err(b, ''); busy(form, true, 'Email me a reset link');
-      const em = form.email.value.trim();
-      try {
-        await A.sendPasswordResetEmail(auth, em, { url: returnUrl() });
-        show('<h2 id="auth-title">Check your inbox</h2><p>If an account exists for <b>' + esc(em) + '</b>, a link to choose a new password is on its way. Check the spam folder too.</p>' +
-          '<button class="btn primary auth-wide" data-act="to-signin">Back to sign in</button>', 'button');
-        wire(dlg.querySelector('.auth-body'), () => em);
-      } catch (x) { err(b, msgOf(x)); busy(form, false, 'Email me a reset link'); }
-    });
-    wire(b, () => form.email.value.trim());
+      '<button type="button" class="btn primary auth-wide" data-act="google">Continue with Google</button>', 'button');
+    wire(b, () => '');
   }
   function viewConfirm(user) {
     const b = show('<h2 id="auth-title">Confirm your email</h2>' +
@@ -142,9 +91,7 @@ async function main() {
   function wire(b, getEmail) {
     b.querySelectorAll('[data-act]').forEach(x => {
       const act = x.dataset.act;
-      if (act === 'to-signup') x.addEventListener('click', e => { e.preventDefault(); viewSignUp(getEmail()); });
       if (act === 'to-signin') x.addEventListener('click', e => { e.preventDefault(); viewSignIn(getEmail()); });
-      if (act === 'to-reset') x.addEventListener('click', e => { e.preventDefault(); viewReset(getEmail()); });
       if (act === 'google') x.addEventListener('click', async () => {
         try { await A.signInWithPopup(auth, provider); close(); }
         catch (e) {
@@ -178,9 +125,8 @@ async function main() {
     }
     if (!user) {
       panel.innerHTML = '<p>Sign in to keep your progress in every book on every device, and to use the apps. Accounts are <b>invite-only</b> for now. Without an account, progress is saved in this browser only.</p>' +
-        '<p><button class="btn primary" id="lib-signin">Sign in</button> <button class="btn" id="lib-signup">Create an account</button></p>';
+        '<p><button class="btn primary" id="lib-signin">Sign in with Google</button></p>';
       document.getElementById('lib-signin').addEventListener('click', () => viewSignIn(''));
-      document.getElementById('lib-signup').addEventListener('click', () => viewSignUp(''));
       return;
     }
     if (needsConfirm(user)) {

@@ -30,6 +30,8 @@ local = dict(a.split('=', 1) for a in sys.argv[1:] if '=' in a)
 books = [(f, b) for f in SITE['fields'] for b in f['books']]
 url_map = {b['slug']: '/library/%s/%s/' % (f['slug'], b['slug']) for f, b in books}
 url_map.update({a['slug']: '/apps/%s/' % a['slug'] for a in SITE.get('apps', [])})
+BOOKCSS = re.compile(r'(<link rel="stylesheet" href="[^"]*assets/css/book\.css">)')
+THEME_KEYS = re.compile(r"\b(aai-theme|llmeng-theme)\b")   # each book's own dark-mode key -> the site's one key
 BOOKJS = re.compile(r'(<script defer src="([^"]*?)assets/js/book\.js"></script>)')
 OVERWRITE = re.compile(r"(profile: \{ name: u\.displayName \|\| '', email: u\.email \|\| '' \} \})\);")
 
@@ -49,7 +51,12 @@ def adapt_book_html(text, field):
                           'data-field="/library/%s/" data-field-title="%s"></script>' % (field['slug'], field['title']), text, count=1)
     for slug, url in url_map.items():
         text = re.sub(re.escape(ORIGIN + '/' + slug) + r'/?', url, text)
-    return text
+    # One look for the whole site: the shared theme loads after the book's own stylesheet,
+    # and visits are counted (analytics.js; page views only).
+    if '/assets/css/theme.css' not in text:
+        text = BOOKCSS.sub(lambda m: m.group(1) + '\n<link rel="stylesheet" href="/assets/css/theme.css">'
+                           '\n<script type="module" src="/assets/js/analytics.js"></script>', text, count=1)
+    return THEME_KEYS.sub('site-theme', text)
 
 
 def build_book(field, book, tmp, report):
@@ -69,6 +76,10 @@ def build_book(field, book, tmp, report):
         if OVERWRITE.search(t) and 'mergeFields' not in t:
             auth.write_text(OVERWRITE.sub(r"\1, { mergeFields: ['items', 'chapters', 'updatedAt', 'profile'] });", t))
             note = ' (sync write patched to merge)'
+    for js in (out / 'assets' / 'js').glob('*.js'):
+        t = js.read_text(); n = THEME_KEYS.sub('site-theme', t)
+        if n != t:
+            js.write_text(n)
     cfg = out / 'assets' / 'js' / 'firebase-config.js'
     if cfg.exists():
         cfg.write_text(FIREBASE_JS)
@@ -100,6 +111,16 @@ def build_app(app, tmp, report):
             s = pathlib.Path(s); d = out / s.name
             (shutil.copytree if s.is_dir() else shutil.copy2)(s, d)
     note = ''
+    # One look for the whole site: the shared theme after the app's own stylesheet, and the
+    # site's light/dark choice. (No analytics in apps: the Planner promises no tracking.)
+    idx = out / 'index.html'
+    if idx.exists():
+        t = idx.read_text()
+        if '/assets/css/theme.css' not in t:
+            t2 = re.sub(r'(<link rel="stylesheet" href="css/[^"]+\.css">)', r'\1\n  <link rel="stylesheet" href="/assets/css/theme.css">'
+                        r'\n  <script src="/assets/js/theme-init.js"></script>', t, count=1)
+            if t2 != t:
+                idx.write_text(t2); note = ' (site theme)'
     report.append('app %s: %d files%s' % (app['slug'], sum(1 for _ in out.rglob('*') if _.is_file()), note))
 
 

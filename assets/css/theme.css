@@ -1,0 +1,67 @@
+/* Shared theme for the whole site: homepage, library pages, every book and every app.
+   Loaded after each book's and app's own stylesheet, so all of them use the same colours,
+   fonts and dark mode (the dark-mode choice is stored under one key, site-theme). */
+:root {
+  color-scheme: light;
+  --bg: #fbfaf7;
+  --surface: #ffffff;
+  --surface-2: #f3f1ec;
+  --fg: #1b1b1a;
+  --fg-2: #4d4c48;
+  --muted: #7a7873;
+  --border: #e2dfd7;
+  --accent: #2a78d6;
+  --accent-ink: #1c5fb0;
+  --accent-soft: #e6f0fb;
+  --good: #11804f;
+  --good-soft: #e3f4ea;
+  --bad: #c0392b;
+  --bad-soft: #fbe9e7;
+  --warn: #a86b00;
+  --warn-soft: #fdf3dc;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #6250d6; --s6: #e34948;
+  --d-fill: #f1f5fb; --d-fill-2: #fdf1ea; --d-fill-3: #e9f7f1; --d-fill-4: #fdf6e3;
+  --d-stroke: #5d6b7e;
+  --code-bg: #f5f3ee;
+  --shadow: 0 1px 2px rgba(0,0,0,.05), 0 4px 16px rgba(0,0,0,.04);
+  --serif: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --measure: 46rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #161615; --surface: #1e1e1c; --surface-2: #262624;
+    --fg: #eeede9; --fg-2: #c4c2bb; --muted: #94928b; --border: #363532;
+    --accent: #5b9cec; --accent-ink: #8ab8f2; --accent-soft: #1d2a3a;
+    --good: #4cc38a; --good-soft: #17301f; --bad: #ef7d70; --bad-soft: #3a1e1b;
+    --warn: #e0a83a; --warn-soft: #33290f;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #9085e9; --s6: #e66767;
+    --d-fill: #1f2a37; --d-fill-2: #33241c; --d-fill-3: #17302a; --d-fill-4: #322a14;
+    --d-stroke: #9aa8bb; --code-bg: #232321;
+    --shadow: 0 1px 2px rgba(0,0,0,.4);
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #161615; --surface: #1e1e1c; --surface-2: #262624;
+  --fg: #eeede9; --fg-2: #c4c2bb; --muted: #94928b; --border: #363532;
+  --accent: #5b9cec; --accent-ink: #8ab8f2; --accent-soft: #1d2a3a;
+  --good: #4cc38a; --good-soft: #17301f; --bad: #ef7d70; --bad-soft: #3a1e1b;
+  --warn: #e0a83a; --warn-soft: #33290f;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #9085e9; --s6: #e66767;
+  --d-fill: #1f2a37; --d-fill-2: #33241c; --d-fill-3: #17302a; --d-fill-4: #322a14;
+  --d-stroke: #9aa8bb; --code-bg: #232321;
+  --shadow: 0 1px 2px rgba(0,0,0,.4);
+}
+
+/* Aliases for apps whose stylesheets use other variable names (My Planner). */
+:root {
+  --panel: var(--surface); --panel2: var(--surface-2); --line: var(--border); --text: var(--fg);
+  --danger: var(--bad); --ok: var(--good); --font: var(--sans); --today: var(--accent-soft);
+}
+:root[data-theme="dark"] { --accent-ink: #fff; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --accent-ink: #fff; } }
+/* In apps, --accent-ink is the text colour on accent-coloured buttons (in books it is a link colour). */
+#app.shell, #app.gate { --accent-ink: #fff; }

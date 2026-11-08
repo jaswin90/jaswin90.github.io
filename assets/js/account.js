@@ -1,8 +1,9 @@
 // The site's account control: one element at the right of the top bar on the Library and Apps
 // pages. Signed out: a "Sign in" button (Google accounts only, invite-only). Signed in: your
-// picture and name, with a menu for My progress, Invites (admin only) and Sign out.
+// picture and name, with a menu for My progress, Admin (admin only) and Sign out. For the admin
+// an Admin tab also appears in the top bar (/admin/: invites and the visitor dashboard).
 // Books link here to sign in (/library/?signin=1&next=<page>) and are returned afterwards.
-import { firebase, configured, isInvited, norm, ADMIN_EMAIL, listInvites, addInvite, removeInvite } from '/assets/js/site-auth.js';
+import { firebase, configured, isInvited, norm, ADMIN_EMAIL } from '/assets/js/site-auth.js';
 
 const slot = document.getElementById('account-slot');
 const progressBox = document.getElementById('progress');           // only on /library/
@@ -28,6 +29,9 @@ const MESSAGES = {
 };
 const BLOCKED = 'Your browser blocked the Google sign-in window. Allow pop-ups for jaswin90.github.io and try again. If you opened this link inside an app (WhatsApp, Gmail, LinkedIn…), open it in Chrome or Safari instead.';
 const msgOf = (e) => MESSAGES[e && e.code] || ('Something went wrong (' + ((e && (e.code || e.message)) || 'unknown') + ').');
+
+/** The Admin tab in the top bar is shown only to the admin. */
+function showAdminTab(on) { document.querySelectorAll('.admin-link').forEach((a) => { a.hidden = !on; }); }
 
 /* ---------------------------------------------------------------- dialog */
 let dlg = null;
@@ -78,31 +82,6 @@ async function main() {
       '<button type="button" class="btn auth-wide" data-act="close">OK</button>');
   }
 
-  async function invitesDialog() {
-    const b = show('<h2 id="auth-title">Invites</h2><p class="small muted">People on this list can sign in to the library and the apps. You are always allowed.</p><div class="inv-list"><p class="small muted">Loading…</p></div>' +
-      '<form class="auth-form" novalidate><label>Email<input name="email" type="email" required></label>' +
-      '<label>Note (optional)<input name="note" type="text"></label><p class="auth-err" role="alert" hidden></p>' +
-      '<button class="btn primary auth-wide" type="submit">Invite</button></form>');
-    const list = b.querySelector('.inv-list');
-    const draw = async () => {
-      try {
-        const items = await listInvites();
-        list.innerHTML = items.length ? '<ul class="inv-ul">' + items.map((i) => '<li><span>' + esc(i.email) + (i.note ? ' <span class="muted small">' + esc(i.note) + '</span>' : '') +
-          '</span><button class="btn small" data-rm="' + esc(i.email) + '">Remove</button></li>').join('') + '</ul>' : '<p class="small muted">No invites yet.</p>';
-        list.querySelectorAll('[data-rm]').forEach((x) => x.addEventListener('click', async () => {
-          if (!confirm('Remove ' + x.dataset.rm + ' from the invite list?')) return;
-          try { await removeInvite(x.dataset.rm); toast('Removed ' + x.dataset.rm); draw(); } catch (e) { toast(msgOf(e)); }
-        }));
-      } catch (e) { list.innerHTML = '<p class="auth-err">Could not read invites (' + esc(e.code || e.message) + '). Have the Firestore rules been published?</p>'; }
-    };
-    const f = b.querySelector('form');
-    f.addEventListener('submit', async (e) => {
-      e.preventDefault(); setErr(f, '');
-      try { const em = await addInvite(f.email.value, f.note.value); f.reset(); toast('Invited ' + em); draw(); } catch (x) { setErr(f, x.message || msgOf(x)); }
-    });
-    draw();
-  }
-
   async function progressHtml(user) {
     try {
       const snap = await F.getDoc(F.doc(db, 'users', user.uid));
@@ -123,18 +102,18 @@ async function main() {
       '<span class="acct-name">' + esc(first) + '</span> ▾</button>' +
       '<div class="acct-menu" hidden><div class="acct-who small muted">' + esc(user.email) + '</div>' +
       '<a href="/library/#progress">My progress</a>' +
-      (admin ? '<button type="button" data-act="invites">Invites</button>' : '') +
+      (admin ? '<a href="/admin/">Admin</a>' : '') +
       '<button type="button" data-act="signout">Sign out</button></div></div>';
     const btn = slot.querySelector('.acct-btn'), menu = slot.querySelector('.acct-menu');
     const set = (open) => { menu.hidden = !open; btn.setAttribute('aria-expanded', String(open)); };
     btn.addEventListener('click', (e) => { e.stopPropagation(); set(menu.hidden); });
     document.addEventListener('click', (e) => { if (!slot.contains(e.target)) set(false); });
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape') set(false); });
-    const inv = menu.querySelector('[data-act=invites]'); if (inv) inv.addEventListener('click', () => { set(false); invitesDialog(); });
     menu.querySelector('[data-act=signout]').addEventListener('click', async () => { set(false); await A.signOut(auth); toast('Signed out. Your progress stays in this browser.'); });
   }
 
   function signedOut() {
+    showAdminTab(false);
     slot.innerHTML = '<button class="btn" id="acct-signin" type="button">Sign in</button>';
     slot.querySelector('#acct-signin').addEventListener('click', () => signInDialog());
     if (progressBox) progressBox.closest('section').hidden = true;   // progress is shown only when signed in
@@ -151,6 +130,7 @@ async function main() {
     if (NEXT) { location.replace(NEXT); return; }
     const admin = norm(user.email) === ADMIN_EMAIL;
     chip(user, admin);
+    showAdminTab(admin);
     if (progressBox) progressBox.closest('section').hidden = false;
     if (progressBox) progressBox.innerHTML = '<p class="small muted">Signed in as ' + esc(user.email) + '. Every book and app uses this account.</p>' + await progressHtml(user);
   });

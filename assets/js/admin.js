@@ -39,13 +39,16 @@ function sendLinks(email) {
   const m = inviteMessage(email);
   const gmail = 'https://mail.google.com/mail/?view=cm&fs=1&to=' + encodeURIComponent(email) + '&su=' + encodeURIComponent(m.subject) + '&body=' + encodeURIComponent(m.body);
   const mailto = 'mailto:' + encodeURIComponent(email) + '?subject=' + encodeURIComponent(m.subject) + '&body=' + encodeURIComponent(m.body);
-  return '<a class="btn small" target="_blank" rel="noopener" href="' + esc(gmail) + '">Email via Gmail</a> ' +
-    '<a class="btn small" href="' + esc(mailto) + '">Other mail app</a> ' +
+  // On phones Gmail's website cannot open a pre-filled draft, so the button opens the mail app (Gmail app) instead.
+  const phone = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+  return (phone ? '<a class="btn small primary" href="' + esc(mailto) + '">Send invite email</a> '
+                : '<a class="btn small primary" target="_blank" rel="noopener" href="' + esc(gmail) + '">Send invite email (Gmail)</a> ') +
+    (phone ? '' : '<a class="btn small" href="' + esc(mailto) + '">Other mail app</a> ') +
     '<button class="btn small" type="button" data-copy="' + esc(email) + '">Copy message</button>';
 }
 
 function invitesSection(box) {
-  box.innerHTML = '<h2>Invites</h2><p class="small muted">People on this list can sign in to the library and the apps with their Google account. You are always allowed. Adding someone does not email them: use <b>Email via Gmail</b> (or Copy message) to let them know.</p>' +
+  box.innerHTML = '<h2>Invites</h2><p class="small muted">People on this list can sign in to the library and the apps with their Google account. You are always allowed. Adding someone does not email them: use <b>Send invite email</b> next to their name (or Copy message) to let them know.</p>' +
     '<div class="inv-list"><p class="small muted">Loading…</p></div>' +
     '<form class="auth-form inv-form" novalidate><label>Email<input name="email" type="email" required placeholder="name@gmail.com"></label>' +
     '<label>Note (optional)<input name="note" type="text"></label><p class="auth-err" role="alert" hidden></p>' +
@@ -72,7 +75,8 @@ function invitesSection(box) {
   };
   form.addEventListener('submit', async (ev) => {
     ev.preventDefault(); err.hidden = true;
-    try { const em = await addInvite(form.email.value, form.note.value); form.reset(); toast('Added ' + em + '. Now send them the invite with "Email via Gmail".'); draw(); }
+    if (!form.email.value.trim()) { err.textContent = 'Type the new person\'s email address first. To email someone already on the list, use Send invite email next to their name.'; err.hidden = false; return; }
+    try { const em = await addInvite(form.email.value, form.note.value); form.reset(); toast('Added ' + em + '. Now click Send invite email next to their name.'); draw(); }
     catch (x) { err.textContent = x.message; err.hidden = false; }
   });
   draw();

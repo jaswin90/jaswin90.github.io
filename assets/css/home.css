@@ -68,3 +68,4 @@ section.plain { border: 0; }
 .inv-actions { display: inline-flex; flex-wrap: wrap; gap: .35rem; justify-content: flex-end; }
 @media (max-width: 600px) { .inv-ul li { flex-direction: column; align-items: flex-start; } .inv-actions { justify-content: flex-start; } }
 .inv-actions a.btn { text-decoration: none; color: var(--fg); }
+.inv-actions a.btn.primary { color: #fff; }

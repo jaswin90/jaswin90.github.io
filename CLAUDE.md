@@ -28,7 +28,7 @@ Personal homepage, library and apps, published by GitHub Pages at https://jaswin
 3. **Firebase console** (project `jaswin-s-library`) → Firestore Database → Rules: paste `firestore.rules`, Publish. → Authentication → Sign-in method: Google enabled; Settings → Authorized domains include `jaswin90.github.io`.
 4. **Google Cloud console**, same project → APIs & Services → Library: enable **Google Drive API**. → Google Auth Platform → Data access: add the scope `.../auth/drive.appdata`. → Audience: **Publish app** (In production), so no test-user list is needed. Google may show an "unverified app" notice the first time someone connects Drive; that is expected for a personal app.
 5. **Visitor dashboard:** Firebase console → Project settings → Integrations → Google Analytics → Enable; copy the web app config again (it now has `measurementId`) into the `FIREBASE_CONFIG` secret; Google Cloud → enable **Google Analytics Data API** and **Google Analytics Admin API**; Google Auth Platform → Data access → add `analytics.readonly`.
-6. Optional: Google Cloud → Credentials → the Browser API key → Application restrictions: HTTP referrers `https://jaswin90.github.io/*`.
+6. Optional: Google Cloud → Credentials → the Browser API key → Application restrictions: Websites, with **both** `https://jaswin90.github.io/*` and `https://jaswin-s-library.firebaseapp.com/*` (Firebase's sign-in window runs on the second; without it sign-in fails with "The requested action is invalid"). If you also restrict APIs, keep Identity Toolkit API, Token Service API, Cloud Firestore API and Firebase Installations API allowed.
 
 After that, adding a person is one entry under Invites on the Admin page.
 

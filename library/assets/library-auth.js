@@ -29,7 +29,8 @@ const MESSAGES = {
   'auth/too-many-requests': 'Too many attempts. Wait a few minutes and try again.',
   'auth/network-request-failed': 'Network error. Check your connection and try again.',
   'auth/operation-not-allowed': 'This sign-in method is not enabled yet.',
-  'auth/popup-closed-by-user': 'The Google window was closed before signing in.'
+  'auth/popup-closed-by-user': 'The Google window was closed before signing in.',
+  'auth/unauthorized-domain': 'This site is not yet authorised for sign-in (Firebase → Authentication → Settings → Authorized domains: add jaswin90.github.io).'
 };
 const msgOf = e => MESSAGES[e && e.code] || ('Something went wrong (' + ((e && (e.code || e.message)) || 'unknown') + ').');
 
@@ -95,8 +96,11 @@ async function main() {
       if (act === 'google') x.addEventListener('click', async () => {
         try { await A.signInWithPopup(auth, provider); close(); }
         catch (e) {
-          if (e && (e.code === 'auth/popup-blocked' || e.code === 'auth/operation-not-supported-in-this-environment')) await A.signInWithRedirect(auth, provider);
-          else err(b, msgOf(e));
+          // Redirect sign-in is not used: on a site whose domain differs from Firebase's
+          // (jaswin90.github.io vs firebaseapp.com) browsers' storage partitioning breaks it.
+          if (e && (e.code === 'auth/popup-blocked' || e.code === 'auth/operation-not-supported-in-this-environment' || e.code === 'auth/web-storage-unsupported')) {
+            err(b, 'Your browser blocked the Google sign-in window. Allow pop-ups for jaswin90.github.io and try again. If you opened this link inside an app (WhatsApp, Gmail, LinkedIn…), open it in Chrome or Safari instead.');
+          } else err(b, msgOf(e));
         }
       });
     });

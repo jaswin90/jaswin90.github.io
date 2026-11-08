@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Generate the homepage, the library page and one page per field from library.json.
+"""Generate the homepage, the library page, one page per field and the apps page into _site/ from site.json.
 
-Run from the repository root:  python3 tools/build_pages.py
-Hand-edit only library.json (fields and books) and the HOME_* text below.
+Called by tools/build_site.py. Hand-edit only site.json and the HOME_* text below.
 """
 import json, html, pathlib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-LIB = json.loads((ROOT / 'library.json').read_text())
+LIB = json.loads((ROOT / 'site.json').read_text())
+APPS = LIB.get('apps', [])
+OUT = ROOT / '_site'
 
 SITE_NAME = 'Jaswin'
 HOME_TAGLINE = 'Mathematics, machine learning and the engineering of AI systems.'
@@ -19,7 +20,7 @@ e = html.escape
 
 def page(title, desc, body, depth_root, extra_head='', active=''):
     nav = ''.join('<a href="%s"%s>%s</a>' % (href, ' aria-current="page"' if key == active else '', label)
-                  for key, href, label in [('home', '/', 'Home'), ('library', '/library/', 'Library')])
+                  for key, href, label in [('home', '/', 'Home'), ('library', '/library/', 'Library'), ('apps', '/apps/', 'Apps')])
     return f'''<!doctype html>
 <html lang="en">
 <head>
@@ -52,7 +53,7 @@ def page(title, desc, body, depth_root, extra_head='', active=''):
 
 
 def write(rel, text):
-    p = ROOT / rel; p.parent.mkdir(parents=True, exist_ok=True); p.write_text(text)
+    p = OUT / rel; p.parent.mkdir(parents=True, exist_ok=True); p.write_text(text)
 
 
 def book_url(field, book):
@@ -72,6 +73,12 @@ home = f'''<section class="hero">
     f'<a class="card" href="/library/{e(f["slug"])}/"><h3>{e(f["title"])}</h3><p>{e(f["blurb"])}</p>'
     f'<p class="small muted">{len(f["books"])} book{"s" if len(f["books"]) != 1 else ""}</p></a>'
     for f in LIB['fields']) + '''</div>
+</section>
+<section>
+<h2>Apps</h2>
+<div class="cards">''' + ''.join(
+    f'<a class="card" href="/apps/{e(a["slug"])}/"><h3>{e(a["title"])}</h3><p>{e(a["blurb"])}</p></a>' for a in APPS) + '''</div>
+<p><a href="/apps/">All apps →</a></p>
 </section>'''
 write('index.html', page(SITE_NAME, HOME_TAGLINE, home, '/', active='home'))
 
@@ -113,4 +120,14 @@ for f in LIB['fields']:
 <p class="small muted">To keep your progress across devices, sign in once at the <a href="/library/">library</a>; every book syncs automatically.</p>
 </section>'''
     write('library/%s/index.html' % f['slug'], page(f['title'] + ' — Library', f['blurb'], body, '/', active='library'))
-print('pages built:', 2 + len(LIB['fields']))
+apps = '''<section class="hero">
+<div class="chapter-kicker">Apps</div>
+<h1>Apps</h1>
+<p class="sub">Small tools that run in your browser. Each app has its own sign-in where it needs one.</p>
+</section>
+<section>
+<div class="cards">''' + ''.join(
+    f'<a class="card" href="/apps/{e(a["slug"])}/"><h3>{e(a["title"])}</h3><p>{e(a["blurb"])}</p><p class="small muted">Open →</p></a>' for a in APPS) + '''</div>
+</section>'''
+write('apps/index.html', page('Apps — ' + SITE_NAME, 'Small browser apps.', apps, '/', active='apps'))
+print('pages built:', 3 + len(LIB['fields']))

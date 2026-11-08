@@ -1,0 +1,42 @@
+name: Build and deploy the site
+
+# Builds the homepage, the library (books fetched from their own repositories) and the apps
+# (fetched from their own repositories) into _site/, then publishes it with GitHub Pages.
+# Pages source must be "GitHub Actions" (Settings → Pages), set once.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 */3 * * *"        # every three hours, to pick up new chapters and app versions
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the site
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID || vars.GOOGLE_CLIENT_ID }}
+        run: python3 tools/build_site.py
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,2 +1,3 @@
 _site/
 __pycache__/
+assets/js/firebase-config.js

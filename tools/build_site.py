@@ -13,13 +13,13 @@ book's book.js (sign-in moves to /library/, progress still syncs), absolute link
 addresses are routed to their library addresses, and a progress write that would overwrite the shared
 account record is made to merge.
 
-Apps are copied as they are (only the files listed in "include"); an app that needs a public OAuth
-client ID gets it from an environment variable (a repository secret in CI) or, failing that, from
-the app's own current deployment.
+Apps are copied as they are (only the files listed in "include"). Apps and books share one account
+system (assets/js/site-auth.js). The Firebase web config is written into the build from the
+FIREBASE_CONFIG repository secret (JSON); no key is stored in any repository.
 
 Usage (repository root):  python3 tools/build_site.py [SLUG=/local/path ...]
 """
-import glob, json, os, pathlib, re, shutil, subprocess, sys, tempfile, urllib.request
+import glob, json, os, pathlib, re, shutil, subprocess, sys, tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 OUT = ROOT / '_site'
@@ -69,25 +69,27 @@ def build_book(field, book, tmp, report):
         if OVERWRITE.search(t) and 'mergeFields' not in t:
             auth.write_text(OVERWRITE.sub(r"\1, { mergeFields: ['items', 'chapters', 'updatedAt', 'profile'] });", t))
             note = ' (sync write patched to merge)'
+    cfg = out / 'assets' / 'js' / 'firebase-config.js'
+    if cfg.exists():
+        cfg.write_text(FIREBASE_JS)
     if shimmed != pages:
         sys.exit('ERROR: %s: %d of %d pages could not load the library shim' % (book['slug'], pages - shimmed, pages))
     report.append('book %s/%s: %d pages%s' % (field['slug'], book['slug'], pages, note))
 
 
-def client_id_for(app):
-    cid = os.environ.get(app.get('client_id_secret', ''), '').strip()
-    if cid:
-        return cid, 'secret'
-    url = app.get('client_id_fallback_url')
-    if url:
-        try:
-            body = urllib.request.urlopen(url, timeout=20).read().decode()
-            m = re.search(r"googleClientId: '([0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com)'", body)
-            if m:
-                return m.group(1), 'current deployment'
-        except Exception as e:
-            print('note: could not read %s (%s)' % (url, e))
-    return '', ''
+def firebase_config_js():
+    """The site's Firebase web config, from the FIREBASE_CONFIG secret (JSON). Not stored in the repo."""
+    raw = os.environ.get('FIREBASE_CONFIG', '').strip()
+    cfg = {}
+    if raw:
+        cfg = json.loads(raw)
+        missing = [k for k in ('apiKey', 'authDomain', 'projectId', 'appId') if not cfg.get(k)]
+        if missing:
+            sys.exit('ERROR: FIREBASE_CONFIG is missing ' + ', '.join(missing))
+    else:
+        print('WARNING: FIREBASE_CONFIG is not set: accounts are disabled in this build (progress stays in the browser).')
+    return ('// Generated at build time from the FIREBASE_CONFIG repository secret. Do not commit.\n'
+            'export const firebaseConfig = ' + json.dumps(cfg, indent=2) + ';\n')
 
 
 def build_app(app, tmp, report):
@@ -98,14 +100,10 @@ def build_app(app, tmp, report):
             s = pathlib.Path(s); d = out / s.name
             (shutil.copytree if s.is_dir() else shutil.copy2)(s, d)
     note = ''
-    if app.get('client_id_file'):
-        f = out / app['client_id_file']; t = f.read_text()
-        cid, how = client_id_for(app)
-        if cid and "googleClientId: ''" in t:
-            f.write_text(t.replace("googleClientId: ''", "googleClientId: '%s'" % cid)); note = ' (client ID from %s)' % how
-        elif not cid:
-            note = ' (WARNING: no client ID; Google sign-in disabled)'
     report.append('app %s: %d files%s' % (app['slug'], sum(1 for _ in out.rglob('*') if _.is_file()), note))
+
+
+FIREBASE_JS = firebase_config_js()
 
 
 def main():
@@ -114,6 +112,7 @@ def main():
     OUT.mkdir()
     (OUT / '.nojekyll').write_text('')
     shutil.copytree(ROOT / 'assets', OUT / 'assets')
+    (OUT / 'assets' / 'js' / 'firebase-config.js').write_text(FIREBASE_JS)
     shutil.copytree(ROOT / 'library' / 'assets', OUT / 'library' / 'assets')
     report = []
     with tempfile.TemporaryDirectory() as tmp:

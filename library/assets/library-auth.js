@@ -2,9 +2,7 @@
 // create an account, confirm their email, reset a password or sign out.
 // Books in the library share this Firebase project and the same browser session,
 // so once a reader signs in here every book syncs its progress automatically.
-import { firebaseConfig } from '../../assets/js/firebase-config.js';
-
-const FB = 'https://www.gstatic.com/firebasejs/10.12.2/';
+import { firebase, configured, isInvited, norm, ADMIN_EMAIL, listInvites, addInvite, removeInvite } from '/assets/js/site-auth.js';
 const panel = document.getElementById('account');
 const BOOKS = JSON.parse(document.getElementById('library-books').textContent);
 const params = new URLSearchParams(location.search);
@@ -13,6 +11,8 @@ const NEXT = (() => { const n = params.get('next') || ''; return n.startsWith('/
 const esc = s => String(s == null ? '' : s).replace(/[<>&"]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
 const isPasswordUser = u => !!u && (u.providerData || []).some(p => p.providerId === 'password');
 const needsConfirm = u => !!u && isPasswordUser(u) && !u.emailVerified;
+const OWNER = 'Jaswin';
+let denied = '';   // email of an uninvited sign-in, to explain after signing them out
 function toast(msg) {
   let t = document.querySelector('.toast');
   if (!t) { t = document.createElement('div'); t.className = 'toast'; document.body.appendChild(t); }
@@ -34,13 +34,8 @@ const MESSAGES = {
 const msgOf = e => MESSAGES[e && e.code] || ('Something went wrong (' + ((e && (e.code || e.message)) || 'unknown') + ').');
 
 async function main() {
-  if (!firebaseConfig || !firebaseConfig.apiKey) { panel.innerHTML = '<p class="small muted">Accounts are not enabled. Progress is saved in this browser.</p>'; return; }
-  const [{ initializeApp }, A, F] = await Promise.all([
-    import(FB + 'firebase-app.js'), import(FB + 'firebase-auth.js'), import(FB + 'firebase-firestore.js')
-  ]);
-  const app = initializeApp(firebaseConfig);
-  const auth = A.getAuth(app);
-  const db = F.getFirestore(app);
+  if (!configured()) { panel.innerHTML = '<p class="small muted">Accounts are not enabled on this build. Progress is saved in this browser.</p>'; return; }
+  const { A, F, auth, db } = await firebase();
   const provider = new A.GoogleAuthProvider();
   const returnUrl = () => location.origin + location.pathname + (NEXT ? '?next=' + encodeURIComponent(NEXT) : '');
 
@@ -174,8 +169,15 @@ async function main() {
     } catch (e) { return '<p class="small muted">Signed in. (Progress summary unavailable: ' + esc(e.code || e.message) + ')</p>'; }
   }
   async function render(user) {
+    if (!user && denied) {
+      panel.innerHTML = '<p>The library\'s accounts are <b>invite-only</b> for now, and <b>' + esc(denied) + '</b> is not on the list.</p>' +
+        '<p class="small muted">You can still read every book; your progress is saved in this browser. Ask ' + OWNER + ' for an invite, then sign in again.</p>' +
+        '<p><button class="btn" id="lib-signin">Sign in with another account</button></p>';
+      document.getElementById('lib-signin').addEventListener('click', () => { denied = ''; viewSignIn(''); });
+      return;
+    }
     if (!user) {
-      panel.innerHTML = '<p>Sign in to keep your progress in every book of the library, on every device. Without an account, progress is saved in this browser only.</p>' +
+      panel.innerHTML = '<p>Sign in to keep your progress in every book on every device, and to use the apps. Accounts are <b>invite-only</b> for now. Without an account, progress is saved in this browser only.</p>' +
         '<p><button class="btn primary" id="lib-signin">Sign in</button> <button class="btn" id="lib-signup">Create an account</button></p>';
       document.getElementById('lib-signin').addEventListener('click', () => viewSignIn(''));
       document.getElementById('lib-signup').addEventListener('click', () => viewSignUp(''));
@@ -187,18 +189,56 @@ async function main() {
       document.getElementById('lib-out').addEventListener('click', () => A.signOut(auth));
       return;
     }
+    if (!(await isInvited(user))) {
+      denied = user.email || '';
+      panel.innerHTML = '<p>The library\'s accounts are <b>invite-only</b> for now, and <b>' + esc(user.email) + '</b> is not on the list.</p>' +
+        '<p class="small muted">You can still read every book; your progress is saved in this browser. Ask ' + OWNER + ' for an invite, then sign in again.</p>' +
+        '<p><button class="btn" id="lib-out">Sign out</button></p>';
+      document.getElementById('lib-out').addEventListener('click', () => A.signOut(auth));
+      setTimeout(() => A.signOut(auth), 0);   // keep uninvited sessions from reaching the books
+      return;
+    }
     if (NEXT) { location.replace(NEXT); return; }
     const name = user.displayName || user.email || 'Reader';
     panel.innerHTML = '<p class="user-chip">' + (user.photoURL ? '<img alt="" referrerpolicy="no-referrer" src="' + esc(user.photoURL) + '">' : '') +
       '<span>Signed in as <b>' + esc(name) + '</b></span> <button class="btn small" id="lib-out">Sign out</button></p>' +
-      '<p class="small muted">Every book in the library now syncs your answers to this account.</p><div id="lib-prog"></div>';
+      '<p class="small muted">Every book in the library, and the apps, now use this account.</p><div id="lib-prog"></div>';
     document.getElementById('lib-out').addEventListener('click', async () => { await A.signOut(auth); toast('Signed out — progress stays in this browser.'); });
     document.getElementById('lib-prog').innerHTML = await progressHtml(user);
+    if (norm(user.email) === ADMIN_EMAIL) adminPanel();
+  }
+
+  /* ------------------------------------------------------------- admin */
+  async function adminPanel() {
+    let box = document.getElementById('lib-admin');
+    if (!box) { box = document.createElement('div'); box.id = 'lib-admin'; panel.appendChild(box); }
+    const draw = async () => {
+      let rows = '';
+      try {
+        const list = await listInvites();
+        rows = list.length ? '<ul class="lib-progress">' + list.map(i => '<li>' + esc(i.email) + (i.note ? ' <span class="muted small">' + esc(i.note) + '</span>' : '') +
+          ' <button class="btn small" data-rm="' + esc(i.email) + '">Remove</button></li>').join('') + '</ul>' : '<p class="small muted">No invites yet.</p>';
+      } catch (e) { rows = '<p class="auth-err">Could not read invites (' + esc(e.code || e.message) + '). Have the Firestore rules been published?</p>'; }
+      box.innerHTML = '<h3>Invites (admin)</h3><p class="small muted">People on this list can sign in to the library and the apps. You are always allowed.</p>' + rows +
+        '<form id="inv-form" class="auth-form" novalidate style="max-width:28rem"><label>Email<input name="email" type="email" required></label>' +
+        '<label>Note (optional)<input name="note" type="text"></label><p class="auth-err" role="alert" hidden></p>' +
+        '<button class="btn primary" type="submit" style="margin-top:.6rem">Invite</button></form>';
+      box.querySelectorAll('[data-rm]').forEach(b => b.addEventListener('click', async () => {
+        if (!confirm('Remove ' + b.dataset.rm + ' from the invite list?')) return;
+        try { await removeInvite(b.dataset.rm); toast('Removed'); draw(); } catch (e) { toast(msgOf(e)); }
+      }));
+      const f = box.querySelector('#inv-form');
+      f.addEventListener('submit', async e => {
+        e.preventDefault(); err(f, '');
+        try { const em = await addInvite(f.email.value, f.note.value); toast('Invited ' + em); draw(); } catch (x) { err(f, x.message || msgOf(x)); }
+      });
+    };
+    draw();
   }
 
   A.onAuthStateChanged(auth, user => {
     render(user);
-    if (!user && params.get('signin')) viewSignIn('');
+    if (!user && !denied && params.get('signin')) viewSignIn('');
   });
 }
 main().catch(e => { console.error(e); panel.innerHTML = '<p class="small muted">Could not load accounts: ' + esc(e.message) + '</p>'; });

@@ -32,7 +32,7 @@ jobs:
           python-version: "3.12"
       - name: Build the site
         env:
-          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID || vars.GOOGLE_CLIENT_ID }}
+          FIREBASE_CONFIG: ${{ secrets.FIREBASE_CONFIG }}
         run: python3 tools/build_site.py
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3

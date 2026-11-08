@@ -30,7 +30,7 @@
     {
       "slug": "planner",
       "title": "My Planner",
-      "blurb": "Encrypted notes and planner: sticky-note to-dos, day and month planning, rich notes. Signs in with Google; your data stays encrypted in your own Google Drive.",
+      "blurb": "Encrypted notes and planner: sticky-note to-dos, day and month planning, rich notes with photos, voice notes and PDFs. Uses your library account; files stay encrypted in your own Google Drive.",
       "repo": "jaswin90/planner",
       "branch": "claude/vibrant-meitner-kjx5s3",
       "include": [
@@ -42,10 +42,7 @@
         "css",
         "js",
         "vendor"
-      ],
-      "client_id_file": "js/config.js",
-      "client_id_secret": "GOOGLE_CLIENT_ID",
-      "client_id_fallback_url": "https://jaswin90.github.io/planner/js/config.js"
+      ]
     }
   ]
 }

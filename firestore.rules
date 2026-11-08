@@ -1,0 +1,28 @@
+rules_version = '2';
+// Security rules for the Firebase project jaswin-s-library (the whole jaswin90.github.io site).
+// Paste into Firebase console → Firestore Database → Rules → Publish (one time, and after edits).
+//
+// Invite-only: a signed-in person can read or write data only if invites/<their email> exists,
+// or they are the admin. Only the admin can add or remove invites.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function verified() { return signedIn() && request.auth.token.email_verified == true; }
+    function email() { return request.auth.token.email.lower(); }
+    function isAdmin() { return verified() && email() == 'k.jaswin@gmail.com'; }
+    function invited() {
+      return isAdmin() || (verified() && exists(/databases/$(database)/documents/invites/$(email())));
+    }
+
+    // Per-reader progress for every book, one document per user.
+    match /users/{uid} {
+      allow read, write: if invited() && request.auth.uid == uid;
+    }
+
+    // The invite list: the admin manages it; an invited person may read their own entry.
+    match /invites/{inviteEmail} {
+      allow read: if isAdmin() || (verified() && email() == inviteEmail);
+      allow write: if isAdmin();
+    }
+  }
+}

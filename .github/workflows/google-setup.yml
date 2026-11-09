@@ -1,0 +1,55 @@
+name: Apply Google and Firebase settings
+
+# Applies the site's Google Cloud / Firebase settings from this repository, so nobody has to
+# change them by hand in the consoles:
+#   - enables the APIs the site uses (Drive for the Planner, Analytics for the Admin dashboard);
+#   - restricts the browser API key to the site and Firebase's sign-in domain;
+#   - publishes firestore.rules (invite-only access) to the Firebase project.
+# Runs on manual dispatch and whenever firestore.rules or this file changes.
+# Needs one repository secret, GCP_SA_KEY: the JSON key of a service account in the Firebase
+# project with the roles Firebase Admin, Service Usage Admin and API Keys Admin.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["firestore.rules", "firebase.json", ".github/workflows/google-setup.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    env:
+      PROJECT: jaswin-s-library
+      SITE_REFERRERS: "https://jaswin90.github.io/*,https://jaswin-s-library.firebaseapp.com/*,https://jaswin-s-library.web.app/*"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the service account key is present
+        env:
+          KEY: ${{ secrets.GCP_SA_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then echo "::error::Add the GCP_SA_KEY repository secret first (see README, Automation)."; exit 1; fi
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Enable the APIs the site uses
+        run: |
+          gcloud services enable --project "$PROJECT" \
+            drive.googleapis.com analyticsdata.googleapis.com analyticsadmin.googleapis.com \
+            firebaserules.googleapis.com firestore.googleapis.com identitytoolkit.googleapis.com apikeys.googleapis.com
+      - name: Restrict the browser API key to the site and Firebase's sign-in domain
+        env:
+          FIREBASE_CONFIG: ${{ secrets.FIREBASE_CONFIG }}
+        run: |
+          KEY_STRING=$(printf '%s' "$FIREBASE_CONFIG" | jq -r .apiKey)
+          NAME=$(gcloud services api-keys lookup "$KEY_STRING" --project "$PROJECT" --format='value(name)')
+          echo "Key: $NAME"
+          gcloud services api-keys update "$NAME" --project "$PROJECT" --allowed-referrers="$SITE_REFERRERS"
+          gcloud services api-keys describe "$NAME" --project "$PROJECT" --format='yaml(restrictions.browserKeyRestrictions)'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Publish the Firestore rules
+        run: npx --yes firebase-tools@13 deploy --only firestore:rules --project "$PROJECT" --non-interactive

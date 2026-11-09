@@ -32,6 +32,9 @@ Personal homepage, library and apps, published by GitHub Pages at https://jaswin
 
 After that, adding a person is one entry under Invites on the Admin page.
 
+## Automation (no console visits)
+`.github/workflows/google-setup.yml` applies the Google/Firebase side from this repository: it enables the APIs, restricts the browser API key (site + Firebase sign-in domain) and publishes `firestore.rules`. It runs on manual dispatch and whenever the rules change. It needs one secret, `GCP_SA_KEY`: the JSON key of a service account in project `jaswin-s-library` with the roles **Firebase Admin**, **Service Usage Admin** and **API Keys Admin**. (Two settings have no public API and stay manual, done once already: publishing the OAuth consent screen and linking Google Analytics.)
+
 ## Adding a book, a field or an app
 - Book or field: add it to `site.json` under `fields` (`slug`, `title`, `blurb`, `repo`, `branch`, `src`, `progress_field`: the Firestore field its progress lives under, or `null` for top-level).
 - App: add it to `site.json` under `apps` (`slug`, `title`, `blurb`, `repo`, `branch`, `include`: the files to publish).

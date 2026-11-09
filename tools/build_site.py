@@ -134,6 +134,7 @@ def main():
     (OUT / '.nojekyll').write_text('')
     shutil.copytree(ROOT / 'assets', OUT / 'assets')
     (OUT / 'assets' / 'js' / 'firebase-config.js').write_text(FIREBASE_JS)
+    shutil.copy2(ROOT / 'tools' / 'gcp-setup.sh', OUT / 'setup.sh')   # one-time Cloud Shell setup (no secrets in it)
     shutil.copytree(ROOT / 'library' / 'assets', OUT / 'library' / 'assets')
     report = []
     with tempfile.TemporaryDirectory() as tmp:

@@ -38,14 +38,32 @@ jobs:
             drive.googleapis.com analyticsdata.googleapis.com analyticsadmin.googleapis.com \
             firebaserules.googleapis.com firestore.googleapis.com identitytoolkit.googleapis.com apikeys.googleapis.com
       - name: Restrict the browser API key to the site and Firebase's sign-in domain
+        # Keeps the key's existing list of allowed APIs and sets the allowed websites. Google refuses
+        # by default when the key has recent traffic from APIs outside that list (for this key: Maps,
+        # Places, Pub/Sub — not used by the site, so most likely someone trying the key); the change
+        # is applied anyway, because blocking that traffic is the point.
+        continue-on-error: true
         env:
           FIREBASE_CONFIG: ${{ secrets.FIREBASE_CONFIG }}
         run: |
+          set -euo pipefail
           KEY_STRING=$(printf '%s' "$FIREBASE_CONFIG" | jq -r .apiKey)
           NAME=$(gcloud services api-keys lookup "$KEY_STRING" --project "$PROJECT" --format='value(name)')
-          echo "Key: $NAME"
-          gcloud services api-keys update "$NAME" --project "$PROJECT" --allowed-referrers="$SITE_REFERRERS"
-          gcloud services api-keys describe "$NAME" --project "$PROJECT" --format='yaml(restrictions.browserKeyRestrictions)'
+          TOKEN=$(gcloud auth print-access-token)
+          CUR=$(curl -sf -H "Authorization: Bearer $TOKEN" "https://apikeys.googleapis.com/v2/$NAME")
+          echo "Current restrictions:"; echo "$CUR" | jq '.restrictions'
+          BODY=$(echo "$CUR" | jq --arg r "$SITE_REFERRERS" '{restrictions: ((.restrictions // {}) | del(.serverKeyRestrictions,.androidKeyRestrictions,.iosKeyRestrictions) + {browserKeyRestrictions: {allowedReferrers: ($r | split(","))}})}')
+          echo "New restrictions:"; echo "$BODY" | jq '.restrictions'
+          for q in "updateMask=restrictions" "updateMask=restrictions&checkExistingUsage=SKIP" "updateMask=restrictions&check_existing_usage=SKIP"; do
+            echo "PATCH ?$q"
+            if curl -s -o resp.json -w '%{http_code}\n' -X PATCH -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+                 "https://apikeys.googleapis.com/v2/$NAME?$q" -d "$BODY" | grep -q '^200$'; then
+              echo "Key updated."; break
+            fi
+            jq -c '.error | {code, status, message}' resp.json || cat resp.json
+          done
+          sleep 15
+          gcloud services api-keys describe "$NAME" --project "$PROJECT" --format='yaml(restrictions)'
       - uses: actions/setup-node@v4
         with:
           node-version: 22

@@ -127,8 +127,12 @@ def copy_auth_helper(report):
         try:
             body = urllib.request.urlopen(base + src, timeout=30).read()
         except Exception as e:
-            print('note: could not fetch %s (%s); sign-in helper not self-hosted in this build' % (base + src, e))
-            return
+            if src != 'firebase/init.json':
+                print('note: could not fetch %s (%s); sign-in helper not self-hosted in this build' % (base + src, e))
+                return
+            # Served only when Firebase Hosting is on; it is just the web config, so write it ourselves.
+            keys = ('apiKey', 'appId', 'authDomain', 'projectId', 'storageBucket', 'messagingSenderId', 'measurementId')
+            body = json.dumps({k: FIREBASE_CFG[k] for k in keys if FIREBASE_CFG.get(k)}).encode()
         d = OUT / '__' / dst; d.parent.mkdir(parents=True, exist_ok=True); d.write_bytes(body); got += 1
     report.append('sign-in helper: %d files at /__/' % got)
 

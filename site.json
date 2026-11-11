@@ -24,6 +24,22 @@
           "progress_field": "agenticAI"
         }
       ]
+    },
+    {
+      "slug": "Quantum_Engineering",
+      "title": "Quantum Engineering",
+      "blurb": "How quantum processors are designed, manufactured, tested and error-corrected, and what tools the industry still lacks.",
+      "books": [
+        {
+          "slug": "Lab-to-Foundry",
+          "title": "From Laboratory to Foundry: Design Automation for Quantum Processors",
+          "blurb": "A review and research agenda: the physics and mathematics of each step from qubit design to calibrated operation, the existing tools, and seven open problems.",
+          "repo": "jaswin90/quantum-eda-tools",
+          "branch": "claude/confident-gauss-lxrbn9",
+          "src": "docs",
+          "progress_field": "labToFoundry"
+        }
+      ]
     }
   ],
   "apps": [

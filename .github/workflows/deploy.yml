@@ -40,3 +40,11 @@ jobs:
           path: _site
       - id: deployment
         uses: actions/deploy-pages@v4
+      - name: Check the self-hosted sign-in helper is served
+        continue-on-error: true
+        run: |
+          sleep 20
+          for u in "/__/auth/handler?apiKey=test&x=1" "/__/auth/iframe?apiKey=test" "/__/auth/handler.js" "/__/firebase/init.json"; do
+            echo "== $u"
+            curl -s -o /dev/null -L -w 'final=%{url_effective} status=%{http_code} type=%{content_type} redirects=%{num_redirects}\n' "https://jaswin90.github.io$u"
+          done

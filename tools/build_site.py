@@ -19,7 +19,7 @@ FIREBASE_CONFIG repository secret (JSON); no key is stored in any repository.
 
 Usage (repository root):  python3 tools/build_site.py [SLUG=/local/path ...]
 """
-import glob, json, os, pathlib, re, shutil, subprocess, sys, tempfile
+import glob, json, os, pathlib, re, shutil, subprocess, sys, tempfile, urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 OUT = ROOT / '_site'
@@ -99,8 +99,38 @@ def firebase_config_js():
             sys.exit('ERROR: FIREBASE_CONFIG is missing ' + ', '.join(missing))
     else:
         print('WARNING: FIREBASE_CONFIG is not set: accounts are disabled in this build (progress stays in the browser).')
+    global FIREBASE_CFG
+    FIREBASE_CFG = dict(cfg)
+    own = (SITE.get('auth') or {}).get('auth_domain')
+    if cfg and own:
+        cfg['authDomain'] = own   # sign-in window served from this site (see copy_auth_helper)
     return ('// Generated at build time from the FIREBASE_CONFIG repository secret. Do not commit.\n'
             'export const firebaseConfig = ' + json.dumps(cfg, indent=2) + ';\n')
+
+
+def copy_auth_helper(report):
+    """Copy Firebase's sign-in helper pages to /__/auth/ on this site.
+
+    Some networks block firebaseapp.com, where Firebase normally serves the sign-in window.
+    Firebase supports serving these files from your own domain instead ("host the sign-in helper
+    code"). Pages without an extension are stored as <name>/index.html so GitHub Pages serves them
+    as HTML (it redirects /__/auth/handler to /__/auth/handler/, keeping the query and fragment).
+    """
+    if not (SITE.get('auth') or {}).get('self_host_helper') or not FIREBASE_CFG.get('authDomain'):
+        return
+    base = 'https://%s/__/' % FIREBASE_CFG['authDomain']
+    files = {'auth/handler': 'auth/handler/index.html', 'auth/handler.js': 'auth/handler.js',
+             'auth/experiments.js': 'auth/experiments.js', 'auth/iframe': 'auth/iframe/index.html',
+             'auth/iframe.js': 'auth/iframe.js', 'firebase/init.json': 'firebase/init.json'}
+    got = 0
+    for src, dst in files.items():
+        try:
+            body = urllib.request.urlopen(base + src, timeout=30).read()
+        except Exception as e:
+            print('note: could not fetch %s (%s); sign-in helper not self-hosted in this build' % (base + src, e))
+            return
+        d = OUT / '__' / dst; d.parent.mkdir(parents=True, exist_ok=True); d.write_bytes(body); got += 1
+    report.append('sign-in helper: %d files at /__/' % got)
 
 
 def build_app(app, tmp, report):
@@ -124,6 +154,7 @@ def build_app(app, tmp, report):
     report.append('app %s: %d files%s' % (app['slug'], sum(1 for _ in out.rglob('*') if _.is_file()), note))
 
 
+FIREBASE_CFG = {}
 FIREBASE_JS = firebase_config_js()
 
 
@@ -142,6 +173,7 @@ def main():
             build_book(field, book, tmp, report)
         for app in SITE.get('apps', []):
             build_app(app, tmp, report)
+    copy_auth_helper(report)
     subprocess.run([sys.executable, str(ROOT / 'tools' / 'build_pages.py')], check=True)
     print('\n'.join(report))
 

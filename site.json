@@ -44,5 +44,10 @@
         "vendor"
       ]
     }
-  ]
+  ],
+  "auth": {
+    "self_host_helper": true,
+    "auth_domain": null,
+    "_comment": "Firebase's sign-in helper is copied to /__/auth/ on this site at every build. Set auth_domain to \"jaswin90.github.io\" to make sign-in use it (needs the redirect URI https://jaswin90.github.io/__/auth/handler on the OAuth web client); null keeps Firebase's own domain."
+  }
 }

@@ -19,6 +19,11 @@ service cloud.firestore {
       allow read, write: if invited() && request.auth.uid == uid;
     }
 
+    // My Planner: each person's encrypted files (encrypted in the browser before upload).
+    match /planner/{uid}/{rest=**} {
+      allow read, write: if invited() && request.auth.uid == uid;
+    }
+
     // The invite list: the admin manages it; an invited person may read their own entry.
     match /invites/{inviteEmail} {
       allow read: if isAdmin() || (verified() && email() == inviteEmail);

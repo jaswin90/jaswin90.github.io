@@ -64,6 +64,12 @@ jobs:
           done
           sleep 15
           gcloud services api-keys describe "$NAME" --project "$PROJECT" --format='yaml(restrictions)'
+      - name: Show the Google sign-in OAuth client (for its redirect-URI setting)
+        continue-on-error: true
+        run: |
+          TOKEN=$(gcloud auth print-access-token)
+          curl -s -H "Authorization: Bearer $TOKEN" -H "X-Goog-User-Project: $PROJECT" \
+            "https://identitytoolkit.googleapis.com/admin/v2/projects/$PROJECT/defaultSupportedIdpConfigs/google.com" | jq '{name, enabled, clientId}'
       - uses: actions/setup-node@v4
         with:
           node-version: 22

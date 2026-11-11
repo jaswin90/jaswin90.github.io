@@ -26,7 +26,12 @@ export async function firebase() {
     import(FB + 'firebase-app.js'), import(FB + 'firebase-auth.js'), import(FB + 'firebase-firestore.js'),
   ]);
   const app = getApps()[0] || initializeApp(firebaseConfig);
-  ctx = { A, F, app, auth: A.getAuth(app), db: F.getFirestore(app) };
+  // Long polling (plain HTTPS requests) instead of a streaming connection: workplace proxies often
+  // hold back or cut streamed responses, which leaves every database read and write waiting forever.
+  let db;
+  try { db = F.initializeFirestore(app, { experimentalForceLongPolling: true }); }
+  catch { db = F.getFirestore(app); }   // already set up on this page
+  ctx = { A, F, app, auth: A.getAuth(app), db };
   return ctx;
 }
 

@@ -88,7 +88,9 @@ async function main() {
       const d = snap.exists() ? snap.data() : {};
       return '<ul class="lib-progress">' + BOOKS.map((b) => {
         const rec = b.progress_field ? d[b.progress_field] : d;
-        const n = rec && rec.items ? Object.keys(rec.items).length : 0;
+        // Volumes that share one record are told apart by the prefix of their question ids.
+        const ids = rec && rec.items ? Object.keys(rec.items) : [];
+        const n = b.progress_prefix ? ids.filter((k) => k.startsWith(b.progress_prefix)).length : ids.length;
         return '<li><a href="' + esc(b.url) + '">' + esc(b.title) + '</a> <span class="muted small">' + (n ? n + (n === 1 ? ' question' : ' questions') + ' answered' : 'not started') + '</span></li>';
       }).join('') + '</ul>';
     } catch (e) { return '<p class="small muted">Progress summary unavailable (' + esc(e.code || e.message) + ').</p>'; }

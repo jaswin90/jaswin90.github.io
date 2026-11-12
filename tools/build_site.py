@@ -27,7 +27,9 @@ SITE = json.loads((ROOT / 'site.json').read_text())
 ORIGIN = 'https://jaswin90.github.io'
 local = dict(a.split('=', 1) for a in sys.argv[1:] if '=' in a)
 
-books = [(f, b) for f in SITE['fields'] for b in f['books']]
+# A book with "within" is a volume published inside another book of the same field (at "path");
+# it gets its own entry in the library but is not fetched or built separately.
+books = [(f, b) for f in SITE['fields'] for b in f['books'] if not b.get('within')]
 url_map = {b['slug']: '/library/%s/%s/' % (f['slug'], b['slug']) for f, b in books}
 url_map.update({a['slug']: '/apps/%s/' % a['slug'] for a in SITE.get('apps', [])})
 BOOKCSS = re.compile(r'(<link rel="stylesheet" href="[^"]*assets/css/book\.css">)')

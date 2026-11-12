@@ -38,6 +38,7 @@ After that, adding a person is one entry under Invites on the Admin page.
 
 ## Adding a book, a field or an app
 - Book or field: add it to `site.json` under `fields` (`slug`, `title`, `blurb`, `repo`, `branch`, `src`, `progress_field`: the Firestore field its progress lives under, or `null` for top-level).
+- A second volume published inside another book's site: add an entry with `within` (the parent book's slug) and `path` (e.g. `cloud/`) instead of `repo`/`branch`/`src`; it is listed as its own book but not built separately. Give both entries a `progress_prefix` (the prefix of their question ids, e.g. `ch` and `ci`) so progress is counted per volume.
 - App: add it to `site.json` under `apps` (`slug`, `title`, `blurb`, `repo`, `branch`, `include`: the files to publish).
 - Push. No settings to change.
 

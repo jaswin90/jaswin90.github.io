@@ -12,7 +12,17 @@
           "repo": "jaswin90/LLM-Engineering",
           "branch": "claude/funny-hopper-lcw8ww",
           "src": "docs",
-          "progress_field": null
+          "progress_field": null,
+          "progress_prefix": "ch"
+        },
+        {
+          "slug": "Cloud-AI-Infrastructure",
+          "title": "Cloud AI Infrastructure",
+          "blurb": "Everything around the engine: datacentres, GPU clusters, scheduling, capacity and cost, reliability, security, agents, guardrails and batch inference.",
+          "within": "LLM-Engineering",
+          "path": "cloud/",
+          "progress_field": null,
+          "progress_prefix": "ci"
         },
         {
           "slug": "Foundations-Agentic-AI",

@@ -60,6 +60,9 @@ def write(rel, text):
 
 
 def book_url(field, book):
+    # A volume inside another book ("within") lives at that book's address plus "path".
+    if book.get('within'):
+        return '/library/%s/%s/%s' % (field['slug'], book['within'], book.get('path', ''))
     return '/library/%s/%s/' % (field['slug'], book['slug'])
 
 
@@ -72,7 +75,8 @@ write('index.html', page(SITE_NAME, f'''<section class="hero"><h1>{e(SITE_NAME)}
 <section class="plain shelf">{links([('/library/', 'Library'), ('/apps/', 'Apps')])}</section>''', active='home', account=False))
 
 # library: each field, then its books
-books_json = json.dumps([{'title': b['title'], 'url': book_url(f, b), 'progress_field': b.get('progress_field')}
+books_json = json.dumps([{'title': b['title'], 'url': book_url(f, b), 'progress_field': b.get('progress_field'),
+                          'progress_prefix': b.get('progress_prefix')}
                          for f in FIELDS for b in f['books']])
 lib = '<section class="hero"><h1>Library</h1></section>\n' + ''.join(
     f'<section class="plain shelf"><h2><a href="/library/{e(f["slug"])}/">{e(f["title"])}</a></h2>'

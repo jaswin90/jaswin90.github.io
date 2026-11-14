@@ -41,11 +41,75 @@
       "blurb": "How quantum processors are designed, manufactured, tested and error-corrected, and what tools the industry still lacks.",
       "books": [
         {
+          "slug": "Foundations-Roadmap",
+          "title": "Foundations of Quantum Engineering: roadmap and reading order",
+          "blurb": "A seven-book course from complex numbers to quantum chip manufacture, written as preparation for the review “From Laboratory to Foundry”.",
+          "within": "Lab-to-Foundry",
+          "path": "foundations/",
+          "progress_field": null
+        },
+        {
+          "slug": "Foundations-1-Mathematics",
+          "title": "Foundations 1: Mathematics for Quantum Engineering",
+          "blurb": "Every piece of mathematics the rest of the series uses, built from school algebra: complex numbers, vector spaces and Dirac notation, eigenvalues and matrix exponentials, tensor products, differential equations, Fourier analysis, probability and numerical optimisation.",
+          "within": "Lab-to-Foundry",
+          "path": "foundations/mathematics/",
+          "progress_field": "qeMath"
+        },
+        {
+          "slug": "Foundations-2-Classical-Physics",
+          "title": "Foundations 2: Classical Physics for Quantum Engineers",
+          "blurb": "The classical physics that quantum hardware is built from: least action and Hamiltonians, oscillators and normal modes, Maxwell's equations, capacitance and inductance matrices, transmission lines and resonators, optical waveguides, and the thermodynamics of noise.",
+          "within": "Lab-to-Foundry",
+          "path": "foundations/classical-physics/",
+          "progress_field": "qeClassical"
+        },
+        {
+          "slug": "Foundations-3-Quantum-Mechanics",
+          "title": "Foundations 3: Quantum Mechanics",
+          "blurb": "Quantum mechanics from the qubit up: postulates, Schrödinger dynamics, tunnelling, the harmonic oscillator, spin and Rabi oscillations, perturbation theory, density matrices and entanglement, decoherence and the Lindblad equation, and second quantisation.",
+          "within": "Lab-to-Foundry",
+          "path": "foundations/quantum-mechanics/",
+          "progress_field": "qeQM"
+        },
+        {
+          "slug": "Foundations-4-Quantum-Information",
+          "title": "Foundations 4: Quantum Information and Computation",
+          "blurb": "What a quantum computer computes and why it is fragile: the circuit model, teleportation, Grover and Shor, quantum channels, fidelity and randomised benchmarking, stabiliser codes, the surface code and its threshold, and how programs become pulses.",
+          "within": "Lab-to-Foundry",
+          "path": "foundations/quantum-information/",
+          "progress_field": "qeQI"
+        },
+        {
+          "slug": "Foundations-5-Quantum-Photonics",
+          "title": "Foundations 5: Quantum Photonics",
+          "blurb": "Light as a quantum system and as a qubit: field quantisation, coherent and squeezed states, beam splitters and Hong–Ou–Mandel interference, cavity QED, photon sources and detectors, integrated photonic circuits, and loss-tolerant photonic quantum computing.",
+          "within": "Lab-to-Foundry",
+          "path": "foundations/quantum-photonics/",
+          "progress_field": "qePhotonics"
+        },
+        {
+          "slug": "Foundations-6-Quantum-Hardware",
+          "title": "Foundations 6: Quantum Hardware: Superconducting Circuits and Other Qubits",
+          "blurb": "How physical qubits are built: superconductivity and the Josephson junction, quantising a circuit, the transmon and fluxonium, dispersive readout, single- and two-qubit gates, where coherence is lost, and the trapped-ion, neutral-atom and spin-qubit alternatives.",
+          "within": "Lab-to-Foundry",
+          "path": "foundations/quantum-hardware/",
+          "progress_field": "qeHardware"
+        },
+        {
+          "slug": "Foundations-7-Quantum-Manufacturing",
+          "title": "Foundations 7: Making Quantum Chips: Fabrication, Simulation, Yield and Design Automation",
+          "blurb": "The bridge to quantum EDA: how chips are fabricated, how classical design automation works, how electromagnetic solvers turn layouts into Hamiltonians, how variation becomes yield loss, how chips are packaged and tested cold, and the statistics and machine learning that tie it together.",
+          "within": "Lab-to-Foundry",
+          "path": "foundations/quantum-manufacturing/",
+          "progress_field": "qeManufacturing"
+        },
+        {
           "slug": "Lab-to-Foundry",
           "title": "From Laboratory to Foundry: Design Automation for Quantum Processors",
           "blurb": "A review and research agenda: the physics and mathematics of each step from qubit design to calibrated operation, the existing tools, and seven open problems.",
           "repo": "jaswin90/quantum-eda-tools",
-          "branch": "claude/confident-gauss-lxrbn9",
+          "branch": "claude/laughing-johnson-t56224",
           "src": "docs",
           "progress_field": "labToFoundry"
         }

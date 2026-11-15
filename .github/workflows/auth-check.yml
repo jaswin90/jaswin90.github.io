@@ -17,16 +17,16 @@ jobs:
   sign-in:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    # Playwright's own image has the three browsers and their system libraries built in,
+    # so the check does not depend on the runner's Ubuntu version.
+    container:
+      image: mcr.microsoft.com/playwright:v1.47.2-jammy
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-      - name: Install Playwright and browsers
+      - name: Install the Playwright library (same version as the image)
         run: |
           npm init -y >/dev/null
           npm install --no-audit --no-fund playwright@1.47.2
-          npx playwright install --with-deps chromium firefox webkit
       - name: Wait for the deploy to be live
         run: sleep 30
       - name: Run the sign-in checks

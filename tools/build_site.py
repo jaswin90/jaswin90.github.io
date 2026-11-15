@@ -117,6 +117,14 @@ def copy_auth_helper(report):
     Firebase supports serving these files from your own domain instead ("host the sign-in helper
     code"). Pages without an extension are stored as <name>/index.html so GitHub Pages serves them
     as HTML (it redirects /__/auth/handler to /__/auth/handler/, keeping the query and fragment).
+
+    Because of that redirect the pages are served from a folder (/__/auth/handler/), so their
+    relative script links (src="handler.js") would point to /__/auth/handler/handler.js, which does
+    not exist: the sign-in window then stays blank. The links are therefore rewritten to absolute
+    paths, and check_auth_helper() fails the build if any script link of a helper page is missing.
+
+    If the helper cannot be copied, sign-in falls back to Firebase's own domain instead of pointing
+    the sign-in window at pages that are not there.
     """
     if not (SITE.get('auth') or {}).get('self_host_helper') or not FIREBASE_CFG.get('authDomain'):
         return
@@ -130,13 +138,46 @@ def copy_auth_helper(report):
             body = urllib.request.urlopen(base + src, timeout=30).read()
         except Exception as e:
             if src != 'firebase/init.json':
-                print('note: could not fetch %s (%s); sign-in helper not self-hosted in this build' % (base + src, e))
+                print('WARNING: could not fetch %s (%s); sign-in uses Firebase\'s own domain in this build' % (base + src, e))
+                shutil.rmtree(OUT / '__', ignore_errors=True)
+                use_firebase_auth_domain(report)
                 return
             # Served only when Firebase Hosting is on; it is just the web config, so write it ourselves.
             keys = ('apiKey', 'appId', 'authDomain', 'projectId', 'storageBucket', 'messagingSenderId', 'measurementId')
             body = json.dumps({k: FIREBASE_CFG[k] for k in keys if FIREBASE_CFG.get(k)}).encode()
+        if dst.endswith('index.html'):
+            # Relative script links -> absolute /__/auth/<file> (see the docstring).
+            body = re.sub(rb'(<script[^>]*\ssrc=")(?![a-z]+:|/)([^"]+)"', rb'\1/__/auth/\2"', body)
         d = OUT / '__' / dst; d.parent.mkdir(parents=True, exist_ok=True); d.write_bytes(body); got += 1
-    report.append('sign-in helper: %d files at /__/' % got)
+    check_auth_helper()
+    report.append('sign-in helper: %d files at /__/ (script links checked)' % got)
+
+
+def check_auth_helper():
+    """Fail the build if a helper page links a script that the built site does not contain."""
+    for page in (OUT / '__' / 'auth').rglob('index.html'):
+        served_dir = '/' + str(page.parent.relative_to(OUT)).replace(os.sep, '/') + '/'
+        html = page.read_text(errors='replace')
+        srcs = re.findall(r'<script[^>]*\ssrc="([^"]+)"', html)
+        if not srcs:
+            sys.exit('ERROR: sign-in helper page %s has no scripts; the sign-in window would be blank' % served_dir)
+        for s in srcs:
+            if re.match(r'[a-z]+:', s):
+                continue
+            path = s if s.startswith('/') else served_dir + s
+            if not (OUT / path.lstrip('/')).is_file():
+                sys.exit('ERROR: sign-in helper page %s loads %s, which is not in the site; the sign-in window would be blank' % (served_dir, path))
+
+
+def use_firebase_auth_domain(report):
+    """Point every copy of firebase-config.js back at Firebase's own sign-in domain."""
+    cfg = dict(FIREBASE_CFG)
+    js = ('// Generated at build time from the FIREBASE_CONFIG repository secret. Do not commit.\n'
+          'export const firebaseConfig = ' + json.dumps(cfg, indent=2) + ';\n')
+    n = 0
+    for p in OUT.rglob('firebase-config.js'):
+        p.write_text(js); n += 1
+    report.append('sign-in helper NOT self-hosted: %d config files use %s' % (n, cfg.get('authDomain')))
 
 
 def build_app(app, tmp, report):

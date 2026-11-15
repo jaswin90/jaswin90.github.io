@@ -34,6 +34,11 @@ async function run(name, browserType, ctxOpts) {
     let win = await popupP;
     const how = win ? 'popup' : 'same tab';
     win = win || page;
+    const consoleLines = [], failed = [];
+    win.on('console', (m) => consoleLines.push(`${m.type()}: ${m.text()}`));
+    win.on('pageerror', (e) => consoleLines.push(`pageerror: ${e.message}`));
+    win.on('requestfailed', (r) => failed.push(`${r.url().split('?')[0]} (${r.failure() && r.failure().errorText})`));
+    win.on('response', (r) => { if (r.status() >= 400) failed.push(`${r.url().split('?')[0]} -> HTTP ${r.status()}`); });
     const chain = [];
     win.on('framenavigated', (f) => { if (f === win.mainFrame()) chain.push(f.url()); });
     await win.waitForURL(/accounts\.google\.com/, { timeout: 30000 }).catch(() => {});
@@ -43,7 +48,11 @@ async function run(name, browserType, ctxOpts) {
     console.log(`  sign-in window opened as: ${how}`);
     for (const u of chain) console.log('  visited:', u.split('?')[0]);
     console.log('  now at :', url.split('?')[0]);
+    for (const l of consoleLines) console.log('  console:', l.slice(0, 300));
+    for (const l of failed) console.log('  request problem:', l);
     if (!/^https:\/\/accounts\.google\.com\//.test(url)) {
+      const html = await win.content().catch(() => '');
+      console.log('  page HTML (first 1500 chars):', html.slice(0, 1500).replace(/\s+/g, ' '));
       const text = (await win.locator('body').innerText().catch(() => '')).trim();
       fail(name, `did not reach accounts.google.com (stuck at ${url.split('?')[0]}; page text: ${JSON.stringify(text.slice(0, 200))})`);
     } else {

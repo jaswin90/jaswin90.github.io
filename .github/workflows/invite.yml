@@ -1,0 +1,67 @@
+name: Manage invites
+
+# Adds, removes or checks one invite (Firestore invites/<email>) without opening the Admin page.
+# Same effect as the Admin page's Invites list. The email is given when the workflow is started
+# (Actions → Manage invites → Run workflow) and is masked in the logs; it is never stored in
+# this repository. Signs in to Google as the site-automation service account (no stored key).
+on:
+  workflow_dispatch:
+    inputs:
+      email:
+        description: "Google account email"
+        required: true
+      action:
+        description: "add, remove or check"
+        required: true
+        default: add
+        type: choice
+        options: [add, remove, check]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  invite:
+    runs-on: ubuntu-latest
+    env:
+      PROJECT: jaswin-s-library
+    steps:
+      - name: Read the email
+        id: in
+        env:
+          RAW: ${{ inputs.email }}
+        run: |
+          E=$(printf '%s' "$RAW" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+          echo "::add-mask::$E"
+          printf '%s' "$E" | grep -Eq '^[^@]+@[^@]+\.[^@]+$' || { echo "Not an email address."; exit 1; }
+          echo "email=$E" >> "$GITHUB_OUTPUT"
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/240981043036/locations/global/workloadIdentityPools/github/providers/github
+          service_account: site-automation@jaswin-s-library.iam.gserviceaccount.com
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Apply
+        env:
+          E: ${{ steps.in.outputs.email }}
+          ACTION: ${{ inputs.action }}
+        run: |
+          set -euo pipefail
+          TOKEN=$(gcloud auth print-access-token)
+          ENC=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$E")
+          URL="https://firestore.googleapis.com/v1/projects/$PROJECT/databases/(default)/documents/invites/$ENC"
+          H=(-H "Authorization: Bearer $TOKEN" -H "X-Goog-User-Project: $PROJECT")
+          case "$ACTION" in
+            add)
+              NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+              BODY='{"fields":{"note":{"stringValue":"added by the Manage invites workflow"},"invitedBy":{"stringValue":"k.jaswin@gmail.com"},"at":{"timestampValue":"'"$NOW"'"}}}'
+              code=$(curl -s -o r.json -w '%{http_code}' -X PATCH "${H[@]}" -H 'Content-Type: application/json' "$URL" -d "$BODY")
+              [ "$code" = 200 ] || { cat r.json; exit 1; }
+              echo "Invite added." ;;
+            remove)
+              code=$(curl -s -o r.json -w '%{http_code}' -X DELETE "${H[@]}" "$URL")
+              [ "$code" = 200 ] || { cat r.json; exit 1; }
+              echo "Invite removed." ;;
+          esac
+          code=$(curl -s -o r.json -w '%{http_code}' "${H[@]}" "$URL")
+          if [ "$code" = 200 ]; then echo "Check: this email IS on the invite list."; else echo "Check: this email is NOT on the invite list (HTTP $code)."; fi
